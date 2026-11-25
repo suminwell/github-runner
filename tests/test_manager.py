@@ -216,7 +216,7 @@ class RuntimeTests(unittest.TestCase):
                 manager.prepare(root, 'x64')
             self.assertFalse(root.exists())
 
-    def test_each_architecture_entrypoint_forwards_the_selected_architecture(self):
+    def test_platform_and_architecture_entrypoints_forward_selected_architecture(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary)
             (source / 'common').mkdir()
@@ -224,15 +224,19 @@ class RuntimeTests(unittest.TestCase):
             env['LOCAL_RUNNER_SOURCE_DIR'] = str(source)
             if os.name == 'nt':
                 (source / 'common/install_windows.ps1').write_text('param($Architecture)\nWrite-Output $Architecture\n')
-                for arch in ('x64', 'arm64'):
-                    result = subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(BASE / 'windows' / arch / 'bin/install.ps1')], env=env, capture_output=True, text=True, timeout=30)
+                entries = [(BASE / 'windows/install.ps1', 'auto')]
+                entries += [(BASE / 'windows' / arch / 'bin/install.ps1', arch) for arch in ('x64', 'arm64')]
+                for entry, arch in entries:
+                    result = subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(entry)], env=env, capture_output=True, text=True, timeout=30)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout.strip(), arch)
             else:
                 (source / 'common/install_unix.sh').write_text('printf "%s %s\\n" "$1" "${2:-auto}"\n')
                 for system in ('linux', 'macos'):
-                    for arch in ('x64', 'arm64'):
-                        result = subprocess.run(['sh', str(BASE / system / arch / 'bin/install.sh')], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+                    entries = [(BASE / system / 'install.sh', 'auto')]
+                    entries += [(BASE / system / arch / 'bin/install.sh', arch) for arch in ('x64', 'arm64')]
+                    for entry, arch in entries:
+                        result = subprocess.run(['sh', str(entry)], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
                         self.assertEqual(result.returncode, 0, result.stderr)
                         self.assertEqual(result.stdout.strip(), system + ' ' + arch)
 

@@ -19,19 +19,19 @@
 Linux（普通用户终端）：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/linux/bin/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/linux/install.sh | sh
 ```
 
 macOS（普通用户终端）：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/macos/bin/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/macos/install.sh | sh
 ```
 
 Windows（**以管理员身份打开 Windows PowerShell**）：
 
 ```powershell
-irm https://raw.githubusercontent.com/suminwell/github-runner/main/windows/bin/install.ps1 | iex
+irm https://raw.githubusercontent.com/suminwell/github-runner/main/windows/install.ps1 | iex
 ```
 
 也可以直接选择架构入口。例如 Linux：
@@ -64,19 +64,19 @@ macOS 对应 `macos/x64/bin/install.sh` 和 `macos/arm64/bin/install.sh`；Windo
 Linux：
 
 ```sh
-gh repo clone suminwell/github-runner && cd github-runner && LOCAL_RUNNER_SOURCE_DIR="$PWD" sh linux/bin/install.sh
+gh repo clone suminwell/github-runner && cd github-runner && LOCAL_RUNNER_SOURCE_DIR="$PWD" sh linux/install.sh
 ```
 
 macOS：
 
 ```sh
-gh repo clone suminwell/github-runner && cd github-runner && LOCAL_RUNNER_SOURCE_DIR="$PWD" sh macos/bin/install.sh
+gh repo clone suminwell/github-runner && cd github-runner && LOCAL_RUNNER_SOURCE_DIR="$PWD" sh macos/install.sh
 ```
 
 Windows（管理员 PowerShell）：
 
 ```powershell
-gh repo clone suminwell/github-runner; if ($LASTEXITCODE -eq 0) { Set-Location github-runner; $env:LOCAL_RUNNER_SOURCE_DIR = (Get-Location).Path; & powershell -NoProfile -ExecutionPolicy Bypass -File windows/bin/install.ps1 }
+gh repo clone suminwell/github-runner; if ($LASTEXITCODE -eq 0) { Set-Location github-runner; $env:LOCAL_RUNNER_SOURCE_DIR = (Get-Location).Path; & powershell -NoProfile -ExecutionPolicy Bypass -File windows/install.ps1 }
 ```
 
 已克隆源码时，直接在项目根目录设置 `LOCAL_RUNNER_SOURCE_DIR` 并运行对应安装脚本即可。
@@ -87,15 +87,15 @@ gh repo clone suminwell/github-runner; if ($LASTEXITCODE -eq 0) { Set-Location g
 
 ```text
 macos/
-├── bin/install.sh              # 自动识别架构的通用入口
+├── install.sh              # 自动识别架构的通用入口
 ├── x64/bin/{install,service}.sh
 └── arm64/bin/{install,service}.sh
 windows/
-├── bin/install.ps1
+├── install.ps1
 ├── x64/bin/{install,service}.ps1
 └── arm64/bin/{install,service}.ps1
 linux/
-├── bin/install.sh
+├── install.sh
 ├── x64/bin/{install,service}.sh
 └── arm64/bin/{install,service}.sh
 ```
@@ -243,7 +243,7 @@ Set-Service LocalGitHubRunner -StartupType Disabled
 自定义安装位置可以在执行安装命令前设置 `LOCAL_RUNNER_HOME`；安装器会在该目录下再创建 `<平台>/<架构>` 目录。例如 Linux：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/linux/bin/install.sh | LOCAL_RUNNER_HOME=/srv/github-runner sh
+curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/linux/install.sh | LOCAL_RUNNER_HOME=/srv/github-runner sh
 ```
 
 该目录需要安装用户可写。`LOCAL_RUNNER_BASE_URL` 可指定固定提交的 raw URL，实现固定版本安装；`LOCAL_RUNNER_SOURCE_DIR` 可指定已克隆源码的绝对路径。`settings.json` 的 `poll_seconds` 可调整组织发现周期（最低 10 秒）。更改配置后重启系统服务。

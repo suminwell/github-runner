@@ -30,7 +30,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: sh
         run: |
-          for script in linux/bin/*.sh macos/bin/*.sh linux/*/bin/*.sh macos/*/bin/*.sh common/install_unix.sh; do
+          for script in linux/*.sh macos/*.sh linux/*/bin/*.sh macos/*/bin/*.sh common/install_unix.sh; do
             sh -n "$script"
           done
       - name: Parse PowerShell and compile native service host
