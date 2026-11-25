@@ -7,6 +7,53 @@ New-Item -ItemType Directory -Path $fixture | Out-Null
 $success = $false
 function Assert($Condition, [string]$Message) { if (-not $Condition) { throw "Assertion failed: $Message" } }
 try {
+    # Test the root entry point with a fake platform installer and download response.
+    if ($onWindows) {
+        & {
+            $saved = @{}
+            foreach ($name in @('LOCAL_RUNNER_SOURCE_DIR','LOCAL_RUNNER_BASE_URL','LOCAL_RUNNER_HOME','BOOTSTRAP_RESULT')) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
+            try {
+                $source = Join-Path $fixture 'source tree'
+                New-Item -ItemType Directory -Path (Join-Path $source 'windows') -Force | Out-Null
+                $env:BOOTSTRAP_RESULT = Join-Path $fixture 'bootstrap-result.json'
+                $env:LOCAL_RUNNER_HOME = Join-Path $fixture 'custom home'
+                $env:LOCAL_RUNNER_SOURCE_DIR = $source; $env:LOCAL_RUNNER_BASE_URL = $null
+                $fakeInstaller = 'param($Architecture); @{arch=$Architecture;source=$env:LOCAL_RUNNER_SOURCE_DIR;root=$env:LOCAL_RUNNER_HOME} | ConvertTo-Json | Set-Content $env:BOOTSTRAP_RESULT'
+                Set-Content (Join-Path $source 'windows\install.ps1') $fakeInstaller
+                Copy-Item (Join-Path $repo 'install.ps1') (Join-Path $source 'install.ps1')
+                & (Join-Path $repo 'install.ps1') -Architecture arm64
+                $result = Get-Content -Raw $env:BOOTSTRAP_RESULT | ConvertFrom-Json
+                Assert ($result.arch -eq 'arm64' -and $result.source -eq $source -and $result.root -eq $env:LOCAL_RUNNER_HOME) 'source, architecture and install home forwarded'
+                $env:LOCAL_RUNNER_SOURCE_DIR = $null
+                & (Join-Path $source 'install.ps1') -Architecture x64
+                $result = Get-Content -Raw $env:BOOTSTRAP_RESULT | ConvertFrom-Json
+                Assert ($result.arch -eq 'x64' -and $result.source -eq $source) 'local checkout discovered'
+                Assert (-not $env:LOCAL_RUNNER_SOURCE_DIR) 'source environment restored'
+                $env:LOCAL_RUNNER_BASE_URL = 'https://example.invalid/pinned'
+                function Invoke-WebRequest {
+                    param([switch]$UseBasicParsing, [int]$TimeoutSec, [Parameter(Position=0)][string]$Uri)
+                    Assert ($Uri -eq 'https://example.invalid/pinned/windows/install.ps1') 'Windows download URL'
+                    return [pscustomobject]@{Content=$fakeInstaller}
+                }
+                Get-Content -Raw (Join-Path $repo 'install.ps1') | Invoke-Expression
+                $result = Get-Content -Raw $env:BOOTSTRAP_RESULT | ConvertFrom-Json
+                Assert ($result.arch -eq 'auto' -and -not $result.source) 'piped entry point uses requested remote source'
+                Remove-Item $env:BOOTSTRAP_RESULT
+                function Invoke-WebRequest { throw 'Simulated download failure' }
+                $failed = $false; try { & (Join-Path $repo 'install.ps1') } catch { $failed = $true }
+                Assert ($failed -and -not (Test-Path $env:BOOTSTRAP_RESULT)) 'failed download never executed'
+                $env:LOCAL_RUNNER_SOURCE_DIR = $source
+                Set-Content (Join-Path $source 'windows\install.ps1') 'throw "Simulated installer failure"'
+                $failed = $false; try { & (Join-Path $repo 'install.ps1') } catch { $failed = $true }
+                Assert $failed 'platform failure propagated'
+            } finally {
+                foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) }
+            }
+        }
+    } else {
+        $failed = $false; try { & (Join-Path $repo 'install.ps1') } catch { $failed = $true }
+        Assert $failed 'PowerShell entry point rejects non-Windows'
+    }
     # Load only installer helper definitions, without administrator/host operations.
     $tokens = $null; $errors = $null
     $installer = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'windows\install.ps1'), [ref]$tokens, [ref]$errors)

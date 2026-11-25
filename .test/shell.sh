@@ -12,6 +12,60 @@ cleanup() {
 }
 trap cleanup EXIT
 assert() { if ! "$@" >/dev/null; then printf 'FAIL: %s\n' "$*" >&2; exit 1; fi; }
+# Exercise the public entry point using fake installers, without touching the host.
+(
+    bootstrap=$FIXTURE/bootstrap
+    mkdir -p "$bootstrap/commands" "$bootstrap/source tree/linux" "$bootstrap/source tree/macos" "$bootstrap/temporary"
+    export BOOTSTRAP_SOURCE="$bootstrap/source tree" BOOTSTRAP_MARKER="$bootstrap/result" BOOTSTRAP_URL_LOG="$bootstrap/url"
+    BOOTSTRAP_SOURCE=$(cd "$BOOTSTRAP_SOURCE" && pwd)
+    export LOCAL_RUNNER_HOME="$bootstrap/custom home" TMPDIR="$bootstrap/temporary"
+    export PATH="$bootstrap/commands:$PATH"
+    unset LOCAL_RUNNER_SOURCE_DIR LOCAL_RUNNER_BASE_URL
+    printf '#!/bin/sh\nprintf "%%s\\n" "$BOOTSTRAP_OS"\n' > "$bootstrap/commands/uname"
+    cat > "$bootstrap/commands/curl" <<'CURL'
+#!/bin/sh
+set -eu
+while [ "$#" -gt 0 ]; do
+    case "$1" in -o) destination=$2; shift 2 ;; https://*) url=$1; shift ;; *) shift ;; esac
+done
+printf '%s\n' "$url" > "$BOOTSTRAP_URL_LOG"
+case "$url" in */linux/install.sh) target=linux ;; */macos/install.sh) target=macos ;; *) exit 90 ;; esac
+cp "$BOOTSTRAP_SOURCE/$target/install.sh" "$destination"
+[ "${BOOTSTRAP_FAIL:-0}" != 1 ] || exit 22
+CURL
+    chmod +x "$bootstrap/commands/"*
+    cp "$REPO/install.sh" "$BOOTSTRAP_SOURCE/install.sh"
+    for target in linux macos; do
+        printf '#!/bin/sh\nprintf "%%s\\n" %s > "$BOOTSTRAP_MARKER"\n' "$target" > "$BOOTSTRAP_SOURCE/$target/install.sh"
+        cat >> "$BOOTSTRAP_SOURCE/$target/install.sh" <<'INSTALL'
+printf '%s\n' "${1:-auto}" "$LOCAL_RUNNER_HOME" "${LOCAL_RUNNER_SOURCE_DIR:-remote}" >> "$BOOTSTRAP_MARKER"
+exit "${BOOTSTRAP_STATUS:-0}"
+INSTALL
+    done
+    for BOOTSTRAP_OS in Linux Darwin; do
+        export BOOTSTRAP_OS
+        target=linux; [ "$BOOTSTRAP_OS" != Darwin ] || target=macos
+        LOCAL_RUNNER_SOURCE_DIR=$BOOTSTRAP_SOURCE sh "$REPO/install.sh" arm64
+        assert test "$(head -n 1 "$BOOTSTRAP_MARKER")" = "$target"
+        assert test "$(sed -n '2p' "$BOOTSTRAP_MARKER")" = arm64
+        assert test "$(sed -n '3p' "$BOOTSTRAP_MARKER")" = "$LOCAL_RUNNER_HOME"
+        (cd "$FIXTURE" && sh "$BOOTSTRAP_SOURCE/install.sh" x64)
+        assert test "$(sed -n '4p' "$BOOTSTRAP_MARKER")" = "$BOOTSTRAP_SOURCE"
+        export LOCAL_RUNNER_BASE_URL=https://example.invalid/pinned
+        cat "$REPO/install.sh" | sh -s -- x64
+        assert test "$(cat "$BOOTSTRAP_URL_LOG")" = "$LOCAL_RUNNER_BASE_URL/$target/install.sh"
+        assert test "$(sed -n '4p' "$BOOTSTRAP_MARKER")" = remote
+        unset LOCAL_RUNNER_BASE_URL
+    done
+    export LOCAL_RUNNER_BASE_URL=https://example.invalid/pinned
+    rm "$BOOTSTRAP_MARKER"
+    if BOOTSTRAP_FAIL=1 sh "$REPO/install.sh"; then echo 'Executed a failed download' >&2; exit 1; fi
+    assert test ! -f "$BOOTSTRAP_MARKER"
+    result=0; BOOTSTRAP_STATUS=17 sh "$REPO/install.sh" || result=$?
+    assert test "$result" = 17
+    if BOOTSTRAP_OS=FreeBSD sh "$REPO/install.sh" 2>/dev/null; then echo 'Accepted unsupported OS' >&2; exit 1; fi
+    rmdir "$TMPDIR"
+)
 # Run installer helpers against temporary files; never install a host service.
 (
     sed '/^install_main()/,$d' "$REPO/$PLATFORM/install.sh" > "$FIXTURE/installer-helpers.sh"

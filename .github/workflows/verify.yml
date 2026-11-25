@@ -17,6 +17,7 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
+          sh -n install.sh
           sh -n linux/install.sh
           sh -n macos/install.sh
           for script in linux/*.sh macos/*.sh .test/*.sh; do
@@ -30,7 +31,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          Get-ChildItem windows,.test -Recurse -Filter *.ps1 | ForEach-Object {
+          Get-ChildItem install.ps1,windows,.test -Recurse -Filter *.ps1 | ForEach-Object {
             $tokens=$null; $errors=$null
             [System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors) | Out-Null
             if ($errors.Count) { throw ($errors | Out-String) }

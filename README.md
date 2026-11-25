@@ -16,25 +16,21 @@
 
 ## 一行安装
 
-Linux，使用普通用户终端：
+Linux / macOS，使用普通用户终端，入口自动识别操作系统和架构：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/linux/install.sh | sh
-```
-
-macOS，使用普通用户终端：
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/macos/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/install.sh | sh
 ```
 
 Windows，以管理员身份打开 Windows PowerShell：
 
 ```powershell
-irm https://raw.githubusercontent.com/suminwell/github-runner/main/windows/install.ps1 | iex
+irm https://raw.githubusercontent.com/suminwell/github-runner/main/install.ps1 | iex
 ```
 
 同一个安装地址支持两种架构，无需选择架构目录。macOS 在 Rosetta 环境下也会识别原生 ARM64；下载的 GitHub CLI 和 Actions Runner 与本机架构匹配。
+
+已克隆项目时，在项目根目录执行 `sh install.sh`；Windows 管理员 PowerShell 执行 `powershell -ExecutionPolicy Bypass -File .\install.ps1`。入口会使用本地源码。原有的 `linux/install.sh`、`macos/install.sh`、`windows/install.ps1` 地址仍可直接使用。
 
 执行后自动完成：
 
@@ -50,6 +46,8 @@ Linux 需要使用 systemd 的现代 glibc 发行版，例如 Ubuntu 22.04+、De
 ## 目录与工作数据
 
 ```text
+install.sh                     # Linux / macOS 统一安装入口
+install.ps1                    # Windows 统一安装入口
 linux/
 ├── install.sh
 └── service.sh
@@ -165,16 +163,16 @@ Get-Content "$env:ProgramData\local-github-runner\windows\logs\service.log" -Enc
 安装根目录可用 `LOCAL_RUNNER_HOME` 指定，安装器会追加 `<平台>`：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/linux/install.sh | LOCAL_RUNNER_HOME=/srv/github-runner sh
+curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/install.sh | LOCAL_RUNNER_HOME=/srv/github-runner sh
 ```
 
-私有 fork 需要先通过 `gh auth login` 登录并克隆，然后设置 `LOCAL_RUNNER_SOURCE_DIR` 为项目绝对路径。例如 Linux：
+私有 fork 需要先通过 `gh auth login` 登录并克隆，然后执行根目录的入口，本地源码会自动传给平台安装器。例如 Linux / macOS：
 
 ```sh
-gh repo clone suminwell/github-runner && cd github-runner && LOCAL_RUNNER_SOURCE_DIR="$PWD" sh linux/install.sh
+gh repo clone suminwell/github-runner && cd github-runner && sh install.sh
 ```
 
-macOS 使用 `macos/install.sh`；Windows 管理员 PowerShell 设置 `$env:LOCAL_RUNNER_SOURCE_DIR=(Get-Location).Path` 后执行 `powershell -ExecutionPolicy Bypass -File windows/install.ps1`。`LOCAL_RUNNER_BASE_URL` 可设为固定提交的 raw URL，固定下载版本。
+Windows 管理员 PowerShell 在项目根目录执行 `powershell -ExecutionPolicy Bypass -File .\install.ps1`。也可用 `LOCAL_RUNNER_SOURCE_DIR` 明确指定源码目录；`LOCAL_RUNNER_BASE_URL` 可设为固定提交的 raw URL，固定下载版本。设置后，入口和平台安装器都使用指定来源。
 
 停用自动启动并停止管理进程：
 
