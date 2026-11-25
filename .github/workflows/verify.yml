@@ -1,4 +1,4 @@
-name: Verify installers and supervisor
+name: Verify Shell and PowerShell runners
 on:
   push:
   pull_request:
@@ -9,40 +9,33 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            python: '3.14'
-          - os: macos-latest
-            python: '3.14'
-          - os: windows-latest
-            python: '3.14'
-          - os: ubuntu-22.04
-            python: '3.9'
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - name: Test both architecture packages with fake GitHub and child processes
-        run: python .test/run.py
-      - name: Check POSIX entry points
+      - name: Check Bash and POSIX syntax
         if: runner.os != 'Windows'
-        shell: sh
+        shell: bash
         run: |
-          for script in linux/*.sh macos/*.sh linux/*/bin/*.sh macos/*/bin/*.sh; do
-            sh -n "$script"
+          sh -n linux/install.sh
+          sh -n macos/install.sh
+          for script in linux/*/bin/*.sh macos/*/bin/*.sh .test/*.sh; do
+            bash -n "$script"
           done
-      - name: Parse PowerShell and compile native service host
+      - name: Exercise Shell supervisor and real child restarts
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash .test/shell.sh
+      - name: Check PowerShell syntax
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          Get-ChildItem windows -Recurse -Filter *.ps1 | ForEach-Object {
-            $tokens = $null; $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+          Get-ChildItem windows,.test -Recurse -Filter *.ps1 | ForEach-Object {
+            $tokens=$null; $errors=$null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors) | Out-Null
             if ($errors.Count) { throw ($errors | Out-String) }
           }
-          foreach ($arch in @('x64', 'arm64')) {
-            powershell.exe -NoProfile -Command "Add-Type -Path windows/$arch/bin/windows-service.cs -ReferencedAssemblies System.ServiceProcess -OutputAssembly '$env:RUNNER_TEMP/LocalGitHubRunner-$arch.exe' -OutputType ConsoleApplication"
-            if ($LASTEXITCODE -ne 0) { throw "Service host compilation failed: $arch" }
-          }
+      - name: Exercise PowerShell supervisor and real child restarts
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./.test/powershell.ps1
