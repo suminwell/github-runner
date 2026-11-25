@@ -1,0 +1,8 @@
+**/__pycache__/
+**/.state/
+**/data/
+**/logs/
+/linux/bin/*/
+/macos/bin/*/
+/windows/bin/*/
+*.pyc

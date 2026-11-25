@@ -1,0 +1,37 @@
+name: Verify installers and supervisor
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Test actual supervisor with fake GitHub and child processes
+        run: python -m unittest discover -s tests -v
+      - name: Check POSIX entry points
+        if: runner.os != 'Windows'
+        shell: sh
+        run: |
+          for script in linux/bin/*.sh macos/bin/*.sh common/install_unix.sh; do
+            sh -n "$script"
+          done
+      - name: Parse PowerShell and compile native service host
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Get-ChildItem windows/bin/*.ps1 | ForEach-Object {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+          Add-Type -Path common/windows-service.cs -ReferencedAssemblies System.ServiceProcess -OutputAssembly "$env:RUNNER_TEMP/LocalGitHubRunner.exe" -OutputType ConsoleApplication
