@@ -28,7 +28,7 @@ stop_installed_service() {
         definition_path=/Library/LaunchDaemons/$service_name.plist
         if [ -f "$definition_path" ]; then
             command_path=$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$definition_path")
-            case "$command_path" in "$root/service.sh"|"$root/$arch/bin/service.sh") ;; *) echo 'Another installation owns this service name.' >&2; exit 1 ;; esac
+            case "$command_path" in "$root/bin/service.sh"|"$root/service.sh"|"$root/$arch/bin/service.sh") ;; *) echo 'Another installation owns this service name.' >&2; exit 1 ;; esac
             sudo launchctl bootout "system/$service_name" 2>/dev/null || :
             sudo launchctl disable "system/$service_name"
         fi
@@ -36,18 +36,28 @@ stop_installed_service() {
 }
 migrate_layout() {
     legacy=$root/$arch
-    [ -f "$legacy/.state/settings.json" ] || return 0
-    for part in bin data logs .state; do
-        [ ! -e "$root/$part" ] || { echo "Both layouts exist at $root; resolve them before upgrading." >&2; exit 1; }
-    done
-    for part in bin data logs .state; do [ ! -d "$legacy/$part" ] || mv "$legacy/$part" "$root/$part"; done
-    if [ -f "$root/.state/organizations.json" ]; then
-        jq 'with_entries(.value.relocated=true)' "$root/.state/organizations.json" > "$root/.state/organizations.new"
-        mv "$root/.state/organizations.new" "$root/.state/organizations.json"
+    if [ -f "$legacy/.state/settings.json" ] || [ -f "$legacy/conf/settings.json" ]; then
+        for part in bin data logs conf; do [ ! -e "$root/$part" ] || { echo "Both layouts exist at $root; resolve them before upgrading." >&2; exit 1; }; done
+        for part in bin data logs; do [ ! -d "$legacy/$part" ] || mv "$legacy/$part" "$root/$part"; done
+        if [ -d "$legacy/.state" ]; then mv "$legacy/.state" "$root/conf"; else mv "$legacy/conf" "$root/conf"; fi
+        rmdir "$legacy" 2>/dev/null || :
     fi
-    rm -f "$root/bin/install.sh" "$root/bin/service.sh"
-    rmdir "$legacy" 2>/dev/null || :
-    printf 'Migrated existing installation to %s; data and registration identities retained.\n' "$root"
+    if [ -d "$root/.state" ]; then
+        [ ! -e "$root/conf" ] || { echo 'Both .state and conf exist; resolve them before upgrading.' >&2; exit 1; }
+        mv "$root/.state" "$root/conf"
+    fi
+    if [ -d "$root/conf/package" ]; then mkdir -p "$root/bin/.cache"; [ ! -e "$root/bin/.cache/package" ] || { echo 'Both package caches exist.' >&2; exit 1; }; mv "$root/conf/package" "$root/bin/.cache/package"; fi
+    if [ -d "$root/conf/tools" ]; then mkdir -p "$root/bin"; [ ! -e "$root/bin/tools" ] || { echo 'Both tool directories exist.' >&2; exit 1; }; mv "$root/conf/tools" "$root/bin/tools"; fi
+    for organization in "$root"/bin/*; do
+        [ -f "$organization/runner/.runner" ] || continue
+        login=${organization##*/}
+        destination=$root/runner/$login
+        [ ! -e "$destination" ] || { echo 'Both organization runner layouts exist.' >&2; exit 1; }
+        mkdir -p "$destination"
+        mv "$organization/runner" "$destination/app"
+        rm -f "$organization/runner.sh"
+        rmdir "$organization" 2>/dev/null || :
+    done
 }
 install_main() {
     umask 077
@@ -74,7 +84,20 @@ install_main() {
     fi
     if [ "$platform" = linux ]; then command -v flock >/dev/null || { echo 'Install util-linux (flock) first.' >&2; exit 1; }; fi
     base=${LOCAL_RUNNER_BASE_URL:-https://raw.githubusercontent.com/suminwell/github-runner/main}
-    root=${LOCAL_RUNNER_HOME:-"$HOME/.local/share/github-runner"}/$platform
+    default_root=${LOCAL_RUNNER_HOME:-"$HOME/.local/share/github-runner"}/$platform
+    previous_root=$HOME/.local/share/github-runner/$platform
+    if [ -z "${LOCAL_RUNNER_HOME:-}" ] && { [ -d "$previous_root/.state" ] || [ -d "$previous_root/$arch/.state" ]; }; then default_root=$previous_root; fi
+    installed_command=$(command -v ghr || :)
+    if [ -z "${LOCAL_RUNNER_HOME:-}" ] && [ -f "$installed_command" ]; then
+        installed_root=$(sed -n 's/^# ghr: //p' "$installed_command")
+        [ ! -f "$installed_root/conf/settings.json" ] || default_root=$installed_root
+    fi
+    root=$default_root
+    if [ -z "${LOCAL_RUNNER_HOME:-}" ] && [ -t 0 ]; then
+        printf '安装目录（维护bin和conf）[%s]: ' "$default_root"
+        IFS= read -r selected_root || selected_root=
+        root=${selected_root:-$default_root}
+    fi
     case "$root" in *'
 '*) echo 'Newlines are not supported in installation paths.' >&2; exit 1 ;; esac
     mkdir -p "$root"
@@ -88,17 +111,17 @@ install_main() {
     fi
     stop_installed_service
     migrate_layout
-    mkdir -p "$root/bin" "$root/.state/tools" "$root/logs"
+    mkdir -p "$root/bin/.cache" "$root/bin/tools" "$root/conf"
     jq_path=$(command -v jq)
     gh_path=$(command -v gh || :)
-    if [ -z "$gh_path" ] && [ -x "$root/.state/tools/gh" ]; then gh_path=$root/.state/tools/gh; fi
+    if [ -z "$gh_path" ] && [ -x "$root/bin/tools/gh" ]; then gh_path=$root/bin/tools/gh; fi
     if [ -n "$gh_path" ]; then
         gh_major=$("$gh_path" --version | sed -n '1s/^gh version \([0-9]*\)\..*/\1/p')
         gh_minor=$("$gh_path" --version | sed -n '1s/^gh version [0-9]*\.\([0-9]*\).*/\1/p')
         if [ "${gh_major:-0}" -lt 2 ] || { [ "${gh_major:-0}" -eq 2 ] && [ "${gh_minor:-0}" -lt 62 ]; }; then gh_path=; fi
     fi
     if [ -z "$gh_path" ]; then
-        temporary=$(mktemp -d "$root/.state/gh.XXXXXX")
+        temporary=$(mktemp -d "$root/bin/.cache/gh.XXXXXX")
         curl -fsSL --max-time 120 https://api.github.com/repos/cli/cli/releases/latest -o "$temporary/release.json"
         version=$("$jq_path" -r '.tag_name|ltrimstr("v")' "$temporary/release.json")
         cli_arch=$arch; [ "$arch" != x64 ] || cli_arch=amd64
@@ -114,33 +137,42 @@ install_main() {
         if [ "$extension" = zip ]; then unzip -q "$temporary/$filename" -d "$temporary/unpacked";
         else tar -xzf "$temporary/$filename" -C "$temporary/unpacked"; fi
         downloaded_gh=$(find "$temporary/unpacked" -type f -name gh -print | head -n 1)
-        cp "$downloaded_gh" "$root/.state/tools/gh"; chmod 700 "$root/.state/tools/gh"
-        gh_path=$root/.state/tools/gh
+        cp "$downloaded_gh" "$root/bin/tools/gh"; chmod 700 "$root/bin/tools/gh"
+        gh_path=$root/bin/tools/gh
         rm -rf "$temporary"
     fi
     "$gh_path" auth status --hostname github.com >/dev/null 2>&1 || "$gh_path" auth login --hostname github.com --web --scopes admin:org,repo
-    if [ -n "${GH_TOKEN:-}" ]; then printf '%s\n' "$GH_TOKEN" > "$root/.state/github-token";
-    elif [ -n "${GITHUB_TOKEN:-}" ]; then printf '%s\n' "$GITHUB_TOKEN" > "$root/.state/github-token";
-    else "$gh_path" auth token --hostname github.com > "$root/.state/github-token"; fi
-    chmod 600 "$root/.state/github-token"
-    printf '%s\n' "$gh_path" > "$root/.state/gh-path"
-    printf '%s\n' "$jq_path" > "$root/.state/jq-path"
-    [ -f "$root/.state/settings.json" ] || printf '{}\n' > "$root/.state/settings.json"
-    "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" \
-        '.platform=$platform|.arch=$arch|.gh=$gh|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
-        "$root/.state/settings.json" > "$root/.state/settings.new"
-    mv "$root/.state/settings.new" "$root/.state/settings.json"
-    fetch "$platform/install.sh" "$root/install.sh"
-    fetch "$platform/service.sh" "$root/service.sh"
-    chmod 700 "$root/install.sh" "$root/service.sh"
-    /bin/bash "$root/service.sh" prepare
-    if [ "$platform" = linux ]; then sudo /bin/bash "$root/.state/package/bin/installdependencies.sh"; fi
+    if [ -n "${GH_TOKEN:-}" ]; then printf '%s\n' "$GH_TOKEN" > "$root/conf/github-token";
+    elif [ -n "${GITHUB_TOKEN:-}" ]; then printf '%s\n' "$GITHUB_TOKEN" > "$root/conf/github-token";
+    else "$gh_path" auth token --hostname github.com > "$root/conf/github-token"; fi
+    chmod 600 "$root/conf/github-token"
+    printf '%s\n' "$gh_path" > "$root/conf/gh-path"
+    printf '%s\n' "$jq_path" > "$root/conf/jq-path"
+    default_work=$(pwd -P)
+    [ ! -f "$root/conf/settings.json" ] || default_work=$root
+    [ -f "$root/conf/settings.json" ] || printf '{}\n' > "$root/conf/settings.json"
+    "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" --argjson owner_uid "$(id -u)" --arg default_work "$default_work" \
+        '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
+        "$root/conf/settings.json" > "$root/conf/settings.new"
+    mv "$root/conf/settings.new" "$root/conf/settings.json"
+    fetch "$platform/install.sh" "$root/bin/install.sh"
+    fetch "$platform/service.sh" "$root/bin/service.sh"
+    fetch "$platform/ghr.sh" "$root/bin/ghr.sh"
+    fetch "$platform/runner.sh" "$root/bin/runner.sh"
+    chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh"
+    /bin/bash "$root/bin/service.sh" prepare
+    if [ "$platform" = linux ]; then sudo /bin/bash "$root/bin/.cache/package/bin/installdependencies.sh"; fi
+    /bin/bash "$root/bin/ghr.sh" --install-command
+    work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
+    mkdir -p "$work_dir/data" "$work_dir/logs"
+    printf 'Data/logs directory: %s\n' "$work_dir"
+    rm -f "$root/conf/stopped"
     user=$(id -un); user_id=$(id -u)
     definition=$(mktemp)
     if [ "$platform" = linux ]; then
         [ -d /run/systemd/system ] || { echo 'Linux must be booted with systemd.' >&2; rm -f "$definition"; exit 1; }
         service_name=local-github-runner-$user_id-$arch.service
-        exec_path=$(unit_quote "$root/service.sh" | sed 's/\$/$$/g')
+        exec_path=$(unit_quote "$root/bin/service.sh" | sed 's/\$/$$/g')
         cat > "$definition" <<UNIT
 [Unit]
 Description=GitHub organization runner supervisor
@@ -175,12 +207,12 @@ UNIT
 <plist version="1.0"><dict>
 <key>Label</key><string>$service_name</string>
 <key>UserName</key><string>$(xml "$user")</string>
-<key>ProgramArguments</key><array><string>/bin/bash</string><string>$(xml "$root/service.sh")</string></array>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>$(xml "$root/bin/service.sh")</string></array>
 <key>WorkingDirectory</key><string>$(xml "$root")</string>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><false/>
 <key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>90</integer>
 <key>EnvironmentVariables</key><dict><key>HOME</key><string>$(xml "$HOME")</string><key>PATH</key><string>$(xml "$PATH")</string></dict>
-<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>$(xml "$root/logs/launchd.log")</string>
+<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string>
 </dict></plist>
 PLIST
         sudo launchctl bootout "system/$service_name" 2>/dev/null || :
@@ -189,8 +221,10 @@ PLIST
         sudo launchctl bootstrap system "/Library/LaunchDaemons/$service_name.plist"
         sudo launchctl print "system/$service_name" >/dev/null
     fi
-    rm -f "$definition"
-    printf '\nInstalled %s\nStatus: bash "%s/service.sh" status\nLog: %s/logs/service.log\n' "$service_name" "$root" "$root"
+    rm -f "$definition" "$root/install.sh" "$root/service.sh" "$root/ghr.sh"
+    printf '\nInstalled %s\n\n' "$service_name"
+    /bin/bash "$root/bin/ghr.sh" help
+    case ":$PATH:" in *:/usr/local/bin:*) ;; *) printf '\nAdd /usr/local/bin to PATH: export PATH="/usr/local/bin:$PATH"\n' ;; esac
 }
 if [ -t 0 ]; then install_main "$@";
 elif ( : < /dev/tty ) 2>/dev/null; then install_main "$@" < /dev/tty;

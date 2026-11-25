@@ -1,4 +1,4 @@
-param([ValidateSet('auto','x64','arm64')][string]$Architecture = 'auto')
+﻿param([ValidateSet('auto','x64','arm64')][string]$Architecture = 'auto')
 $ErrorActionPreference = 'Stop'
 function Get-NativeArchitecture {
     # The machine environment reports native ARM64 even in an emulated x64 shell.
@@ -7,24 +7,38 @@ function Get-NativeArchitecture {
 }
 function Move-PreviousLayout([string]$InstallRoot, [string]$Arch) {
     $legacy = Join-Path $InstallRoot $Arch
-    $bin = Join-Path $InstallRoot 'bin'; $state = Join-Path $InstallRoot '.state'
-    if (-not (Test-Path (Join-Path $legacy '.state\settings.json'))) { return }
-    foreach ($part in @('bin','data','logs','.state')) {
-        if (Test-Path (Join-Path $InstallRoot $part)) { throw "Both layouts exist at $InstallRoot; resolve them before upgrading." }
+    if ((Test-Path (Join-Path $legacy '.state\settings.json')) -or (Test-Path (Join-Path $legacy 'conf\settings.json'))) {
+        foreach ($part in @('bin','data','logs','conf')) { if (Test-Path (Join-Path $InstallRoot $part)) { throw 'Both installation layouts exist; resolve them before upgrading.' } }
+        foreach ($part in @('bin','data','logs')) { $source = Join-Path $legacy $part; if (Test-Path $source) { Move-Item -LiteralPath $source -Destination (Join-Path $InstallRoot $part) } }
+        $oldState = if (Test-Path (Join-Path $legacy '.state')) { Join-Path $legacy '.state' } else { Join-Path $legacy 'conf' }
+        Move-Item -LiteralPath $oldState -Destination (Join-Path $InstallRoot 'conf')
+        if (-not @(Get-ChildItem -LiteralPath $legacy -Force).Count) { Remove-Item -LiteralPath $legacy }
     }
-    foreach ($part in @('bin','data','logs','.state')) {
-        $source = Join-Path $legacy $part
-        if (Test-Path -LiteralPath $source) { Move-Item -LiteralPath $source -Destination (Join-Path $installRoot $part) }
+    if (Test-Path (Join-Path $InstallRoot '.state')) {
+        if (Test-Path (Join-Path $InstallRoot 'conf')) { throw 'Both .state and conf exist; resolve them before upgrading.' }
+        Move-Item -LiteralPath (Join-Path $InstallRoot '.state') -Destination (Join-Path $InstallRoot 'conf')
     }
-    $statePath = Join-Path $state 'organizations.json'
-    if (Test-Path $statePath) {
-        $organizations = Get-Content -Raw -Encoding UTF8 $statePath | ConvertFrom-Json
-        foreach ($property in $organizations.PSObject.Properties) { $property.Value | Add-Member -NotePropertyName relocated -NotePropertyValue $true -Force }
-        [IO.File]::WriteAllText($statePath, ($organizations | ConvertTo-Json -Depth 30), (New-Object Text.UTF8Encoding($false)))
+    foreach ($pair in @(@('conf\package','bin\.cache\package'),@('conf\tools','bin\tools'))) {
+        $source = Join-Path $InstallRoot $pair[0]; $destination = Join-Path $InstallRoot $pair[1]
+        if (Test-Path $source) {
+            if (Test-Path $destination) { throw 'Both cache/tool directories exist.' }
+            New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
+            Move-Item -LiteralPath $source -Destination $destination
+        }
     }
-    Remove-Item (Join-Path $bin 'install.ps1'),(Join-Path $bin 'service.ps1') -Force -ErrorAction SilentlyContinue
-    if (-not @(Get-ChildItem -LiteralPath $legacy -Force).Count) { Remove-Item -LiteralPath $legacy }
-    Write-Host "Migrated existing installation to $installRoot; data and registration identities retained."
+    $oldBin = Join-Path $InstallRoot 'bin'
+    if (Test-Path $oldBin) {
+        foreach ($org in @(Get-ChildItem -Directory -LiteralPath $oldBin)) {
+            if (Test-Path (Join-Path $org.FullName 'runner\.runner')) {
+                $destination = Join-Path $InstallRoot "runner\$($org.Name)"
+                if (Test-Path $destination) { throw 'Both organization runner layouts exist.' }
+                New-Item -ItemType Directory -Path $destination -Force | Out-Null
+                Move-Item -LiteralPath (Join-Path $org.FullName 'runner') -Destination (Join-Path $destination 'app')
+                foreach ($wrapper in @('runner.ps1','listener.ps1')) { Remove-Item (Join-Path $org.FullName $wrapper) -Force -ErrorAction SilentlyContinue }
+                if (-not @(Get-ChildItem -LiteralPath $org.FullName -Force).Count) { Remove-Item -LiteralPath $org.FullName }
+            }
+        }
+    }
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -35,7 +49,18 @@ if ($Architecture -ne 'auto' -and $Architecture -ne $arch) { throw "Architecture
 $base = if ($env:LOCAL_RUNNER_BASE_URL) { $env:LOCAL_RUNNER_BASE_URL } else { 'https://raw.githubusercontent.com/suminwell/github-runner/main' }
 $installHome = if ($env:LOCAL_RUNNER_HOME) { $env:LOCAL_RUNNER_HOME } else { Join-Path $env:ProgramData 'local-github-runner' }
 $installRoot = Join-Path $installHome 'windows'
-$bin = Join-Path $installRoot 'bin'; $state = Join-Path $installRoot '.state'; $taskName = "LocalGitHubRunner-$arch"
+$previousRoot = Join-Path $env:ProgramData 'local-github-runner\windows'
+if (-not $env:LOCAL_RUNNER_HOME -and ((Test-Path (Join-Path $previousRoot '.state')) -or (Test-Path (Join-Path $previousRoot "$arch\.state")))) { $installRoot = $previousRoot }
+$existingCommand = Get-Command ghr.cmd -ErrorAction SilentlyContinue
+if (-not $env:LOCAL_RUNNER_HOME -and $existingCommand) {
+    $knownRoot = Split-Path (Split-Path $existingCommand.Source -Parent) -Parent
+    if (Test-Path (Join-Path $knownRoot 'conf\settings.json')) { $installRoot = $knownRoot }
+}
+if (-not $env:LOCAL_RUNNER_HOME -and -not [Console]::IsInputRedirected -and [Environment]::GetCommandLineArgs() -notcontains '-NonInteractive') {
+    $selectedRoot = Read-Host "安装目录（维护bin和conf）[$installRoot]"
+    if ($selectedRoot) { $installRoot = $selectedRoot }
+}
+$bin = Join-Path $installRoot 'bin'; $state = Join-Path $installRoot 'conf'; $taskName = "LocalGitHubRunner-$arch"
 $legacy = Join-Path $installRoot $arch
 $otherArch = if ($arch -eq 'x64') { 'arm64' } else { 'x64' }
 if (Test-Path (Join-Path $installRoot "$otherArch\.state\settings.json")) { throw 'An installation for another architecture exists; stop it and move it aside before upgrading.' }
@@ -47,7 +72,7 @@ if ($migrate) {
 }
 New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
 $installRoot = (Resolve-Path -LiteralPath $installRoot).Path
-$bin = Join-Path $installRoot 'bin'; $state = Join-Path $installRoot '.state'; $legacy = Join-Path $installRoot $arch
+$bin = Join-Path $installRoot 'bin'; $state = Join-Path $installRoot 'conf'; $legacy = Join-Path $installRoot $arch
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $acl = New-Object Security.AccessControl.DirectorySecurity
 $acl.SetAccessRuleProtection($true, $false)
@@ -60,7 +85,7 @@ $acl.AddAccessRule($rule)
 Set-Acl -LiteralPath $installRoot -AclObject $acl
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($task) {
-    if ($task.Actions.Arguments -notlike ('*"' + (Join-Path $installRoot 'service.ps1') + '"*') -and $task.Actions.Arguments -notlike ('*"' + (Join-Path $legacy 'bin\service.ps1') + '"*')) { throw 'Another installation owns this task name.' }
+    if ($task.Actions.Arguments -notlike ('*"' + (Join-Path $installRoot 'bin\service.ps1') + '"*') -and $task.Actions.Arguments -notlike ('*"' + (Join-Path $installRoot 'service.ps1') + '"*') -and $task.Actions.Arguments -notlike ('*"' + (Join-Path $legacy 'bin\service.ps1') + '"*')) { throw 'Another installation owns this task name.' }
     Disable-ScheduledTask -TaskName $taskName | Out-Null
     Stop-ScheduledTask -TaskName $taskName
     for ($attempt = 0; $attempt -lt 30 -and (Get-ScheduledTask -TaskName $taskName).State -eq 'Running'; $attempt++) { Start-Sleep -Milliseconds 200 }
@@ -73,19 +98,19 @@ if ($oldService) {
     & sc.exe delete $taskName | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Could not remove the previous service host.' }
 }
-$previousScript = if ($migrate) { Join-Path $legacy 'bin\service.ps1' } else { Join-Path $installRoot 'service.ps1' }
+$previousScript = if ($migrate) { Join-Path $legacy 'bin\service.ps1' } elseif (Test-Path (Join-Path $bin 'service.ps1')) { Join-Path $bin 'service.ps1' } else { Join-Path $installRoot 'service.ps1' }
 if (Test-Path -LiteralPath $previousScript) {
     & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $previousScript -Mode Stop
     if ($LASTEXITCODE -ne 0) { throw 'Could not stop existing runner processes; installation left unchanged.' }
 }
-if ($migrate) { Move-PreviousLayout $installRoot $arch }
-New-Item -ItemType Directory -Force -Path $bin, $state, (Join-Path $state 'tools'), (Join-Path $installRoot 'logs') | Out-Null
+Move-PreviousLayout $installRoot $arch
+New-Item -ItemType Directory -Force -Path $bin, $state, (Join-Path $bin 'tools'), (Join-Path $bin '.cache'), (Join-Path $installRoot 'runner') | Out-Null
 function Get-SourceFile([string]$Source, [string]$Destination) {
     if ($env:LOCAL_RUNNER_SOURCE_DIR) { Copy-Item -LiteralPath (Join-Path $env:LOCAL_RUNNER_SOURCE_DIR $Source) -Destination "$Destination.new" -Force }
     else { Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 "$base/$Source" -OutFile "$Destination.new" }
     Move-Item -LiteralPath "$Destination.new" -Destination $Destination -Force
 }
-$ghPath = Join-Path $state 'tools\gh.exe'
+$ghPath = Join-Path $bin 'tools\gh.exe'
 $existing = Get-Command gh -ErrorAction SilentlyContinue
 $usable = $false
 if ($existing) {
@@ -100,7 +125,7 @@ if ($usable) {
     $assetName = "gh_$($release.tag_name.TrimStart('v'))_windows_$cliArch.zip"
     $asset = @($release.assets | Where-Object name -eq $assetName)[0]
     if ($asset.digest -notmatch '^sha256:[a-fA-F0-9]{64}$') { throw 'Missing gh asset digest.' }
-    $temporary = Join-Path $state ('gh-' + [Guid]::NewGuid().ToString('N'))
+    $temporary = Join-Path (Join-Path $bin '.cache') ('gh-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temporary | Out-Null
     try {
         $archive = Join-Path $temporary 'gh.zip'
@@ -122,20 +147,29 @@ if (-not $token) { throw 'No GitHub credential available.' }
 [IO.File]::WriteAllText((Join-Path $state 'gh-path'), $ghPath, (New-Object Text.UTF8Encoding($false)))
 $settingsPath = Join-Path $state 'settings.json'
 $settings = @{}
+$defaultWork = (Get-Location).ProviderPath
 if (Test-Path $settingsPath) {
+    $defaultWork = $installRoot
     $previous = Get-Content -Raw -Encoding UTF8 -LiteralPath $settingsPath | ConvertFrom-Json
     foreach ($property in $previous.PSObject.Properties) { $settings[$property.Name] = $property.Value }
 }
 $settings.platform = 'windows'; $settings.arch = $arch; $settings.gh = $ghPath; $settings.Remove('python')
+if (-not $settings.ContainsKey('work_dir')) { $settings.work_dir = $defaultWork }
 if (-not $settings.ContainsKey('poll_seconds')) { $settings.poll_seconds = 300 }
 if (-not $settings.ContainsKey('restart_seconds')) { $settings.restart_seconds = 30 }
 if (-not $settings.ContainsKey('organizations')) { $settings.organizations = @() }
 [IO.File]::WriteAllText($settingsPath, ($settings | ConvertTo-Json -Depth 20), (New-Object Text.UTF8Encoding($false)))
-Get-SourceFile 'windows/install.ps1' (Join-Path $installRoot 'install.ps1')
-Get-SourceFile 'windows/service.ps1' (Join-Path $installRoot 'service.ps1')
-& $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $installRoot 'service.ps1') -Mode Prepare
+Get-SourceFile 'windows/install.ps1' (Join-Path $bin 'install.ps1')
+Get-SourceFile 'windows/service.ps1' (Join-Path $bin 'service.ps1')
+Get-SourceFile 'windows/ghr.ps1' (Join-Path $bin 'ghr.ps1')
+Get-SourceFile 'windows/runner.ps1' (Join-Path $bin 'runner.ps1')
+& $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'service.ps1') -Mode Prepare
 if ($LASTEXITCODE -ne 0) { throw 'Runner preparation failed.' }
-$action = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$installRoot\service.ps1`"" -WorkingDirectory $installRoot
+& $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'ghr.ps1') install-command
+if ($LASTEXITCODE -ne 0) { throw 'Management command setup failed.' }
+$env:Path = "$bin;$env:Path"
+Remove-Item (Join-Path $state 'stopped') -Force -ErrorAction SilentlyContinue
+$action = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$bin\service.ps1`"" -WorkingDirectory $installRoot
 $boot = New-ScheduledTaskTrigger -AtStartup
 # Indefinite repetition also recovers clean exits; IgnoreNew keeps only one manager.
 $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
@@ -147,6 +181,8 @@ Enable-ScheduledTask -TaskName $taskName | Out-Null
 Start-ScheduledTask -TaskName $taskName
 foreach ($old in @('manager.py','windows-service.cs','LocalGitHubRunner.exe')) { Remove-Item (Join-Path $bin $old) -Force -ErrorAction SilentlyContinue }
 Remove-Item (Join-Path $state 'python') -Recurse -Force -ErrorAction SilentlyContinue
+foreach ($file in @('install.ps1','service.ps1','ghr.ps1')) { Remove-Item (Join-Path $installRoot $file) -Force -ErrorAction SilentlyContinue }
 Write-Host "Installed $taskName in $installRoot"
-Write-Host "Task: Get-ScheduledTask '$taskName'"
-Write-Host "Runner status: & '$installRoot\service.ps1' -Mode Status"
+Write-Host "Data/logs directory: $($settings.work_dir)"
+& $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'ghr.ps1') help
+Write-Host 'If ghr is not found in an existing terminal, open a new terminal.'

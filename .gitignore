@@ -1,6 +1,10 @@
 **/.state/
+**/conf/
 **/data/
 **/logs/
 /linux/bin/
 /macos/bin/
 /windows/bin/
+/linux/runner/
+/macos/runner/
+/windows/runner/

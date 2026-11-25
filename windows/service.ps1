@@ -1,7 +1,7 @@
 param(
     [ValidateSet('Serve','Worker','Prepare','Status','Stop','Once','Library')][string]$Mode = 'Serve',
     [string]$OrgId,
-    [string]$Root = $(if ($env:LOCAL_RUNNER_ROOT) { $env:LOCAL_RUNNER_ROOT } else { $PSScriptRoot })
+    [string]$Root = $(if ($env:LOCAL_RUNNER_ROOT) { $env:LOCAL_RUNNER_ROOT } else { Split-Path $PSScriptRoot -Parent })
 )
 $ErrorActionPreference = 'Stop'
 $script:Root = $Root
@@ -19,7 +19,7 @@ function Read-Json([string]$Path) {
     return $null
 }
 function Write-Log([string]$Message) {
-    $path = Join-Path $script:Root 'logs\service.log'
+    $path = Join-Path $script:LogDir 'service.log'
     if ((Test-Path $path) -and (Get-Item $path).Length -gt 5MB) {
         foreach ($number in @(2,1)) { if (Test-Path "$path.$number") { Move-Item "$path.$number" "$path.$($number+1)" -Force } }
         Move-Item $path "$path.1" -Force
@@ -28,22 +28,25 @@ function Write-Log([string]$Message) {
 }
 function Get-State {
     $state = @{}
-    $raw = Read-Json (Join-Path $script:Root '.state\organizations.json')
+    $raw = Read-Json (Join-Path $script:Root 'conf\organizations.json')
     if ($null -ne $raw) { foreach ($property in $raw.PSObject.Properties) { $state[$property.Name] = $property.Value } }
     return $state
 }
-function Save-State($State) { Write-Json (Join-Path $script:Root '.state\organizations.json') $State }
-function Initialize-Manager {
-    $script:Settings = Read-Json (Join-Path $script:Root '.state\settings.json')
+function Save-State($State) { Write-Json (Join-Path $script:Root 'conf\organizations.json') $State }
+function Initialize-Manager([switch]$Control) {
+    $script:Settings = Read-Json (Join-Path $script:Root 'conf\settings.json')
     if ($script:Settings.arch -notin @('x64','arm64')) { throw 'Unsupported architecture.' }
     $script:Prefix = 'local-windows-' + $script:Settings.arch
-    $script:Gh = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:Root '.state\gh-path')).Trim()
+    $script:WorkDir = if ($script:Settings.work_dir) { $script:Settings.work_dir } else { $script:Root }
+    $script:DataDir = Join-Path $script:WorkDir 'data'; $script:LogDir = Join-Path $script:WorkDir 'logs'
+    if (-not $Control) { New-Item -ItemType Directory -Force -Path $script:LogDir | Out-Null }
+    $script:Gh = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:Root 'conf\gh-path')).Trim()
     $script:PollSeconds = [Math]::Max(10, $(if ($script:Settings.poll_seconds) { $script:Settings.poll_seconds } else { 300 }))
     $script:RestartSeconds = [Math]::Max(1, $(if ($script:Settings.restart_seconds) { $script:Settings.restart_seconds } else { 30 }))
-    foreach ($directory in @('logs','data','.state\workers','.state\children','.state\paused','.state\retry')) {
+    foreach ($directory in @('bin\.cache','conf\workers','conf\children','conf\paused','conf\retry')) {
         New-Item -ItemType Directory -Force -Path (Join-Path $script:Root $directory) | Out-Null
     }
-    if (-not (Test-Path (Join-Path $script:Root '.state\organizations.json'))) { Save-State @{} }
+    if (-not (Test-Path (Join-Path $script:Root 'conf\organizations.json'))) { Save-State @{} }
 }
 function Quote-Argument([string]$Value) {
     $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
@@ -61,7 +64,7 @@ function New-ProcessInfo([string]$Executable, [string[]]$Arguments, [string]$Dir
 function Invoke-Native([string]$Executable, [string[]]$Arguments, [int]$Timeout = 90, [switch]$Authentication, [string]$Directory = $script:Root) {
     $info = New-ProcessInfo $Executable $Arguments $Directory
     if ($Authentication) {
-        $info.EnvironmentVariables['GH_TOKEN'] = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:Root '.state\github-token')).Trim()
+        $info.EnvironmentVariables['GH_TOKEN'] = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:Root 'conf\github-token')).Trim()
         $info.EnvironmentVariables['GH_HOST'] = 'github.com'
         $info.EnvironmentVariables['GH_PROMPT_DISABLED'] = '1'
     }
@@ -104,57 +107,39 @@ function Stop-Record([string]$Path) {
     Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
 }
 function Stop-Worker([string]$Id) {
-    Stop-Record (Join-Path $script:Root ".state\workers\$Id.json")
-    Stop-Record (Join-Path $script:Root ".state\children\$Id.json")
+    Stop-Record (Join-Path $script:Root "conf\workers\$Id.json")
+    Stop-Record (Join-Path $script:Root "conf\children\$Id.json")
 }
 function Write-RunnerWrapper([string]$Id, [string]$Login) {
-    $directory = Join-Path $script:Root "bin\$Login"
+    $directory = Join-Path $script:Root "runner\$Login"
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
-    $wrapper = "& (Join-Path (Split-Path (Split-Path `$PSScriptRoot -Parent) -Parent) 'service.ps1') -Mode Worker -OrgId '$Id'`nexit `$LASTEXITCODE`n"
-    Write-AtomicText (Join-Path $directory 'runner.ps1') $wrapper
-    Write-AtomicText (Join-Path $directory 'listener.ps1') "Set-Location (Join-Path `$PSScriptRoot 'runner')`n& .\run.cmd`nexit `$LASTEXITCODE`n"
+    Copy-Item -LiteralPath (Join-Path $script:Root 'bin\runner.ps1') -Destination (Join-Path $directory 'runner.ps1') -Force
+    Write-AtomicText (Join-Path $directory 'listener.ps1') "Set-Location (Join-Path `$PSScriptRoot 'app')`n& .\run.cmd`nexit `$LASTEXITCODE`n"
 }
 function Start-Worker([string]$Id, [string]$Login) {
     $entry = (Get-State)[$Id]
-    if ($entry.relocated -or -not (Test-IndexedName $entry.runner_name)) { return }
-    if (Test-Path (Join-Path $script:Root ".state\paused\$Id")) { return }
-    if (-not (Test-Path (Join-Path $script:Root "bin\$Login\runner\.runner"))) { return }
-    $record = Join-Path $script:Root ".state\workers\$Id.json"
+    if ($entry.active -eq $false -or $entry.relocated -or -not (Test-IndexedName $entry.runner_name) -or (Test-Path (Join-Path $script:Root 'conf\stopped'))) { return }
+    if (Test-Path (Join-Path $script:Root "conf\paused\$Id")) { return }
+    if (-not (Test-Path (Join-Path $script:Root "runner\$Login\app\.runner"))) { return }
+    $record = Join-Path $script:Root "conf\workers\$Id.json"
     if ($null -ne (Get-RecordedProcess $record)) { return }
-    $retry = Read-Json (Join-Path $script:Root ".state\retry\$Id.json")
+    $retry = Read-Json (Join-Path $script:Root "conf\retry\$Id.json")
     if ($null -ne $retry -and [DateTime]::UtcNow.Ticks -lt [long]$retry.after) { return }
     Stop-Worker $Id
+    Set-RunnerWorkspace $Login
     Write-RunnerWrapper $Id $Login
-    $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $script:Root "bin\$Login\runner.ps1"))
+    $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $script:Root "runner\$Login\runner.ps1"),'-Root',$script:Root,'-OrgId',$Id)
     $process = [Diagnostics.Process]::Start($info)
     Record-Process $record $process
-    Write-Json (Join-Path $script:Root ".state\retry\$Id.json") @{ after=[DateTime]::UtcNow.AddSeconds($script:RestartSeconds).Ticks }
+    Write-Json (Join-Path $script:Root "conf\retry\$Id.json") @{ after=[DateTime]::UtcNow.AddSeconds($script:RestartSeconds).Ticks }
     Write-Log "Started $((Get-State)[$Id].runner_name) for $Login (pid $($process.Id))"
 }
 function Ensure-Workers {
     $state = Get-State
     foreach ($id in @($state.Keys)) { if ($id -match '^\d+$' -and (Test-Organization $state[$id].login)) { Start-Worker $id $state[$id].login } }
 }
-function Invoke-Worker([string]$Id) {
-    if ($Id -notmatch '^\d+$') { throw 'Invalid organization ID.' }
-    $login = (Get-State)[$Id].login
-    if (-not (Test-Organization $login)) { throw 'Invalid organization.' }
-    $record = Join-Path $script:Root ".state\children\$Id.json"
-    $lock = [IO.File]::Open((Join-Path $script:Root ".state\worker-$Id.lock"), 'OpenOrCreate', 'ReadWrite', 'None')
-    try {
-        Stop-Record $record
-        while ($true) {
-            $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $script:Root "bin\$login\listener.ps1"))
-            $process = [Diagnostics.Process]::Start($info)
-            Record-Process $record $process
-            $process.WaitForExit(); $process.Dispose()
-            Remove-Item -LiteralPath $record -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds $script:RestartSeconds
-        }
-    } finally { Stop-Record $record; $lock.Dispose() }
-}
 function Ensure-Package {
-    $script:Package = Join-Path $script:Root '.state\package'
+    $script:Package = Join-Path $script:Root 'bin\.cache\package'
     $complete = Join-Path $script:Package '.complete'
     if ((Test-Path $complete) -and (Get-Item $complete).LastWriteTimeUtc -gt [DateTime]::UtcNow.AddDays(-1)) { return }
     $release = Invoke-GitHubApi 'repos/actions/runner/releases/latest'
@@ -162,7 +147,7 @@ function Ensure-Package {
     $name = "actions-runner-win-$($script:Settings.arch)-$version.zip"
     $asset = @($release.assets | Where-Object name -eq $name)[0]
     if ($asset.digest -notmatch '^sha256:[a-fA-F0-9]{64}$') { throw 'Runner release has no SHA-256 digest.' }
-    $temporary = Join-Path $script:Root ('.state\download-' + [Guid]::NewGuid().ToString('N'))
+    $temporary = Join-Path $script:Root ('bin\.cache\download-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $temporary | Out-Null
     try {
         $archive = Join-Path $temporary 'runner.zip'
@@ -176,9 +161,18 @@ function Ensure-Package {
     } finally { Remove-Item -LiteralPath $temporary -Recurse -Force }
     Write-Log "Downloaded official Runner $version"
 }
+function Set-RunnerWorkspace([string]$Login) {
+    if (-not (Test-Organization $Login)) { throw 'Invalid organization.' }
+    $work = Join-Path $script:DataDir $Login
+    New-Item -ItemType Directory -Force -Path $work | Out-Null
+    $configuration = Join-Path $script:Root "runner\$Login\app\.runner"
+    $runner = Read-Json $configuration
+    $runner | Add-Member -NotePropertyName workFolder -NotePropertyValue $work -Force
+    Write-Json $configuration $runner
+}
 function Register-Runner([string]$Login, [string]$Name) {
     Ensure-Package
-    $directory = Join-Path $script:Root "bin\$Login\runner"
+    $directory = Join-Path $script:Root "runner\$Login\app"
     if (-not (Test-Path (Join-Path $directory 'run.cmd'))) {
         if (Test-Path "$directory.staging") { Remove-Item "$directory.staging" -Recurse -Force }
         New-Item -ItemType Directory -Force -Path (Split-Path $directory -Parent) | Out-Null
@@ -186,7 +180,7 @@ function Register-Runner([string]$Login, [string]$Name) {
         if (Test-Path $directory) { Remove-Item $directory -Recurse -Force }
         Move-Item "$directory.staging" $directory
     }
-    $work = Join-Path $script:Root "data\$Login"
+    $work = Join-Path $script:DataDir $Login
     New-Item -ItemType Directory -Force -Path $work | Out-Null
     $token = (Invoke-GitHubApi "orgs/$Login/actions/runners/registration-token" -Method POST).token
     $wrapper = Join-Path $directory 'configure.ps1'
@@ -215,7 +209,7 @@ function Reconcile-Organization([string]$Id, [string]$Login) {
     if ($Id -notmatch '^\d+$' -or -not (Test-Organization $Login)) { throw 'Invalid organization.' }
     $remote = @(Get-RemoteRunners $Login)
     $state = Get-State; $entry = $state[$Id]
-    $directory = Join-Path $script:Root "bin\$Login\runner"
+    $directory = Join-Path $script:Root "runner\$Login\app"
     $local = Read-Json (Join-Path $directory '.runner')
     # Recover ownership when registration succeeded before state was saved.
     if ($null -eq $entry -and $null -ne $local) {
@@ -225,7 +219,7 @@ function Reconcile-Organization([string]$Id, [string]$Login) {
     $registered = @($remote | Where-Object { $null -ne $entry -and $_.id -eq $entry.runner_id }) | Select-Object -First 1
     $preferred = $entry.runner_name
     if ($null -ne $registered -and (Test-IndexedName $registered.name)) { $preferred = $registered.name }
-    $pause = Join-Path $script:Root ".state\paused\$Id"
+    $pause = Join-Path $script:Root "conf\paused\$Id"
     if ($null -ne $entry -and ($entry.login -ne $Login -or $null -eq $registered -or $local.agentId -ne $entry.runner_id -or -not (Test-IndexedName $registered.name) -or $entry.relocated)) {
         if ($null -ne $registered -and $registered.busy) { return }
         Write-AtomicText $pause 'paused'; Stop-Worker $Id
@@ -276,18 +270,23 @@ function Invoke-Reconcile {
     $state = Get-State
     foreach ($id in @($state.Keys)) {
         if (-not $desired.ContainsKey($id)) {
-            Stop-Worker $id; $state.Remove($id); Save-State $state
+            Stop-Worker $id
+            $state[$id] | Add-Member -NotePropertyName active -NotePropertyValue $false -Force
+            Save-State $state
             Write-Log "Stopped organization $id; local data retained"
         }
     }
 }
 function Invoke-Supervisor {
-    $lock = [IO.File]::Open((Join-Path $script:Root '.state\service.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+    if (Test-Path (Join-Path $script:Root 'conf\stopped')) { return }
+    $lock = [IO.File]::Open((Join-Path $script:Root 'conf\service.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     try {
-        foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $script:Root ".state\$folder") -Filter *.json | ForEach-Object { Stop-Record $_.FullName } }
+        Record-Process (Join-Path $script:Root 'conf\manager.json') ([Diagnostics.Process]::GetCurrentProcess())
+        Write-AtomicText (Join-Path $script:Root 'conf\active-work-dir') $script:WorkDir
+        foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $script:Root "conf\$folder") -Filter *.json | ForEach-Object { Stop-Record $_.FullName } }
         Write-Log "Started PowerShell supervisor $script:Prefix"
         $next = [DateTime]::MinValue
-        while ($true) {
+        while (-not (Test-Path (Join-Path $script:Root 'conf\stopped'))) {
             Ensure-Workers
             if ([DateTime]::UtcNow -ge $next) {
                 try { Invoke-Reconcile } catch { Write-Log "Discovery failed; retaining current runners: $($_.Exception.Message)" }
@@ -297,21 +296,22 @@ function Invoke-Supervisor {
             Start-Sleep -Seconds 5
         }
     } finally {
-        foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $script:Root ".state\$folder") -Filter *.json | ForEach-Object { Stop-Record $_.FullName } }
+        foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $script:Root "conf\$folder") -Filter *.json | ForEach-Object { Stop-Record $_.FullName } }
         $lock.Dispose()
+        Remove-Item (Join-Path $script:Root 'conf\manager.json') -Force -ErrorAction SilentlyContinue
     }
 }
 if ($Mode -ne 'Library') {
     Initialize-Manager
     switch ($Mode) {
         'Serve' { Invoke-Supervisor }
-        'Worker' { Invoke-Worker $OrgId }
+        'Worker' { & (Join-Path $script:Root 'bin\runner.ps1') -Root $script:Root -OrgId $OrgId }
         'Prepare' { Ensure-Package }
         'Once' { Invoke-Reconcile }
         'Stop' {
-            $lock = [IO.File]::Open((Join-Path $script:Root '.state\service.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
+            $lock = [IO.File]::Open((Join-Path $script:Root 'conf\service.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
             try {
-                foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $script:Root ".state\$folder") -Filter *.json | ForEach-Object { Stop-Record $_.FullName } }
+                foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $script:Root "conf\$folder") -Filter *.json | ForEach-Object { Stop-Record $_.FullName } }
             } finally { $lock.Dispose() }
         }
         'Status' {

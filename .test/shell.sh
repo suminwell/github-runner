@@ -3,9 +3,12 @@ set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 case "$(uname -s)" in Darwin) PLATFORM=macos ;; *) PLATFORM=linux ;; esac
 FIXTURE=$(mktemp -d "${TMPDIR:-/tmp}/runner-shell.XXXXXX")
+FIXTURE=$(cd "$FIXTURE" && pwd -P)
 export FAKE_FIXTURE=$FIXTURE
 cleanup() {
     if declare -F stop_worker >/dev/null; then
+        stop_record "$ROOT/conf/manager.pid" 2>/dev/null || :
+        [ ! -f "$FIXTURE/follower.pid" ] || stop_record "$FIXTURE/follower.pid" 2>/dev/null || :
         for id in 1 2 3 4 5 6 7; do stop_worker "$id" 2>/dev/null || :; done
     fi
     if [ "${TEST_FAILED:-1}" = 0 ]; then rm -rf "$FIXTURE"; else printf "Retained fixture: %s\n" "$FIXTURE"; fi
@@ -79,40 +82,42 @@ INSTALL
     unset -f uname
     for arch in x64 arm64; do
         root=$FIXTURE/upgrade-$arch
-        mkdir -p "$root/$arch/.state" "$root/$arch/bin/alpha/runner" "$root/$arch/data/alpha/repo" "$root/$arch/logs"
-        printf '{}\n' > "$root/$arch/.state/settings.json"
-        printf '{"1":{"login":"alpha","runner_id":100,"runner_name":"local-linux-x64-3"}}\n' > "$root/$arch/.state/organizations.json"
+        mkdir -p "$root/$arch/conf" "$root/$arch/bin/alpha/runner" "$root/$arch/data/alpha/repo" "$root/$arch/logs"
+        printf '{}\n' > "$root/$arch/conf/settings.json"
+        printf '{"1":{"login":"alpha","runner_id":100,"runner_name":"local-linux-x64-3"}}\n' > "$root/$arch/conf/organizations.json"
         printf 'keep' > "$root/$arch/data/alpha/repo/.hidden"
         printf 'credential' > "$root/$arch/bin/alpha/runner/.credentials"
         touch "$root/$arch/bin/install.sh" "$root/$arch/bin/service.sh"
         migrate_layout
         assert test ! -d "$root/$arch"
-        assert test ! -f "$root/bin/service.sh"
+        assert test -f "$root/bin/service.sh"
         assert test "$(cat "$root/data/alpha/repo/.hidden")" = keep
         assert test "$(cat "$root/bin/alpha/runner/.credentials")" = credential
-        assert jq -e '."1".relocated and ."1".runner_id==100 and ."1".runner_name=="local-linux-x64-3"' "$root/.state/organizations.json"
+        assert jq -e '."1".runner_id==100 and ."1".runner_name=="local-linux-x64-3"' "$root/conf/organizations.json"
         migrate_layout
     done
     root=$FIXTURE/conflicting-layout; arch=x64
-    mkdir -p "$root/$arch/.state" "$root/data"
-    printf '{}\n' > "$root/$arch/.state/settings.json"
+    mkdir -p "$root/$arch/conf" "$root/data"
+    printf '{}\n' > "$root/$arch/conf/settings.json"
     if (migrate_layout) 2>/dev/null; then echo 'Merged conflicting layouts' >&2; exit 1; fi
-    assert test -f "$root/$arch/.state/settings.json"
+    assert test -f "$root/$arch/conf/settings.json"
 )
 for arch in x64 arm64; do
     export LOCAL_RUNNER_ROOT=$FIXTURE/$arch
     ROOT=$LOCAL_RUNNER_ROOT
-    mkdir -p "$ROOT/bin" "$ROOT/.state/package"
-    cp "$REPO/$PLATFORM/service.sh" "$ROOT/service.sh"
-    printf '%s\n' "$(command -v jq)" > "$ROOT/.state/jq-path"
-    printf '/usr/bin/false\n' > "$ROOT/.state/gh-path"
-    printf 'secret-test-token\n' > "$ROOT/.state/github-token"
-    jq -n --arg arch "$arch" '{arch:$arch,poll_seconds:10,restart_seconds:1,organizations:[]}' > "$ROOT/.state/settings.json"
-    printf 'fixture\n' > "$ROOT/.state/package/.complete"
+    mkdir -p "$ROOT/bin" "$ROOT/conf" "$ROOT/bin/.cache/package"
+    cp "$REPO/$PLATFORM/service.sh" "$ROOT/bin/service.sh"
+    cp "$REPO/$PLATFORM/runner.sh" "$ROOT/bin/runner.sh"
+    cp "$REPO/$PLATFORM/ghr.sh" "$ROOT/bin/ghr.sh"
+    printf '%s\n' "$(command -v jq)" > "$ROOT/conf/jq-path"
+    printf '/usr/bin/false\n' > "$ROOT/conf/gh-path"
+    printf 'secret-test-token\n' > "$ROOT/conf/github-token"
+    jq -n --arg arch "$arch" '{arch:$arch,poll_seconds:10,restart_seconds:1,organizations:[]}' > "$ROOT/conf/settings.json"
+    printf 'fixture\n' > "$ROOT/bin/.cache/package/.complete"
     printf '{}\n' > "$FIXTURE/remote.json"
     printf '100\n' > "$FIXTURE/next-id"
     printf '[[{"state":"active","organization":{"id":1,"login":"alpha"}}]]\n' > "$FIXTURE/memberships.json"
-    cat > "$ROOT/.state/package/config.sh" <<'CONFIG'
+    cat > "$ROOT/bin/.cache/package/config.sh" <<'CONFIG'
 #!/bin/bash
 set -eu
 while [ "$#" -gt 0 ]; do
@@ -134,21 +139,23 @@ jq --arg login "$login" --arg name "$name" --argjson id "$id" '.[$login] = ((.[$
 mv "$FAKE_FIXTURE/remote.new" "$FAKE_FIXTURE/remote.json"
 [ "$login" != partial ] || exit 1
 CONFIG
-    cat > "$ROOT/.state/package/run.sh" <<'RUN'
+    cat > "$ROOT/bin/.cache/package/run.sh" <<'RUN'
 #!/bin/bash
 [ -z "${GH_TOKEN:-}" ] || exit 92
 printf 'run\n' >> "$FAKE_FIXTURE/listener-runs"
 sleep 0.2
 RUN
-    . "$ROOT/service.sh"
+    . "$ROOT/bin/ghr.sh"
     init
     api() {
         local endpoint=$1 login runner_id
         case "$endpoint" in
+            organizations/*) runner_id=${endpoint##*/}; jq -c --arg id "$runner_id" '{id:($id|tonumber),login:.[$id].login}' "$ROOT/conf/organizations.json" ;;
             user/memberships/*) [ ! -f "$FIXTURE/fail-discovery" ] || return 1; cat "$FIXTURE/memberships.json" ;;
             */registration-token) printf '{"token":"temporary"}\n' ;;
             *'/runners?'*) login=${endpoint#orgs/}; login=${login%%/*}; jq -c --arg login "$login" '(.[$login] // []) as $r | [{runners:$r[:1]},{runners:$r[1:]}]' "$FIXTURE/remote.json" ;;
             */actions/runners/*)
+                [ ! -f "$FIXTURE/fail-delete" ] || return 1
                 login=${endpoint#orgs/}; login=${login%%/*}; runner_id=${endpoint##*/}
                 jq --arg login "$login" --argjson id "$runner_id" '.[$login] = [.[$login][] | select(.id!=$id)]' "$FIXTURE/remote.json" > "$FIXTURE/remote.new"
                 mv "$FIXTURE/remote.new" "$FIXTURE/remote.json" ;;
@@ -157,34 +164,34 @@ RUN
     }
     export GH_TOKEN=should-not-reach-runner
     reconcile
-    assert jq -e '."1".login=="alpha" and ."1".runner_id==100' "$ROOT/.state/organizations.json"
+    assert jq -e '."1".login=="alpha" and ."1".runner_id==100' "$ROOT/conf/organizations.json"
     assert jq -e --arg name "$PREFIX-1" '.alpha[0].name==$name' "$FIXTURE/remote.json"
-    assert jq -e --arg name "$PREFIX-1" '."1".runner_name==$name' "$ROOT/.state/organizations.json"
-    assert jq -e --arg work "$ROOT/data/alpha" '.work==$work' "$ROOT/bin/alpha/runner/.runner"
+    assert jq -e --arg name "$PREFIX-1" '."1".runner_name==$name' "$ROOT/conf/organizations.json"
+    assert jq -e --arg work "$ROOT/data/alpha" '.work==$work' "$ROOT/runner/alpha/app/.runner"
     reconcile
     assert test "$(cat "$FIXTURE/next-id")" = 101
     touch "$FIXTURE/fail-discovery"
     if reconcile; then echo 'Discovery failure not propagated' >&2; exit 1; fi
-    assert jq -e 'has("1")' "$ROOT/.state/organizations.json"
+    assert jq -e 'has("1")' "$ROOT/conf/organizations.json"
     rm "$FIXTURE/fail-discovery"
     # Remote deletion and lost local configuration each recover the owned runner.
     printf '{}\n' > "$FIXTURE/remote.json"; reconcile
     assert test "$(cat "$FIXTURE/next-id")" = 102
-    rm "$ROOT/bin/alpha/runner/.runner"; reconcile
+    rm "$ROOT/runner/alpha/app/.runner"; reconcile
     assert test "$(cat "$FIXTURE/next-id")" = 103
     # Rename keeps old data and defers while the runner is busy.
     mkdir -p "$ROOT/data/alpha/repo"; printf keep > "$ROOT/data/alpha/repo/keep"
     printf '[[{"state":"active","organization":{"id":1,"login":"renamed"}}]]\n' > "$FIXTURE/memberships.json"
     jq '.renamed=.alpha|del(.alpha)|.renamed[0].busy=true' "$FIXTURE/remote.json" > "$FIXTURE/remote.new"; mv "$FIXTURE/remote.new" "$FIXTURE/remote.json"
     reconcile
-    assert jq -e '."1".login=="alpha"' "$ROOT/.state/organizations.json"
+    assert jq -e '."1".login=="alpha"' "$ROOT/conf/organizations.json"
     jq '.renamed[0].busy=false' "$FIXTURE/remote.json" > "$FIXTURE/remote.new"; mv "$FIXTURE/remote.new" "$FIXTURE/remote.json"
     reconcile
-    assert jq -e '."1".login=="renamed"' "$ROOT/.state/organizations.json"
+    assert jq -e '."1".login=="renamed"' "$ROOT/conf/organizations.json"
     assert test -f "$ROOT/data/alpha/repo/keep"
     assert test -d "$ROOT/data/renamed"
     # Lost state after successful registration recovers the existing identity.
-    printf '{}\n' > "$ROOT/.state/organizations.json"; previous=$(cat "$FIXTURE/next-id"); reconcile
+    printf '{}\n' > "$ROOT/conf/organizations.json"; previous=$(cat "$FIXTURE/next-id"); reconcile
     assert test "$(cat "$FIXTURE/next-id")" = "$previous"
     # Each organization/OS/architecture has an independent sequence; all pages count.
     other=x64; [ "$arch" != x64 ] || other=arm64
@@ -203,19 +210,19 @@ RUN
     assert jq -e --arg name "$PREFIX-2" '.race[-1].name==$name and .race[0].id==997' "$FIXTURE/remote.json"
     # Registration may report failure after it persisted credentials: recover the ID.
     reconcile_one 6 partial
-    assert jq -e --arg name "$PREFIX-1" '."6".runner_name==$name' "$ROOT/.state/organizations.json"
+    assert jq -e --arg name "$PREFIX-1" '."6".runner_name==$name' "$ROOT/conf/organizations.json"
     # A migrated registration is reconfigured with its number and new work path.
-    jq '."3".relocated=true' "$ROOT/.state/organizations.json" > "$ROOT/.state/state.new"; mv "$ROOT/.state/state.new" "$ROOT/.state/organizations.json"
+    jq '."3".relocated=true' "$ROOT/conf/organizations.json" > "$ROOT/conf/state.new"; mv "$ROOT/conf/state.new" "$ROOT/conf/organizations.json"
     reconcile_one 3 collision
-    assert jq -e --arg name "$PREFIX-11" '."3".runner_name==$name and (."3"|has("relocated")|not)' "$ROOT/.state/organizations.json"
+    assert jq -e --arg name "$PREFIX-11" '."3".runner_name==$name and (."3"|has("relocated")|not)' "$ROOT/conf/organizations.json"
     # If another installation takes a deleted registration's number, allocate anew.
     jq --arg name "$PREFIX-11" '.collision |= map(if .name==$name then .id=995 else . end)' "$FIXTURE/remote.json" > "$FIXTURE/remote.new"; mv "$FIXTURE/remote.new" "$FIXTURE/remote.json"
     reconcile_one 3 collision
     assert jq -e --arg name "$PREFIX-12" '.collision[-1].name==$name and any(.collision[]; .id==995)' "$FIXTURE/remote.json"
     # A legacy unnumbered runner is upgraded only after it becomes idle.
     jq --arg name "$PREFIX" '.legacy=[{id:996,name:$name,busy:true}]' "$FIXTURE/remote.json" > "$FIXTURE/remote.new"; mv "$FIXTURE/remote.new" "$FIXTURE/remote.json"
-    mkdir -p "$ROOT/bin/legacy/runner"
-    printf '{"agentId":996}\n' > "$ROOT/bin/legacy/runner/.runner"
+    mkdir -p "$ROOT/runner/legacy/app"
+    printf '{"agentId":996}\n' > "$ROOT/runner/legacy/app/.runner"
     save_entry 7 legacy 996 "$PREFIX"
     reconcile_one 7 legacy
     assert jq -e --arg name "$PREFIX" '.legacy[0].name==$name' "$FIXTURE/remote.json"
@@ -233,13 +240,64 @@ RUN
         sleep 0.1
     done
     assert test "$(wc -l < "$FIXTURE/listener-runs")" -ge 2
-    assert record_alive "$ROOT/.state/workers/1.pid"
+    assert record_alive "$ROOT/conf/workers/1.pid"
     stop_worker 1
-    assert test ! -f "$ROOT/.state/workers/1.pid"
+    assert test ! -f "$ROOT/conf/workers/1.pid"
     printf '[[]]\n' > "$FIXTURE/memberships.json"; reconcile
-    assert jq -e 'length==0' "$ROOT/.state/organizations.json"
+    assert jq -e 'all(.[]; .active==false)' "$ROOT/conf/organizations.json"
     assert test -f "$ROOT/data/alpha/repo/keep"
     if grep -q 'secret-test-token\|should-not-reach-runner' "$ROOT/logs/service.log"; then echo 'Credential leaked to log' >&2; exit 1; fi
+    # Real CLI, processes and file switching; only the OS service manager is faked.
+    privileged() { "$@"; }
+    native_service() {
+        printf '%s\n' "$1" >> "$FIXTURE/native-actions"
+        if [ "$1" = start ]; then /bin/bash "$ROOT/bin/service.sh" > "$FIXTURE/supervisor-output" 2>&1 & fi
+    }
+    command_path=$FIXTURE/commands-$arch/ghr
+    install_cli "$command_path"
+    assert "$command_path" help
+    assert command_main status
+    jq '."1".active=true' "$ROOT/conf/organizations.json" > "$ROOT/conf/state.new"; mv "$ROOT/conf/state.new" "$ROOT/conf/organizations.json"
+    rm -f "$ROOT/conf/paused/1"
+    command_main start
+    for attempt in $(seq 1 100); do record_alive "$ROOT/conf/manager.pid" && break; sleep 0.1; done
+    assert record_alive "$ROOT/conf/manager.pid"
+    new_work=$FIXTURE/"new work $arch"
+    "$command_path" config "--dir=$new_work"
+    assert test "$(cat "$ROOT/conf/active-work-dir")" = "$ROOT"
+    (command_main restart)
+    for attempt in $(seq 1 100); do
+        if [ "$(cat "$ROOT/conf/active-work-dir" 2>/dev/null || :)" = "$new_work" ] && jq -e --arg work "$new_work/data/renamed" '.workFolder==$work' "$ROOT/runner/renamed/app/.runner" >/dev/null; then break; fi
+        sleep 0.1
+    done
+    assert test "$(cat "$ROOT/conf/active-work-dir")" = "$new_work"
+    assert jq -e --arg work "$new_work/data/renamed" '.workFolder==$work' "$ROOT/runner/renamed/app/.runner"
+    (command_main stop)
+    assert test -f "$ROOT/conf/stopped"
+    if record_alive "$ROOT/conf/manager.pid"; then echo 'Stop left the manager running' >&2; exit 1; fi
+    assert test -f "$ROOT/data/alpha/repo/keep"
+    "$command_path" logs -f > "$FIXTURE/followed-$arch" 2>&1 & follower=$!
+    record_pid "$FIXTURE/follower.pid" "$follower"
+    printf 'follow-marker\n' >> "$new_work/logs/service.log"
+    for attempt in $(seq 1 100); do grep -q follow-marker "$FIXTURE/followed-$arch" && break; sleep 0.1; done
+    assert grep -q follow-marker "$FIXTURE/followed-$arch"
+    mv "$new_work/logs/service.log" "$new_work/logs/service.log.rotated"
+    printf 'rotation-marker\n' > "$new_work/logs/service.log"
+    for attempt in $(seq 1 150); do grep -q rotation-marker "$FIXTURE/followed-$arch" && break; sleep 0.1; done
+    assert grep -q rotation-marker "$FIXTURE/followed-$arch"
+    stop_record "$FIXTURE/follower.pid"
+    touch "$FIXTURE/fail-delete"
+    if (command_main uninstall); then echo 'Uninstall ignored remote failure' >&2; exit 1; fi
+    assert test -f "$ROOT/conf/github-token"
+    assert test -f "$command_path"
+    rm "$FIXTURE/fail-delete"
+    (command_main uninstall)
+    assert test ! -e "$ROOT/conf"
+    assert test ! -e "$ROOT/runner"
+    assert test ! -e "$command_path"
+    assert test -f "$ROOT/data/alpha/repo/keep"
+    assert test -f "$new_work/logs/service.log"
+    assert jq -e '.beta|any(.[]; .id==999)' "$FIXTURE/remote.json"
     printf 'PASS %s/%s: discovery, numbered registration, pagination, race retry, migration, recovery, worker restart, cleanup\n' "$PLATFORM" "$arch"
 done
 

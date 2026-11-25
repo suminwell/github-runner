@@ -15,7 +15,7 @@ try {
         $content = (Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 "$base/windows/install.ps1").Content
     }
     # A script block also works with irm ... | iex under Restricted execution policy.
-    & ([scriptblock]::Create($content)) -Architecture $Architecture
+    & ([scriptblock]::Create($content.TrimStart([char]0xFEFF))) -Architecture $Architecture
 } finally {
     $env:LOCAL_RUNNER_SOURCE_DIR = $previousSource
 }

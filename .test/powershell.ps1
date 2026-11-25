@@ -70,45 +70,48 @@ try {
     Remove-Item Function:Get-ItemProperty
     foreach ($arch in @('x64','arm64')) {
         $upgradeRoot = Join-Path $fixture "upgrade-$arch"; $legacy = Join-Path $upgradeRoot $arch
-        foreach ($part in @('.state','bin\alpha\runner','data\alpha\repo','logs')) { New-Item -ItemType Directory -Force -Path (Join-Path $legacy $part) | Out-Null }
-        Set-Content (Join-Path $legacy '.state\settings.json') '{}'
-        Set-Content (Join-Path $legacy '.state\organizations.json') '{"1":{"login":"alpha","runner_id":100,"runner_name":"local-windows-x64-3"}}'
+        foreach ($part in @('conf','bin\alpha\runner','data\alpha\repo','logs')) { New-Item -ItemType Directory -Force -Path (Join-Path $legacy $part) | Out-Null }
+        Set-Content (Join-Path $legacy 'conf\settings.json') '{}'
+        Set-Content (Join-Path $legacy 'conf\organizations.json') '{"1":{"login":"alpha","runner_id":100,"runner_name":"local-windows-x64-3"}}'
         Set-Content (Join-Path $legacy 'data\alpha\repo\.hidden') 'keep'
         Set-Content (Join-Path $legacy 'bin\alpha\runner\.credentials') 'credential'
         Set-Content (Join-Path $legacy 'bin\service.ps1') 'old script'
         Set-Content (Join-Path $legacy 'bin\install.ps1') 'old script'
         Move-PreviousLayout $upgradeRoot $arch
         Assert (-not (Test-Path $legacy)) 'architecture directory removed'
-        Assert (-not (Test-Path (Join-Path $upgradeRoot 'bin\service.ps1'))) 'old script removed'
+        Assert (Test-Path (Join-Path $upgradeRoot 'bin\service.ps1')) 'old script retained until update'
         Assert ((Get-Content (Join-Path $upgradeRoot 'data\alpha\repo\.hidden')) -eq 'keep') 'work data preserved'
         Assert ((Get-Content (Join-Path $upgradeRoot 'bin\alpha\runner\.credentials')) -eq 'credential') 'credentials preserved'
-        $migrated = Get-Content -Raw (Join-Path $upgradeRoot '.state\organizations.json') | ConvertFrom-Json
-        Assert ($migrated.'1'.relocated -and $migrated.'1'.runner_id -eq 100 -and $migrated.'1'.runner_name -eq 'local-windows-x64-3') 'identity preserved for reconfiguration'
+        $migrated = Get-Content -Raw (Join-Path $upgradeRoot 'conf\organizations.json') | ConvertFrom-Json
+        Assert ($migrated.'1'.runner_id -eq 100 -and $migrated.'1'.runner_name -eq 'local-windows-x64-3') 'identity preserved for reconfiguration'
         Move-PreviousLayout $upgradeRoot $arch
     }
     $conflictRoot = Join-Path $fixture 'conflicting-layout'
-    New-Item -ItemType Directory -Force -Path (Join-Path $conflictRoot 'x64\.state'),(Join-Path $conflictRoot 'data') | Out-Null
-    Set-Content (Join-Path $conflictRoot 'x64\.state\settings.json') '{}'
+    New-Item -ItemType Directory -Force -Path (Join-Path $conflictRoot 'x64\conf'),(Join-Path $conflictRoot 'data') | Out-Null
+    Set-Content (Join-Path $conflictRoot 'x64\conf\settings.json') '{}'
     $failed = $false; try { Move-PreviousLayout $conflictRoot 'x64' } catch { $failed = $true }
     Assert $failed 'conflicting layouts not merged'
-    Assert (Test-Path (Join-Path $conflictRoot 'x64\.state\settings.json')) 'conflicting layout retained'
+    Assert (Test-Path (Join-Path $conflictRoot 'x64\conf\settings.json')) 'conflicting layout retained'
     foreach ($arch in @('x64','arm64')) {
         $testRoot = Join-Path $fixture $arch
-        New-Item -ItemType Directory -Force -Path (Join-Path $testRoot 'bin'), (Join-Path $testRoot '.state') | Out-Null
-        Copy-Item (Join-Path $repo 'windows\service.ps1') (Join-Path $testRoot 'service.ps1')
+        New-Item -ItemType Directory -Force -Path (Join-Path $testRoot 'bin'), (Join-Path $testRoot 'conf') | Out-Null
+        Copy-Item (Join-Path $repo 'windows\service.ps1') (Join-Path $testRoot 'bin\service.ps1')
+        Copy-Item (Join-Path $repo 'windows\runner.ps1') (Join-Path $testRoot 'bin\runner.ps1')
+        Copy-Item (Join-Path $repo 'windows\ghr.ps1') (Join-Path $testRoot 'bin\ghr.ps1')
         $env:LOCAL_RUNNER_ROOT = $testRoot
-        . (Join-Path $testRoot 'service.ps1') -Mode Library -Root $testRoot
+        . (Join-Path $testRoot 'bin\ghr.ps1') -Command library
         if (-not $onWindows) { $script:PowerShell = (Get-Process -Id $PID).Path }
-        Write-Json (Join-Path $testRoot '.state\settings.json') @{ arch=$arch; poll_seconds=10; restart_seconds=1; organizations=@() }
-        Write-AtomicText (Join-Path $testRoot '.state\gh-path') $script:PowerShell
-        Write-AtomicText (Join-Path $testRoot '.state\github-token') 'secret-test-token'
+        Write-Json (Join-Path $testRoot 'conf\settings.json') @{ arch=$arch; poll_seconds=10; restart_seconds=1; organizations=@() }
+        Write-AtomicText (Join-Path $testRoot 'conf\gh-path') $script:PowerShell
+        Write-AtomicText (Join-Path $testRoot 'conf\github-token') 'secret-test-token'
         Initialize-Manager
         $unicodePath = 'C:\' + [char]0x5DE5 + [char]0x4F5C
-        Write-Json (Join-Path $testRoot '.state\unicode.json') @{ path=$unicodePath }
-        Assert ((Read-Json (Join-Path $testRoot '.state\unicode.json')).path -ceq $unicodePath) 'UTF-8 paths round-trip'
+        Write-Json (Join-Path $testRoot 'conf\unicode.json') @{ path=$unicodePath }
+        Assert ((Read-Json (Join-Path $testRoot 'conf\unicode.json')).path -ceq $unicodePath) 'UTF-8 paths round-trip'
         $script:Remote = @{}; $script:NextId = 100; $script:FailDiscovery = $false; $script:Raced = $false
         $script:Members = @(@{ state='active'; organization=@{id=1;login='alpha'} })
         function Invoke-GitHubApi([string]$Endpoint, [string]$Method='GET', [switch]$Paginate) {
+            if ($Endpoint -match '^organizations/(\d+)$') { return [pscustomobject]@{id=[long]$Matches[1];login=(Get-State)[$Matches[1]].login} }
             if ($Endpoint -like 'user/memberships/*') {
                 if ($script:FailDiscovery) { throw 'Simulated network failure' }
                 return ,@($script:Members)
@@ -118,6 +121,7 @@ try {
                 return ,@([pscustomobject]@{runners=@($runners | Select-Object -First 1)},[pscustomobject]@{runners=@($runners | Select-Object -Skip 1)})
             }
             if ($Endpoint -match '^orgs/([^/]+)/actions/runners/(\d+)$' -and $Method -eq 'DELETE') {
+                if ($script:FailDelete) { throw 'Simulated deletion failure.' }
                 $script:Remote[$Matches[1]] = @($script:Remote[$Matches[1]] | Where-Object id -ne ([long]$Matches[2]))
                 return $null
             }
@@ -131,7 +135,7 @@ try {
             }
             if (@($script:Remote[$Login] | Where-Object name -eq $Name).Count) { throw 'Name already exists.' }
             $runnerId = $script:NextId; $script:NextId++
-            $directory = Join-Path $script:Root "bin\$Login\runner"
+            $directory = Join-Path $script:Root "runner\$Login\app"
             New-Item -ItemType Directory -Force -Path $directory, (Join-Path $script:Root "data\$Login") | Out-Null
             Write-Json (Join-Path $directory '.runner') @{agentId=$runnerId;agentName=$Name}
             $script:Remote[$Login] = @($script:Remote[$Login] | Where-Object { $null -ne $_ }) + @([pscustomobject]@{id=$runnerId; name=$Name; busy=$false; status='online'})
@@ -151,7 +155,7 @@ try {
         $script:FailDiscovery = $false
         $script:Remote.alpha = @(); Invoke-Reconcile
         Assert ($script:NextId -eq 102) 'remote deletion recovery'
-        Remove-Item (Join-Path $testRoot 'bin\alpha\runner\.runner') -Force; Invoke-Reconcile
+        Remove-Item (Join-Path $testRoot 'runner\alpha\app\.runner') -Force; Invoke-Reconcile
         Assert ($script:NextId -eq 103) 'missing local configuration recovery'
         Write-AtomicText (Join-Path $testRoot 'data\alpha\keep') 'keep'
         $script:Members = @(@{state='active';organization=@{id=1;login='renamed'}})
@@ -191,7 +195,7 @@ try {
         Reconcile-Organization '3' 'collision'
         Assert ($script:Remote.collision[-1].name -eq "$script:Prefix-12" -and @($script:Remote.collision | Where-Object id -eq 995).Count -eq 1) 'taken repair number increments without replacing'
         $script:Remote.legacy = @([pscustomobject]@{id=996;name=$script:Prefix;busy=$true})
-        $directory = Join-Path $testRoot 'bin\legacy\runner'; New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        $directory = Join-Path $testRoot 'runner\legacy\app'; New-Item -ItemType Directory -Path $directory -Force | Out-Null
         Write-Json (Join-Path $directory '.runner') @{agentId=996}
         $state = Get-State; $state['7'] = @{login='legacy';runner_id=996;runner_name=$script:Prefix}; Save-State $state
         Reconcile-Organization '7' 'legacy'
@@ -212,7 +216,7 @@ try {
         # Exercise actual wrapper restart, without real GitHub runners or host services.
         if ($onWindows) {
         Remove-Item Env:LOCAL_RUNNER_ROOT
-        $runner = Join-Path $testRoot 'bin\renamed\runner'
+        $runner = Join-Path $testRoot 'runner\renamed\app'
         $env:FAKE_RUN_MARKER = Join-Path $testRoot 'runs'
         Write-AtomicText (Join-Path $runner 'probe.ps1') 'if($env:GH_TOKEN){exit 92}; Add-Content -LiteralPath $env:FAKE_RUN_MARKER -Value run; Start-Sleep -Milliseconds 200'
         Write-AtomicText (Join-Path $runner 'run.cmd') "@echo off`r`npowershell.exe -NoProfile -ExecutionPolicy Bypass -File probe.ps1`r`nexit /b %ERRORLEVEL%`r`n"
@@ -226,15 +230,77 @@ try {
         Stop-Worker '1'
         }
         $script:Members = @(); Invoke-Reconcile
-        Assert ((Get-State).Count -eq 0) 'removed membership stopped'
+        Assert (@((Get-State).Values | Where-Object active -ne $false).Count -eq 0) 'removed membership stopped and retained for uninstall'
         Assert (Test-Path (Join-Path $testRoot 'data\alpha\keep')) 'data retained after removal'
         $text = Get-Content -Raw (Join-Path $testRoot 'logs\service.log')
         Assert ($text -notmatch 'secret-test-token|should-not-reach-runner') 'no credential log leak'
+        # Exercise management with real child processes and a fake scheduled task.
+        function Assert-Administrator {}
+        function Grant-DataDirectory([string]$Directory) { New-Item -ItemType Directory -Force -Path $Directory | Out-Null }
+        $script:TaskExists = $true; $script:TaskEnabled = $false; $script:FailDelete = $false
+        function Get-ScheduledTask { if ($script:TaskExists) { return [pscustomobject]@{TaskName='fixture';Actions=[pscustomobject]@{Arguments=('-File "' + (Join-Path $script:Root 'bin\service.ps1') + '"')}} } }
+        function Disable-ScheduledTask { $script:TaskEnabled = $false }
+        function Enable-ScheduledTask { $script:TaskEnabled = $true }
+        function Stop-ScheduledTask { Stop-Record (Join-Path $script:Root 'conf\manager.json') }
+        function Unregister-ScheduledTask { param($TaskName, [switch]$Confirm); $script:TaskExists = $false }
+        function Start-ScheduledTask {
+            $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $script:Root 'bin\service.ps1'))
+            $script:SupervisorProcess = [Diagnostics.Process]::Start($info)
+        }
+        Show-Status
+        $launcher = Join-Path $testRoot 'bin\ghr.cmd'; Write-AtomicText $launcher (Get-CommandText)
+        $newWork = Join-Path $fixture "new work $arch"
+        if ($onWindows) {
+            $state = Get-State; $state['1'].active = $true; Save-State $state
+            Start-Installation
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            while ($null -eq (Get-RecordedProcess (Join-Path $testRoot 'conf\manager.json')) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+            Assert ($script:TaskEnabled) 'start enables startup'
+            & $launcher config "--dir=$newWork"
+            Assert ($LASTEXITCODE -eq 0) 'public --dir syntax'
+            Assert ((Get-Content -Raw -Encoding UTF8 (Join-Path $testRoot 'conf\active-work-dir')) -eq $testRoot) 'configuration remains pending'
+            Stop-Installation; Start-Installation
+            $deadline = [DateTime]::UtcNow.AddSeconds(15)
+            do {
+                Start-Sleep -Milliseconds 100
+                $current = Read-Json (Join-Path $testRoot 'runner\renamed\app\.runner')
+            } while ($current.workFolder -ne (Join-Path $newWork 'data\renamed') -and [DateTime]::UtcNow -lt $deadline)
+            Assert ($current.workFolder -eq (Join-Path $newWork 'data\renamed')) 'restart applies work folder'
+            Stop-Installation
+            Assert (-not $script:TaskEnabled -and $null -eq (Get-RecordedProcess (Join-Path $testRoot 'conf\manager.json'))) 'stop disables watchdog and kills manager'
+            $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $testRoot 'bin\ghr.ps1'),'logs','-f')
+            $info.RedirectStandardOutput = $true
+            $follower = [Diagnostics.Process]::Start($info); $followed = $follower.StandardOutput.ReadToEndAsync()
+            $followerRecord = Join-Path $fixture 'follower.json'; Record-Process $followerRecord $follower
+            Start-Sleep -Milliseconds 800
+            Add-Content (Join-Path $newWork 'logs\service.log') 'follow-marker'
+            Start-Sleep -Milliseconds 800
+            Move-Item (Join-Path $newWork 'logs\service.log') (Join-Path $newWork 'logs\service.log.rotated')
+            Set-Content (Join-Path $newWork 'logs\service.log') 'rotation-marker'
+            Start-Sleep -Milliseconds 800
+            Stop-Record $followerRecord; $follower.WaitForExit()
+            $captured = $followed.GetAwaiter().GetResult(); $follower.Dispose()
+            Assert ($captured -match 'follow-marker' -and $captured -match 'rotation-marker') 'logs follow new lines across rotation'
+        } else {
+            Set-WorkDirectory $newWork
+            Assert ($script:WorkDir -eq $testRoot) 'configuration does not change running settings'
+            Assert ((Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq $newWork) 'new directory saved'
+        }
+        $script:FailDelete = $true; $failed = $false
+        try { Uninstall-Runner } catch { $failed = $true }
+        Assert ($failed -and (Test-Path (Join-Path $testRoot 'conf\github-token'))) 'failed unregister retains credentials'
+        $script:FailDelete = $false; Uninstall-Runner
+        Assert (-not (Test-Path (Join-Path $testRoot 'conf')) -and -not (Test-Path (Join-Path $testRoot 'runner')) -and -not (Test-Path $launcher)) 'uninstall removes runtime and command'
+        Assert (Test-Path (Join-Path $testRoot 'data\alpha\keep')) 'uninstall preserves work data'
+        Assert (@($script:Remote.beta | Where-Object id -eq 999).Count -eq 1) 'uninstall preserves other machines'
         if ($onWindows) { Write-Host "PASS windows/${arch}: core logic, quoting, native worker restart and cleanup" }
         else { Write-Host "PASS windows/${arch}: core logic and quoting; native Windows worker test is deferred to CI" }
     }
     $success = $true
 } finally {
+    if (Get-Command Stop-Record -ErrorAction SilentlyContinue) {
+        try { Stop-Record (Join-Path $script:Root 'conf\manager.json'); Stop-Record (Join-Path $fixture 'follower.json') } catch {}
+    }
     if (Get-Command Stop-Worker -ErrorAction SilentlyContinue) { foreach ($id in @('1','2','3')) { try { Stop-Worker $id } catch {} } }
     Remove-Item Env:LOCAL_RUNNER_ROOT,Env:FAKE_RUN_MARKER,Env:GH_TOKEN -ErrorAction SilentlyContinue
     if ($success) { Remove-Item $fixture -Recurse -Force } else { Write-Host "Retained fixture: $fixture" }
