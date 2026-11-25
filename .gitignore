@@ -5,4 +5,7 @@
 /linux/bin/*/
 /macos/bin/*/
 /windows/bin/*/
+/linux/*/bin/*/
+/macos/*/bin/*/
+/windows/*/bin/*/
 *.pyc

@@ -30,14 +30,14 @@ jobs:
         if: runner.os != 'Windows'
         shell: sh
         run: |
-          for script in linux/bin/*.sh macos/bin/*.sh common/install_unix.sh; do
+          for script in linux/bin/*.sh macos/bin/*.sh linux/*/bin/*.sh macos/*/bin/*.sh common/install_unix.sh; do
             sh -n "$script"
           done
       - name: Parse PowerShell and compile native service host
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          Get-ChildItem windows/bin/*.ps1 | ForEach-Object {
+          @(Get-ChildItem windows -Recurse -Filter *.ps1) + @(Get-Item common/install_windows.ps1) | ForEach-Object {
             $tokens = $null; $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
             if ($errors.Count) { throw ($errors | Out-String) }

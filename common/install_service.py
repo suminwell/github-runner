@@ -40,6 +40,14 @@ def macos_plist(root, user, home, path, label):
     }
 
 
+def service_name(system, uid, arch):
+    if arch not in ("x64", "arm64"):
+        raise ValueError("Unsupported architecture")
+    if system == 'linux':
+        return 'local-github-runner-%s-%s.service' % (uid, arch)
+    return 'com.suminwell.github-runner.%s.%s' % (uid, arch)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', type=Path, required=True)
@@ -49,12 +57,12 @@ def main():
     if account.pw_uid == 0:
         raise SystemExit('Run the installer as a normal user')
     path = os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin')
+    name = service_name(settings['platform'], account.pw_uid, settings['arch'])
     with tempfile.TemporaryDirectory() as temporary:
         source = Path(temporary) / 'service'
         if settings['platform'] == 'linux':
             if not Path('/run/systemd/system').is_dir():
                 raise SystemExit('A Linux host booted with systemd is required (enable systemd for WSL)')
-            name = 'local-github-runner-%s.service' % account.pw_uid
             source.write_text(linux_unit(root, account.pw_name, account.pw_dir, path))
             subprocess.run(['sudo', 'install', '-m', '644', str(source), '/etc/systemd/system/' + name], check=True)
             subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
@@ -62,7 +70,6 @@ def main():
             subprocess.run(['sudo', 'systemctl', 'restart', name], check=True)
             subprocess.run(['sudo', 'systemctl', 'is-active', '--quiet', name], check=True)
         else:
-            name = 'com.suminwell.github-runner.%s' % account.pw_uid
             target = '/Library/LaunchDaemons/' + name + '.plist'
             source.write_bytes(plistlib.dumps(macos_plist(root, account.pw_name, account.pw_dir, path, name)))
             subprocess.run(['sudo', 'launchctl', 'bootout', 'system/' + name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

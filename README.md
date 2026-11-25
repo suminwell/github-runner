@@ -2,11 +2,19 @@
 
 在 macOS、Windows、Linux 本机安装一个开机自启的管理服务。服务自动发现当前 GitHub 账号加入的组织，为有管理权限的组织创建并维护 Runner，供该组织的仓库执行 GitHub Actions。
 
-Runner 名称和自定义标签分别是 `local-macos`、`local-windows`、`local-linux`。每个组织独立注册、独立运行；不同组织可以同时派活。
+每个平台都分为 `x64` 和 `arm64` 两个目录，Runner 名称和自定义标签统一为 `local-<OS>-<架构>`：
+
+| 平台 | x64 | arm64 |
+| --- | --- | --- |
+| macOS | `local-macos-x64` | `local-macos-arm64` |
+| Windows | `local-windows-x64` | `local-windows-arm64` |
+| Linux | `local-linux-x64` | `local-linux-arm64` |
+
+每个组织独立注册、独立运行；不同组织可以同时派活。
 
 ## 一行安装
 
-本仓库已公开，以下命令从 `main` 下载并安装。使用私有 fork 时请参考下一节；未认证访问私有仓库会返回 404。
+本仓库已公开，以下通用入口从 `main` 下载并安装，自动检测本机原生架构，选择对应的 `<平台>/<架构>/` 目录。使用私有 fork 时请参考下一节；未认证访问私有仓库会返回 404。
 
 Linux（普通用户终端）：
 
@@ -25,6 +33,17 @@ Windows（**以管理员身份打开 Windows PowerShell**）：
 ```powershell
 irm https://raw.githubusercontent.com/suminwell/github-runner/main/windows/bin/install.ps1 | iex
 ```
+
+也可以直接选择架构入口。例如 Linux：
+
+```sh
+# x64
+curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/linux/x64/bin/install.sh | sh
+# ARM64
+curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/linux/arm64/bin/install.sh | sh
+```
+
+macOS 对应 `macos/x64/bin/install.sh` 和 `macos/arm64/bin/install.sh`；Windows 对应 `windows/x64/bin/install.ps1` 和 `windows/arm64/bin/install.ps1`。指定架构与本机不匹配时，安装器会停止并提示，不会安装错误架构的 Runner。
 
 执行一次安装命令后，脚本会：
 
@@ -64,21 +83,39 @@ gh repo clone suminwell/github-runner; if ($LASTEXITCODE -eq 0) { Set-Location g
 
 ## 目录结构
 
-源码中的 `common/` 保存三平台共用的管理逻辑。安装后所需文件会放入当前平台的 `bin`，无需保留源码目录。
+源码中的 `common/` 保存共用管理逻辑；每个平台的两个架构目录都包含安装和服务脚本：
+
+```text
+macos/
+├── bin/install.sh              # 自动识别架构的通用入口
+├── x64/bin/{install,service}.sh
+└── arm64/bin/{install,service}.sh
+windows/
+├── bin/install.ps1
+├── x64/bin/{install,service}.ps1
+└── arm64/bin/{install,service}.ps1
+linux/
+├── bin/install.sh
+├── x64/bin/{install,service}.sh
+└── arm64/bin/{install,service}.sh
+```
+
+安装后的程序、数据、日志、凭据和包缓存均保存在 `<平台>/<架构>/` 下，无需保留源码目录。
 
 默认安装位置：
 
 | 平台 | 安装目录 | 系统托管方式 |
 | --- | --- | --- |
-| Linux | `~/.local/share/github-runner/linux` | systemd 系统服务，以安装用户运行 |
-| macOS | `~/.local/share/github-runner/macos` | LaunchDaemon，以安装用户运行 |
-| Windows | `C:\ProgramData\local-github-runner\windows` | Windows Service，以 LocalService 运行 |
+| Linux | `~/.local/share/github-runner/linux/<架构>` | systemd 系统服务，以安装用户运行 |
+| macOS | `~/.local/share/github-runner/macos/<架构>` | LaunchDaemon，以安装用户运行 |
+| Windows | `C:\ProgramData\local-github-runner\windows\<架构>` | Windows Service，以 LocalService 运行 |
 
-以 Linux 为例，运行后目录类似：
+以 Linux x64 为例，运行后目录类似：
 
 ```text
-linux/
+linux/x64/
 ├── bin/
+│   ├── install.sh
 │   ├── service.sh
 │   ├── manager.py
 │   ├── install_service.py
@@ -104,7 +141,7 @@ linux/
 
 macOS 同样使用 `service.sh` / `runner.sh`；Windows 使用 `service.ps1` / `runner.ps1`，另有一个与 Windows 服务管理器通信的服务宿主程序。
 
-仓库数据的归属目录始终为 `data/<组织名称>/<仓库名称>/`。官方 Runner 默认会在其下再创建一个同名 checkout 子目录；这是 GitHub 的标准工作区结构，不需要修改 workflow。`_temp`、`_actions`、`_tool` 等内部目录由 Runner 在组织工作目录内管理。
+仓库数据的完整归属目录为 `<平台>/<架构>/data/<组织名称>/<仓库名称>/`，例如 `linux/arm64/data/ceenware/example/`。官方 Runner 默认会在其下再创建一个同名 checkout 子目录；这是 GitHub 的标准工作区结构，不需要修改 workflow。`_temp`、`_actions`、`_tool` 等内部目录由 Runner 在组织工作目录内管理。
 
 仓库改名后，下一次任务使用当前仓库名自动创建新目录，旧目录保留。仓库创建、改名和 checkout 目录分配由官方 Runner 根据实际任务处理，不需要提前轮询或克隆每个仓库。组织改名通过稳定的组织 ID 识别，空闲后重新配置到新路径；繁忙时延后处理。旧目录不自动迁移或删除。
 
@@ -117,29 +154,31 @@ name: Local build
 on: workflow_dispatch
 jobs:
   build:
-    runs-on: [self-hosted, local-linux]
+    runs-on: [self-hosted, local-linux-x64]
     steps:
       - uses: actions/checkout@v4
       - run: pwd
       - run: echo "Build on my local Linux machine"
 ```
 
-macOS 改为 `runs-on: [self-hosted, local-macos]`，Windows 改为 `runs-on: [self-hosted, local-windows]`。GitHub 根据标签和 Runner Group 的仓库访问规则分配任务，不能直接根据 Runner 名称派活。
+根据实际机器架构选择上表中的标签，例如 Apple Silicon macOS 使用 `runs-on: [self-hosted, local-macos-arm64]`，x64 Windows 使用 `runs-on: [self-hosted, local-windows-x64]`。GitHub 根据标签和 Runner Group 的仓库访问规则分配任务，不能直接根据 Runner 名称派活。
 
-安装器不准备项目自身的编译工具链。Java、Docker、Node.js、Xcode、Android SDK 等按项目需要安装。每个组织的单个 Runner 同时执行一个 job；不同组织的 Runner 可同时执行，要预留机器资源。
+安装器不准备项目自身的编译工具链。Java、Docker、Node.js、Xcode、Android SDK 等按项目需要安装。每个组织的每个 OS / 架构组合有独立 Runner，单个 Runner 同时执行一个 job；不同组织或架构的 Runner 可同时执行，要预留机器资源。
 
 ## 组织与权限
 
 - 服务每 300 秒通过 GitHub API 分页发现当前账号的活跃组织成员关系，再尝试注册或恢复 Runner。仅有成员身份并不代表可以管理 Runner；组织所有者或具有相应权限的角色才可成功注册。
 - 新登录默认申请 `admin:org` 和 `repo`。已有登录若权限不足，可执行 `gh auth refresh -h github.com -s admin:org,repo` 后重新运行安装器。使用 PAT 时，需要能管理组织 self-hosted runners 的权限；组织若启用 SSO，还需要为凭据授权。
 - 新 Runner 使用组织默认 Runner Group。新仓库能否使用它取决于该 Group 的访问策略。公开仓库通常需要组织管理员显式允许，本项目不会自动放宽此设置。
-- 默认自动发现全部可见组织；个人账号名下的仓库不在接入范围内。只接入指定组织时，编辑 `<平台>/.state/settings.json` 的 `organizations`，例如 `["ceenware", "ceenads"]`，然后重启服务。空数组表示不筛选。
-- 同一组织每种 OS 只维护一个固定名称。本项目不会用 `--replace` 抢占另一台机器的同名 Runner；发生冲突时，在 GitHub 确认并移除不用的旧 Runner 后，服务会自动重试。
+- 默认自动发现全部可见组织；个人账号名下的仓库不在接入范围内。只接入指定组织时，编辑 `<平台>/<架构>/.state/settings.json` 的 `organizations`，例如 `["ceenware", "ceenads"]`，然后重启服务。空数组表示不筛选。
+- 同一组织的每种 OS / 架构组合维护一个固定名称。x64 与 arm64 的 Runner 可以同时注册，不会互相占用名称。本项目不会用 `--replace` 抢占另一台机器的同名 Runner；发生冲突时，在 GitHub 确认并移除不用的旧 Runner 后，服务会自动重试。
 - 暂时断网、API 限流或无权限会记录日志并在下一轮重试，不会因此清空本地工作数据。失去组织成员关系后会停止该组织本机进程并保留目录。
 
 ## 常驻与重启恢复
 
-系统启动 → 系统服务启动 `service.sh` / `service.ps1` → 管理进程读取持久化状态并发现组织 → 启动每个 `bin/<组织>/runner.sh` / `runner.ps1`。
+系统启动 → 对应架构的系统服务启动 `<平台>/<架构>/bin/service.sh` / `service.ps1` → 管理进程读取该架构的持久化状态并发现组织 → 启动每个 `bin/<组织>/runner.sh` / `runner.ps1`。
+
+系统服务名也包含架构：Linux 为 `local-github-runner-<UID>-<架构>.service`，macOS 为 `com.suminwell.github-runner.<UID>.<架构>`，Windows 为 `LocalGitHubRunner-<架构>`。
 
 管理服务异常退出由系统恢复。组织 Runner 退出后由管理服务重新启动，重试间隔至少 30 秒，避免错误状态下持续刷进程。组织发现使用独立线程，网络请求不会阻塞本地 Runner 的退出检测。官方 Runner 自更新仍由其标准启动脚本处理。
 
@@ -149,28 +188,30 @@ Unix 服务以安装用户身份执行；Windows 的 LocalService 没有管理�
 
 ## 查看状态与日志
 
+以下 Linux / Windows 示例使用 x64，macOS 示例使用 arm64。请按本机架构替换路径和服务名中的 `x64` / `arm64`。
+
 Linux：
 
 ```sh
-sudo systemctl status "local-github-runner-$(id -u).service"
-~/.local/share/github-runner/linux/bin/service.sh status
-tail -f ~/.local/share/github-runner/linux/logs/service.log
+sudo systemctl status "local-github-runner-$(id -u)-x64.service"
+~/.local/share/github-runner/linux/x64/bin/service.sh status
+tail -f ~/.local/share/github-runner/linux/x64/logs/service.log
 ```
 
 macOS：
 
 ```sh
-sudo launchctl print "system/com.suminwell.github-runner.$(id -u)"
-~/.local/share/github-runner/macos/bin/service.sh status
-tail -f ~/.local/share/github-runner/macos/logs/service.log
+sudo launchctl print "system/com.suminwell.github-runner.$(id -u).arm64"
+~/.local/share/github-runner/macos/arm64/bin/service.sh status
+tail -f ~/.local/share/github-runner/macos/arm64/logs/service.log
 ```
 
 Windows（管理员 PowerShell）：
 
 ```powershell
-Get-Service LocalGitHubRunner
-& "$env:ProgramData\local-github-runner\windows\bin\service.ps1" status
-Get-Content "$env:ProgramData\local-github-runner\windows\logs\service.log" -Wait
+Get-Service LocalGitHubRunner-x64
+& "$env:ProgramData\local-github-runner\windows\x64\bin\service.ps1" status
+Get-Content "$env:ProgramData\local-github-runner\windows\x64\logs\service.log" -Wait
 ```
 
 `status` 查询 GitHub 实际返回的 `online` / `offline` 和 `busy` 状态；系统服务已启动不代表组织已成功注册。详细 Runner 日志在 `bin/<组织>/runner/_diag/`。管理日志按 5 MiB 轮换，保留三份历史。
@@ -181,7 +222,25 @@ Get-Content "$env:ProgramData\local-github-runner\windows\logs\service.log" -Wai
 
 再次运行安装命令会更新管理程序、刷新保存的 GitHub 凭据并重启服务，保留组织状态和 `data`。请在没有任务运行时升级，重启可能中断任务。
 
-自定义安装位置可以在执行安装命令前设置 `LOCAL_RUNNER_HOME`；安装器会在该目录下再创建对应平台目录。例如 Linux：
+如果已经安装过没有架构目录的旧版，请先停止旧服务，然后执行新的安装命令。新版会在架构目录内独立注册 `local-<OS>-<架构>`，不会移动旧的凭据、注册状态或 `data`；旧数据保留。确认旧任务结束后，可在 GitHub 删除不再使用的 `local-<OS>`，并把 workflow 的标签改成新名称。
+
+旧版服务的停止方式（仅用于升级旧版）：
+
+```sh
+# Linux 旧版
+sudo systemctl disable --now "local-github-runner-$(id -u).service"
+# macOS 旧版
+sudo launchctl bootout "system/com.suminwell.github-runner.$(id -u)"
+sudo launchctl disable "system/com.suminwell.github-runner.$(id -u)"
+```
+
+```powershell
+# Windows 旧版，管理员 PowerShell
+Stop-Service LocalGitHubRunner
+Set-Service LocalGitHubRunner -StartupType Disabled
+```
+
+自定义安装位置可以在执行安装命令前设置 `LOCAL_RUNNER_HOME`；安装器会在该目录下再创建 `<平台>/<架构>` 目录。例如 Linux：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/linux/bin/install.sh | LOCAL_RUNNER_HOME=/srv/github-runner sh
@@ -193,17 +252,17 @@ curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/linux/
 
 ```sh
 # Linux
-sudo systemctl disable --now "local-github-runner-$(id -u).service"
+sudo systemctl disable --now "local-github-runner-$(id -u)-x64.service"
 
 # macOS
-sudo launchctl bootout "system/com.suminwell.github-runner.$(id -u)"
-sudo launchctl disable "system/com.suminwell.github-runner.$(id -u)"
+sudo launchctl bootout "system/com.suminwell.github-runner.$(id -u).arm64"
+sudo launchctl disable "system/com.suminwell.github-runner.$(id -u).arm64"
 ```
 
 ```powershell
 # Windows，管理员 PowerShell
-Stop-Service LocalGitHubRunner
-Set-Service LocalGitHubRunner -StartupType Disabled
+Stop-Service LocalGitHubRunner-x64
+Set-Service LocalGitHubRunner-x64 -StartupType Disabled
 ```
 
 关闭服务不会自动删除 GitHub 上的 Runner 注册记录，需要时可在组织 Settings → Actions → Runners 移除。需要恢复服务时重新执行安装器。

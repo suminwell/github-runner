@@ -45,6 +45,12 @@ def read_json(path, default=None):
 def host_platform():
     system = {"Linux": "linux", "Darwin": "macos", "Windows": "windows"}[platform.system()]
     machine = platform.machine().lower()
+    if system == "windows":
+        machine = (os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE") or machine).lower()
+    elif system == "macos":
+        native_arm = subprocess.run(["/usr/sbin/sysctl", "-n", "hw.optional.arm64"], capture_output=True, text=True)
+        if native_arm.returncode == 0 and native_arm.stdout.strip() == "1":
+            machine = "arm64"  # Also select native binaries when Python runs under Rosetta.
     arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
     if not arch:
         raise RuntimeError("Only x64 and arm64 hosts are supported")
@@ -239,6 +245,7 @@ class Supervisor:
         self.root = Path(root).resolve()
         self.settings = read_json(self.root / ".state/settings.json")
         self.system = self.settings["platform"]
+        self.runner_name = "local-%s-%s" % (self.system, self.settings["arch"])
         self.api = api or GitHub(self.settings["gh"], self.root / ".state/github-token")
         self.state_file = self.root / ".state/organizations.json"
         self.organizations = read_json(self.state_file, {})
@@ -263,7 +270,7 @@ class Supervisor:
         work.mkdir(parents=True, exist_ok=True)
         token = self.api.api("orgs/%s/actions/runners/registration-token" % org, "POST")["token"]
         args = ["--unattended", "--url", "https://github.com/" + org, "--token", token,
-                "--name", "local-" + self.system, "--labels", "local-" + self.system, "--work", str(work)]
+                "--name", self.runner_name, "--labels", self.runner_name, "--work", str(work)]
         config = runner / ("config.cmd" if self.system == "windows" else "config.sh")
         process = launch_script(config, self.system, args, cwd=runner, env=clean_environment(),
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -317,7 +324,7 @@ class Supervisor:
                                    stderr=subprocess.DEVNULL)
         self.processes[org_id] = process
         self.retry_after[org_id] = time.monotonic() + 30
-        LOG.info("Started %s for %s (pid %s)", "local-" + self.system, entry["login"], process.pid)
+        LOG.info("Started %s for %s (pid %s)", self.runner_name, entry["login"], process.pid)
 
     def stop(self, org_id):
         with self.process_lock:
@@ -399,8 +406,8 @@ class Supervisor:
                 if local_config and any(item["id"] == local_config["agentId"] for item in remote):
                     runner_id = local_config["agentId"]
                 else:
-                    if any(item["name"] == "local-" + self.system for item in remote):
-                        raise RuntimeError("Runner name local-%s already exists; refusing to replace another machine" % self.system)
+                    if any(item["name"] == self.runner_name for item in remote):
+                        raise RuntimeError("Runner name %s already exists; refusing to replace another machine" % self.runner_name)
                     for name in (".runner", ".credentials", ".credentials_rsaparams"):
                         (directory / "runner" / name).unlink(missing_ok=True)
                     package = runner_package(self.root, self.api, self.system, self.settings["arch"])
@@ -442,9 +449,11 @@ class Supervisor:
                 self.stop(org_id)
 
 
-def prepare(root):
+def prepare(root, expected_arch=None):
     root = Path(root).resolve()
     system, arch = host_platform()
+    if expected_arch and arch != expected_arch:
+        raise RuntimeError("Installer architecture %s does not match host architecture %s" % (expected_arch, arch))
     for name in (".state", "logs", "data", "bin"):
         (root / name).mkdir(parents=True, exist_ok=True)
     (root / ".state").chmod(0o700)
@@ -476,6 +485,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=["prepare", "serve", "status"])
     parser.add_argument("--root", required=True, type=Path)
+    parser.add_argument("--arch", choices=["x64", "arm64"])
     args = parser.parse_args()
     root = args.root.resolve()
     (root / "logs").mkdir(parents=True, exist_ok=True)
@@ -484,7 +494,7 @@ def main():
         handlers.append(RotatingFileHandler(root / "logs/service.log", maxBytes=5 * 1024 * 1024, backupCount=3))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", handlers=handlers)
     if args.command == "prepare":
-        prepare(root)
+        prepare(root, args.arch)
     elif args.command == "status":
         settings = read_json(root / ".state/settings.json")
         api = GitHub(settings["gh"], root / ".state/github-token")

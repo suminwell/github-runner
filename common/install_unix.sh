@@ -4,13 +4,24 @@ set -eu
 umask 077
 
 platform=$1
+requested_arch=${2:-auto}
 case "$platform:$(uname -s)" in linux:Linux|macos:Darwin) ;; *) echo 'Incorrect platform installer' >&2; exit 1 ;; esac
+case "$(uname -m)" in
+    x86_64|amd64) arch=x64 ;;
+    arm64|aarch64) arch=arm64 ;;
+    *) echo 'Only x64 and arm64 hosts are supported.' >&2; exit 1 ;;
+esac
+if [ "$platform" = macos ] && [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || :)" = 1 ]; then arch=arm64; fi
+if [ "$requested_arch" != auto ] && [ "$requested_arch" != "$arch" ]; then
+    echo "Installer architecture $requested_arch does not match host architecture $arch." >&2
+    exit 1
+fi
 if [ "$(id -u)" -eq 0 ]; then
     echo 'Run as your normal user; the installer uses sudo only for system setup.' >&2
     exit 1
 fi
 base=${LOCAL_RUNNER_BASE_URL:-https://raw.githubusercontent.com/suminwell/github-runner/main}
-root=${LOCAL_RUNNER_HOME:-"$HOME/.local/share/github-runner"}/$platform
+root=${LOCAL_RUNNER_HOME:-"$HOME/.local/share/github-runner"}/$platform/$arch
 mkdir -p "$root/bin" "$root/.state" "$root/logs"
 command -v sudo >/dev/null || { echo 'sudo is required for boot-time service installation.' >&2; exit 1; }
 sudo -v
@@ -56,9 +67,10 @@ fetch() {
 }
 fetch common/manager.py "$root/bin/manager.py"
 fetch common/install_service.py "$root/bin/install_service.py"
-fetch "$platform/bin/service.sh" "$root/bin/service.sh"
+fetch "$platform/$arch/bin/install.sh" "$root/bin/install.sh"
+fetch "$platform/$arch/bin/service.sh" "$root/bin/service.sh"
 chmod 700 "$root/bin/service.sh"
 printf '%s\n' "$python" > "$root/.state/python"
-"$python" "$root/bin/manager.py" prepare --root "$root"
+"$python" "$root/bin/manager.py" prepare --root "$root" --arch "$arch"
 "$python" "$root/bin/install_service.py" --root "$root"
 printf '\nInstalled in %s\nCheck registration: %s status\nService log: %s/logs/service.log\n' "$root" "$root/bin/service.sh" "$root"

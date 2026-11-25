@@ -13,7 +13,12 @@ public sealed class RunnerService : ServiceBase
     private volatile bool stopping;
     private readonly string root = Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\')).FullName;
 
-    public RunnerService() { ServiceName = "LocalGitHubRunner"; CanShutdown = true; AutoLog = false; }
+    public RunnerService() {
+        string arch = new DirectoryInfo(root).Name;
+        if (arch != "x64" && arch != "arm64") throw new InvalidOperationException("Invalid architecture directory");
+        ServiceName = "LocalGitHubRunner-" + arch;
+        CanShutdown = true; AutoLog = false;
+    }
     public static void Main() { ServiceBase.Run(new RunnerService()); }
 
     protected override void OnStart(string[] args)
