@@ -273,13 +273,15 @@ try {
             $follower = [Diagnostics.Process]::Start($info); $followed = $follower.StandardOutput.ReadToEndAsync()
             $followerRecord = Join-Path $fixture 'follower.json'; Record-Process $followerRecord $follower
             Start-Sleep -Milliseconds 800
-            Add-Content (Join-Path $newWork 'logs\service.log') 'follow-marker'
+            $previousLogDir = $script:LogDir; $script:LogDir = Join-Path $newWork 'logs'
+            Write-Log 'follow-marker'
             Start-Sleep -Milliseconds 800
             Move-Item (Join-Path $newWork 'logs\service.log') (Join-Path $newWork 'logs\service.log.rotated')
-            Set-Content (Join-Path $newWork 'logs\service.log') 'rotation-marker'
+            Write-Log 'rotation-marker'
             Start-Sleep -Milliseconds 800
             Stop-Record $followerRecord; $follower.WaitForExit()
             $captured = $followed.GetAwaiter().GetResult(); $follower.Dispose()
+            $script:LogDir = $previousLogDir
             Assert ($captured -match 'follow-marker' -and $captured -match 'rotation-marker') 'logs follow new lines across rotation'
         } else {
             Set-WorkDirectory $newWork

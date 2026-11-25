@@ -24,7 +24,10 @@ function Write-Log([string]$Message) {
         foreach ($number in @(2,1)) { if (Test-Path "$path.$number") { Move-Item "$path.$number" "$path.$($number+1)" -Force } }
         Move-Item $path "$path.1" -Force
     }
-    Add-Content -Encoding UTF8 -LiteralPath $path -Value "$([DateTime]::UtcNow.ToString('o')) $Message"
+    # Windows PowerShell Add-Content can deny a concurrent log reader's access.
+    $stream = [IO.File]::Open($path, 'Append', 'Write', ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $writer = New-Object IO.StreamWriter($stream, (New-Object Text.UTF8Encoding($false)))
+    try { $writer.WriteLine("$([DateTime]::UtcNow.ToString('o')) $Message") } finally { $writer.Dispose() }
 }
 function Get-State {
     $state = @{}
