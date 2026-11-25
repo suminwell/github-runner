@@ -87,12 +87,14 @@ INSTALL
         printf '{"1":{"login":"alpha","runner_id":100,"runner_name":"local-linux-x64-3"}}\n' > "$root/$arch/conf/organizations.json"
         printf 'keep' > "$root/$arch/data/alpha/repo/.hidden"
         printf 'credential' > "$root/$arch/bin/alpha/runner/.credentials"
+        printf '{"agentId":100}\n' > "$root/$arch/bin/alpha/runner/.runner"
         touch "$root/$arch/bin/install.sh" "$root/$arch/bin/service.sh"
         migrate_layout
         assert test ! -d "$root/$arch"
         assert test -f "$root/bin/service.sh"
         assert test "$(cat "$root/data/alpha/repo/.hidden")" = keep
-        assert test "$(cat "$root/bin/alpha/runner/.credentials")" = credential
+        assert test "$(cat "$root/runner/alpha/app/.credentials")" = credential
+        assert jq -e '.agentId==100' "$root/runner/alpha/app/.runner"
         assert jq -e '."1".runner_id==100 and ."1".runner_name=="local-linux-x64-3"' "$root/conf/organizations.json"
         migrate_layout
     done

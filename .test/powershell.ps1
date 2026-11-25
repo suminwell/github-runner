@@ -75,13 +75,15 @@ try {
         Set-Content (Join-Path $legacy 'conf\organizations.json') '{"1":{"login":"alpha","runner_id":100,"runner_name":"local-windows-x64-3"}}'
         Set-Content (Join-Path $legacy 'data\alpha\repo\.hidden') 'keep'
         Set-Content (Join-Path $legacy 'bin\alpha\runner\.credentials') 'credential'
+        Set-Content (Join-Path $legacy 'bin\alpha\runner\.runner') '{"agentId":100}'
         Set-Content (Join-Path $legacy 'bin\service.ps1') 'old script'
         Set-Content (Join-Path $legacy 'bin\install.ps1') 'old script'
         Move-PreviousLayout $upgradeRoot $arch
         Assert (-not (Test-Path $legacy)) 'architecture directory removed'
         Assert (Test-Path (Join-Path $upgradeRoot 'bin\service.ps1')) 'old script retained until update'
         Assert ((Get-Content (Join-Path $upgradeRoot 'data\alpha\repo\.hidden')) -eq 'keep') 'work data preserved'
-        Assert ((Get-Content (Join-Path $upgradeRoot 'bin\alpha\runner\.credentials')) -eq 'credential') 'credentials preserved'
+        Assert ((Get-Content (Join-Path $upgradeRoot 'runner\alpha\app\.credentials')) -eq 'credential') 'credentials preserved'
+        Assert ((Get-Content -Raw (Join-Path $upgradeRoot 'runner\alpha\app\.runner') | ConvertFrom-Json).agentId -eq 100) 'runner moved to dedicated directory'
         $migrated = Get-Content -Raw (Join-Path $upgradeRoot 'conf\organizations.json') | ConvertFrom-Json
         Assert ($migrated.'1'.runner_id -eq 100 -and $migrated.'1'.runner_name -eq 'local-windows-x64-3') 'identity preserved for reconfiguration'
         Move-PreviousLayout $upgradeRoot $arch
