@@ -6,7 +6,7 @@ Runner 名称和自定义标签分别是 `local-macos`、`local-windows`、`loca
 
 ## 一行安装
 
-以下匿名下载命令要求 `suminwell/github-runner` 是**公开仓库**，并且文件已发布到 `main`。私有仓库请使用下一节的方式；GitHub 返回 404 不代表本机安装失败。
+本仓库已公开，以下命令从 `main` 下载并安装。使用私有 fork 时请参考下一节；未认证访问私有仓库会返回 404。
 
 Linux（普通用户终端）：
 
@@ -28,7 +28,7 @@ irm https://raw.githubusercontent.com/suminwell/github-runner/main/windows/bin/i
 
 执行一次安装命令后，脚本会：
 
-1. 准备 Python 运行环境，检查 `gh`；缺少时下载官方 GitHub CLI，并校验发布资产的 SHA-256。
+1. 准备 Python 运行环境，检查 `gh`；缺少或版本低于 2.62 时下载官方 GitHub CLI，并校验发布资产的 SHA-256。
 2. 检查 GitHub 登录状态；未登录时引导浏览器授权，申请组织 Runner 所需权限。
 3. 下载并校验官方 Actions Runner，Linux 另执行官方依赖安装脚本。
 4. 安装系统后台服务，设置开机自启和异常退出恢复。

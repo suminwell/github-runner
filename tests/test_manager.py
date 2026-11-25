@@ -185,6 +185,26 @@ class SupervisorTests(unittest.TestCase):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_actual_configuration_script_preserves_arguments_with_spaces(self):
+        with tempfile.TemporaryDirectory(prefix="runner test ") as temporary:
+            root = Path(temporary).resolve()
+            system, arch = manager.host_platform()
+            manager.write_json(root / ".state/settings.json", {"platform": system, "arch": arch, "gh": "fake"})
+            package = root / "package"
+            package.mkdir()
+            (package / "probe.py").write_text('import json,sys\nfrom pathlib import Path\nPath("arguments.json").write_text(json.dumps(sys.argv[1:]))\nPath(".runner").write_text(json.dumps({"agentId": 123}))\n')
+            if system == "windows":
+                (package / "config.cmd").write_text('@echo off\n"%s" probe.py %%*\nexit /b %%ERRORLEVEL%%\n' % sys.executable)
+            else:
+                import shlex
+                (package / "config.sh").write_text('exec %s probe.py "$@"\n' % shlex.quote(sys.executable))
+            supervisor = manager.Supervisor(root, FakeGitHub())
+            directory = root / "bin/alpha"
+            self.assertEqual(supervisor.configure("alpha", directory, package), 123)
+            args = manager.read_json(directory / "runner/arguments.json")
+            self.assertEqual(args[args.index("--work") + 1], str(root / "data/alpha"))
+            self.assertEqual(args[args.index("--token") + 1], "temporary-registration-token")
+
     def test_supervisor_restarts_exited_real_process_and_excludes_token(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

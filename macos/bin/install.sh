@@ -11,7 +11,7 @@ install_main() {
         curl -fsSL "$base/common/install_unix.sh" -o "$setup"
     fi
     if [ -t 0 ]; then sh "$setup" macos;
-    elif [ -r /dev/tty ]; then sh "$setup" macos < /dev/tty;
+    elif ( : < /dev/tty ) 2>/dev/null; then sh "$setup" macos < /dev/tty;
     else sh "$setup" macos < /dev/null; fi
 }
 install_main

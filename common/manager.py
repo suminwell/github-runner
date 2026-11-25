@@ -140,6 +140,11 @@ class GitHub:
 def install_gh(root, system, arch):
     existing = shutil.which("gh")
     if existing:
+        version = subprocess.check_output([existing, "--version"], text=True, timeout=15)
+        match = re.search(r"gh version (\d+)\.(\d+)", version)
+        if not match or tuple(map(int, match.groups())) < (2, 62):
+            existing = None  # Older releases lack API flags used by the supervisor.
+    if existing:
         # Windows LocalService needs an executable outside the installing user's profile.
         if system != "windows":
             return str(Path(existing).resolve())
