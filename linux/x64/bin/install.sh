@@ -6,12 +6,12 @@ install_main() {
     setup=$(mktemp)
     trap 'rm -f "$setup"' EXIT HUP INT TERM
     if [ -n "${LOCAL_RUNNER_SOURCE_DIR:-}" ]; then
-        cp "$LOCAL_RUNNER_SOURCE_DIR/common/install_unix.sh" "$setup"
+        cp "$LOCAL_RUNNER_SOURCE_DIR/linux/install.sh" "$setup"
     else
-        curl -fsSL "$base/common/install_unix.sh" -o "$setup"
+        curl -fsSL "$base/linux/install.sh" -o "$setup"
     fi
-    if [ -t 0 ]; then sh "$setup" linux x64;
-    elif ( : < /dev/tty ) 2>/dev/null; then sh "$setup" linux x64 < /dev/tty;
-    else sh "$setup" linux x64 < /dev/null; fi
+    if [ -t 0 ]; then sh "$setup" x64;
+    elif ( : < /dev/tty ) 2>/dev/null; then sh "$setup" x64 < /dev/tty;
+    else sh "$setup" x64 < /dev/null; fi
 }
 install_main

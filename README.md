@@ -83,21 +83,22 @@ gh repo clone suminwell/github-runner; if ($LASTEXITCODE -eq 0) { Set-Location g
 
 ## 目录结构
 
-源码中的 `common/` 保存共用管理逻辑；每个平台的两个架构目录都包含安装和服务脚本：
+各平台独立包含安装、服务和 Runner 管理代码。平台根目录的安装脚本包含完整安装流程；各架构的 `bin` 包含该平台所需的全部运行代码，不依赖其他平台目录。
 
 ```text
 macos/
-├── install.sh              # 自动识别架构的通用入口
-├── x64/bin/{install,service}.sh
-└── arm64/bin/{install,service}.sh
+├── install.sh              # 完整安装流程，自动识别架构
+├── x64/bin/                # install.sh、service.sh、manager.py、install_service.py
+└── arm64/bin/              # 同样包含完整运行代码
 windows/
 ├── install.ps1
-├── x64/bin/{install,service}.ps1
-└── arm64/bin/{install,service}.ps1
+├── x64/bin/                # install.ps1、service.ps1、manager.py、windows-service.cs
+└── arm64/bin/
 linux/
 ├── install.sh
-├── x64/bin/{install,service}.sh
-└── arm64/bin/{install,service}.sh
+├── x64/bin/                # install.sh、service.sh、manager.py、install_service.py
+└── arm64/bin/
+.test/                     # 开发验证，不参与用户安装
 ```
 
 安装后的程序、数据、日志、凭据和包缓存均保存在 `<平台>/<架构>/` 下，无需保留源码目录。
@@ -270,10 +271,10 @@ Set-Service LocalGitHubRunner-x64 -StartupType Disabled
 ## 开发验证
 
 ```sh
-python3 -m unittest discover -s tests -v
+python3 .test/run.py
 ```
 
-测试使用假的 GitHub API 和临时目录，验证实际管理逻辑与子进程恢复，不注册真实 Runner、不安装本机服务。CI 在 Linux、macOS、Windows 上执行这些测试，并检查 Shell / PowerShell 语法和 Windows 服务宿主编译。
+测试位于 `.test/`，分别加载当前平台 x64、arm64 目录中的管理代码，使用假的 GitHub API 和临时目录验证实际管理逻辑与子进程恢复，不注册真实 Runner、不安装本机服务。这是两份代码包的验证，并不代表在两种原生硬件上运行。CI 在 Linux、macOS、Windows 上执行这些测试，并检查 Shell / PowerShell 语法和两份 Windows 服务宿主编译。
 
 真实账号权限、三平台系统重启、Runner 在线状态以及实际 workflow 的 checkout 路径需要在对应环境进行集成验收，不能仅凭单元测试或服务启动判定通过。
 

@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -14,7 +15,9 @@ from unittest.mock import patch
 import zipfile
 
 BASE = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(BASE / "common"))
+PACKAGE_PLATFORM = {'linux': 'linux', 'darwin': 'macos', 'win32': 'windows'}[sys.platform]
+PACKAGE_ARCH = os.environ.get('LOCAL_RUNNER_TEST_ARCH', 'x64')
+sys.path.insert(0, str(BASE / PACKAGE_PLATFORM / PACKAGE_ARCH / 'bin'))
 import manager
 
 
@@ -216,29 +219,28 @@ class RuntimeTests(unittest.TestCase):
                 manager.prepare(root, 'x64')
             self.assertFalse(root.exists())
 
-    def test_platform_and_architecture_entrypoints_forward_selected_architecture(self):
+    def test_architecture_entrypoints_use_their_own_platform_installer(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary)
-            (source / 'common').mkdir()
             env = os.environ.copy()
             env['LOCAL_RUNNER_SOURCE_DIR'] = str(source)
             if os.name == 'nt':
-                (source / 'common/install_windows.ps1').write_text('param($Architecture)\nWrite-Output $Architecture\n')
-                entries = [(BASE / 'windows/install.ps1', 'auto')]
-                entries += [(BASE / 'windows' / arch / 'bin/install.ps1', arch) for arch in ('x64', 'arm64')]
+                (source / 'windows').mkdir()
+                (source / 'windows/install.ps1').write_text('param($Architecture)\nWrite-Output $Architecture\n')
+                entries = [(BASE / 'windows' / arch / 'bin/install.ps1', arch) for arch in ('x64', 'arm64')]
                 for entry, arch in entries:
                     result = subprocess.run(['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(entry)], env=env, capture_output=True, text=True, timeout=30)
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(result.stdout.strip(), arch)
             else:
-                (source / 'common/install_unix.sh').write_text('printf "%s %s\\n" "$1" "${2:-auto}"\n')
                 for system in ('linux', 'macos'):
-                    entries = [(BASE / system / 'install.sh', 'auto')]
-                    entries += [(BASE / system / arch / 'bin/install.sh', arch) for arch in ('x64', 'arm64')]
+                    (source / system).mkdir()
+                    (source / system / 'install.sh').write_text('printf "%s\\n" "$1"\n')
+                    entries = [(BASE / system / arch / 'bin/install.sh', arch) for arch in ('x64', 'arm64')]
                     for entry, arch in entries:
                         result = subprocess.run(['sh', str(entry)], env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
                         self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertEqual(result.stdout.strip(), system + ' ' + arch)
+                        self.assertEqual(result.stdout.strip(), arch)
 
     @unittest.skipIf(os.name == 'nt', 'POSIX installer')
     def test_unix_installer_creates_architecture_specific_root_before_privileged_setup(self):
@@ -256,10 +258,41 @@ class RuntimeTests(unittest.TestCase):
             env.update(PATH=str(commands) + os.pathsep + env['PATH'], LOCAL_RUNNER_HOME=str(base / 'install'))
             for machine, arch in [('x86_64', 'x64'), ('aarch64', 'arm64')]:
                 env['TEST_MACHINE'] = machine
-                result = subprocess.run(['sh', str(BASE / 'common/install_unix.sh'), 'linux'], env=env, capture_output=True, text=True, timeout=10)
+                result = subprocess.run(['sh', str(BASE / 'linux/install.sh')], env=env, capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 17, result.stderr)
                 self.assertTrue((base / 'install/linux' / arch / 'bin').is_dir())
                 self.assertFalse((base / 'install/linux/bin').exists())
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX installer')
+    def test_linux_pipe_installer_uses_only_its_platform_sources(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            source = base / 'source'
+            shutil.copytree(BASE / 'linux', source / 'linux')
+            commands = base / 'commands'
+            commands.mkdir()
+            (commands / 'uname').write_text('#!/bin/sh\nif [ "$1" = -s ]; then echo Linux; else echo "$TEST_MACHINE"; fi\n')
+            (commands / 'id').write_text('#!/bin/sh\necho 1000\n')
+            (commands / 'sudo').write_text('#!/bin/sh\nexit 0\n')
+            # Do not execute downloaded code, authenticate, or install a real service.
+            (commands / 'python3').write_text('#!/bin/sh\nif [ "$1" = -c ]; then\n case "$2" in *sys.executable*) printf "%s\\n" "$0";; esac\nelse\n printf "%s\\n" "$*" >> "$TEST_PYTHON_CALLS"\nfi\n')
+            for command in commands.iterdir():
+                command.chmod(0o755)
+            env = os.environ.copy()
+            env.update(PATH=str(commands) + os.pathsep + env['PATH'],
+                       LOCAL_RUNNER_HOME=str(base / 'installed'), LOCAL_RUNNER_SOURCE_DIR=str(source),
+                       TEST_MACHINE='x86_64' if PACKAGE_ARCH == 'x64' else 'aarch64',
+                       TEST_PYTHON_CALLS=str(base / 'python-calls'))
+            result = subprocess.run(['sh'], input=(source / 'linux/install.sh').read_text(),
+                                    env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            installed = base / 'installed/linux' / PACKAGE_ARCH
+            for name in ('manager.py', 'install_service.py', 'install.sh', 'service.sh'):
+                self.assertEqual((installed / 'bin' / name).read_bytes(),
+                                 (source / 'linux' / PACKAGE_ARCH / 'bin' / name).read_bytes())
+            calls = (base / 'python-calls').read_text()
+            self.assertIn('prepare --root', calls)
+            self.assertIn('install_service.py --root', calls)
 
     def test_all_six_registration_names_labels_and_work_roots(self):
         with tempfile.TemporaryDirectory() as temporary:
