@@ -9,12 +9,51 @@ fetch() {
     else curl -fsSL --connect-timeout 15 --max-time 120 "$base/$1" -o "$2.new"; fi
     mv -f "$2.new" "$2"
 }
+detect_architecture() {
+    case "$(uname -m)" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) echo 'Only x64/arm64 are supported.' >&2; return 1 ;; esac
+    if [ "$platform" = macos ] && [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || :)" = 1 ]; then arch=arm64; fi
+}
+stop_installed_service() {
+    user_id=$(id -u)
+    if [ "$platform" = linux ]; then
+        service_name=local-github-runner-$user_id-$arch.service
+        definition_path=$(sudo systemctl show "$service_name" -p FragmentPath --value 2>/dev/null || :)
+        if [ -n "$definition_path" ]; then
+            installed_root=$(sudo systemctl show "$service_name" -p WorkingDirectory --value)
+            case "$installed_root" in "$root"|"$root/$arch") ;; *) echo 'Another installation owns this service name.' >&2; exit 1 ;; esac
+            sudo systemctl disable --now "$service_name"
+        fi
+    else
+        service_name=com.suminwell.github-runner.$user_id.$arch
+        definition_path=/Library/LaunchDaemons/$service_name.plist
+        if [ -f "$definition_path" ]; then
+            command_path=$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$definition_path")
+            case "$command_path" in "$root/service.sh"|"$root/$arch/bin/service.sh") ;; *) echo 'Another installation owns this service name.' >&2; exit 1 ;; esac
+            sudo launchctl bootout "system/$service_name" 2>/dev/null || :
+            sudo launchctl disable "system/$service_name"
+        fi
+    fi
+}
+migrate_layout() {
+    legacy=$root/$arch
+    [ -f "$legacy/.state/settings.json" ] || return 0
+    for part in bin data logs .state; do
+        [ ! -e "$root/$part" ] || { echo "Both layouts exist at $root; resolve them before upgrading." >&2; exit 1; }
+    done
+    for part in bin data logs .state; do [ ! -d "$legacy/$part" ] || mv "$legacy/$part" "$root/$part"; done
+    if [ -f "$root/.state/organizations.json" ]; then
+        jq 'with_entries(.value.relocated=true)' "$root/.state/organizations.json" > "$root/.state/organizations.new"
+        mv "$root/.state/organizations.new" "$root/.state/organizations.json"
+    fi
+    rm -f "$root/bin/install.sh" "$root/bin/service.sh"
+    rmdir "$legacy" 2>/dev/null || :
+    printf 'Migrated existing installation to %s; data and registration identities retained.\n' "$root"
+}
 install_main() {
     umask 077
     platform=linux
     case "$platform:$(uname -s)" in linux:Linux|macos:Darwin) ;; *) echo 'Incorrect platform installer' >&2; exit 1 ;; esac
-    case "$(uname -m)" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) echo 'Only x64/arm64 are supported.' >&2; exit 1 ;; esac
-    if [ "$platform" = macos ] && [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || :)" = 1 ]; then arch=arm64; fi
+    detect_architecture
     if [ "${1:-auto}" != auto ] && [ "$1" != "$arch" ]; then echo "Architecture mismatch: requested $1, host $arch" >&2; exit 1; fi
     [ "$(id -u)" -ne 0 ] || { echo 'Use a normal user; sudo is used for system setup.' >&2; exit 1; }
     sudo -v
@@ -35,13 +74,24 @@ install_main() {
     fi
     if [ "$platform" = linux ]; then command -v flock >/dev/null || { echo 'Install util-linux (flock) first.' >&2; exit 1; }; fi
     base=${LOCAL_RUNNER_BASE_URL:-https://raw.githubusercontent.com/suminwell/github-runner/main}
-    root=${LOCAL_RUNNER_HOME:-"$HOME/.local/share/github-runner"}/$platform/$arch
+    root=${LOCAL_RUNNER_HOME:-"$HOME/.local/share/github-runner"}/$platform
     case "$root" in *'
 '*) echo 'Newlines are not supported in installation paths.' >&2; exit 1 ;; esac
-    mkdir -p "$root/bin" "$root/.state/tools" "$root/logs"
+    mkdir -p "$root"
     root=$(cd "$root" && pwd)
+    other_arch=x64; [ "$arch" != x64 ] || other_arch=arm64
+    [ ! -f "$root/$other_arch/.state/settings.json" ] || { echo 'An installation for another architecture exists; stop it and move it aside before upgrading.' >&2; exit 1; }
+    if [ -f "$root/$arch/.state/settings.json" ]; then
+        for part in bin data logs .state; do
+            [ ! -e "$root/$part" ] || { echo "Both layouts exist at $root; resolve them before upgrading." >&2; exit 1; }
+        done
+    fi
+    stop_installed_service
+    migrate_layout
+    mkdir -p "$root/bin" "$root/.state/tools" "$root/logs"
     jq_path=$(command -v jq)
     gh_path=$(command -v gh || :)
+    if [ -z "$gh_path" ] && [ -x "$root/.state/tools/gh" ]; then gh_path=$root/.state/tools/gh; fi
     if [ -n "$gh_path" ]; then
         gh_major=$("$gh_path" --version | sed -n '1s/^gh version \([0-9]*\)\..*/\1/p')
         gh_minor=$("$gh_path" --version | sed -n '1s/^gh version [0-9]*\.\([0-9]*\).*/\1/p')
@@ -80,17 +130,17 @@ install_main() {
         '.platform=$platform|.arch=$arch|.gh=$gh|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
         "$root/.state/settings.json" > "$root/.state/settings.new"
     mv "$root/.state/settings.new" "$root/.state/settings.json"
-    fetch "$platform/$arch/bin/install.sh" "$root/bin/install.sh"
-    fetch "$platform/$arch/bin/service.sh" "$root/bin/service.sh"
-    chmod 700 "$root/bin/"*.sh
-    /bin/bash "$root/bin/service.sh" prepare
+    fetch "$platform/install.sh" "$root/install.sh"
+    fetch "$platform/service.sh" "$root/service.sh"
+    chmod 700 "$root/install.sh" "$root/service.sh"
+    /bin/bash "$root/service.sh" prepare
     if [ "$platform" = linux ]; then sudo /bin/bash "$root/.state/package/bin/installdependencies.sh"; fi
     user=$(id -un); user_id=$(id -u)
     definition=$(mktemp)
     if [ "$platform" = linux ]; then
         [ -d /run/systemd/system ] || { echo 'Linux must be booted with systemd.' >&2; rm -f "$definition"; exit 1; }
         service_name=local-github-runner-$user_id-$arch.service
-        exec_path=$(unit_quote "$root/bin/service.sh" | sed 's/\$/$$/g')
+        exec_path=$(unit_quote "$root/service.sh" | sed 's/\$/$$/g')
         cat > "$definition" <<UNIT
 [Unit]
 Description=GitHub organization runner supervisor
@@ -125,7 +175,7 @@ UNIT
 <plist version="1.0"><dict>
 <key>Label</key><string>$service_name</string>
 <key>UserName</key><string>$(xml "$user")</string>
-<key>ProgramArguments</key><array><string>/bin/bash</string><string>$(xml "$root/bin/service.sh")</string></array>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>$(xml "$root/service.sh")</string></array>
 <key>WorkingDirectory</key><string>$(xml "$root")</string>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><false/>
 <key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>90</integer>
@@ -139,8 +189,8 @@ PLIST
         sudo launchctl bootstrap system "/Library/LaunchDaemons/$service_name.plist"
         sudo launchctl print "system/$service_name" >/dev/null
     fi
-    rm -f "$definition" "$root/bin/manager.py" "$root/bin/install_service.py" "$root/.state/python"
-    printf '\nInstalled %s\nStatus: bash "%s/bin/service.sh" status\nLog: %s/logs/service.log\n' "$service_name" "$root" "$root"
+    rm -f "$definition"
+    printf '\nInstalled %s\nStatus: bash "%s/service.sh" status\nLog: %s/logs/service.log\n' "$service_name" "$root" "$root"
 }
 if [ -t 0 ]; then install_main "$@";
 elif ( : < /dev/tty ) 2>/dev/null; then install_main "$@" < /dev/tty;

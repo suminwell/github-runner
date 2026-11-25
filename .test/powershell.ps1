@@ -7,12 +7,50 @@ New-Item -ItemType Directory -Path $fixture | Out-Null
 $success = $false
 function Assert($Condition, [string]$Message) { if (-not $Condition) { throw "Assertion failed: $Message" } }
 try {
+    # Load only installer helper definitions, without administrator/host operations.
+    $tokens = $null; $errors = $null
+    $installer = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'windows\install.ps1'), [ref]$tokens, [ref]$errors)
+    Assert ($errors.Count -eq 0) 'installer syntax'
+    foreach ($name in @('Get-NativeArchitecture','Move-PreviousLayout')) {
+        $definition = $installer.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $false)
+        . ([scriptblock]::Create($definition.Extent.Text))
+    }
+    function Get-ItemProperty { return [pscustomobject]@{PROCESSOR_ARCHITECTURE=$script:NativeArch} }
+    $script:NativeArch = 'AMD64'; Assert ((Get-NativeArchitecture) -eq 'x64') 'native x64 detected'
+    $script:NativeArch = 'ARM64'; Assert ((Get-NativeArchitecture) -eq 'arm64') 'native ARM64 detected'
+    $script:NativeArch = 'x86'; $failed = $false; try { Get-NativeArchitecture } catch { $failed = $true }
+    Assert $failed 'unsupported architecture rejected'
+    Remove-Item Function:Get-ItemProperty
+    foreach ($arch in @('x64','arm64')) {
+        $upgradeRoot = Join-Path $fixture "upgrade-$arch"; $legacy = Join-Path $upgradeRoot $arch
+        foreach ($part in @('.state','bin\alpha\runner','data\alpha\repo','logs')) { New-Item -ItemType Directory -Force -Path (Join-Path $legacy $part) | Out-Null }
+        Set-Content (Join-Path $legacy '.state\settings.json') '{}'
+        Set-Content (Join-Path $legacy '.state\organizations.json') '{"1":{"login":"alpha","runner_id":100,"runner_name":"local-windows-x64-3"}}'
+        Set-Content (Join-Path $legacy 'data\alpha\repo\.hidden') 'keep'
+        Set-Content (Join-Path $legacy 'bin\alpha\runner\.credentials') 'credential'
+        Set-Content (Join-Path $legacy 'bin\service.ps1') 'old script'
+        Set-Content (Join-Path $legacy 'bin\install.ps1') 'old script'
+        Move-PreviousLayout $upgradeRoot $arch
+        Assert (-not (Test-Path $legacy)) 'architecture directory removed'
+        Assert (-not (Test-Path (Join-Path $upgradeRoot 'bin\service.ps1'))) 'old script removed'
+        Assert ((Get-Content (Join-Path $upgradeRoot 'data\alpha\repo\.hidden')) -eq 'keep') 'work data preserved'
+        Assert ((Get-Content (Join-Path $upgradeRoot 'bin\alpha\runner\.credentials')) -eq 'credential') 'credentials preserved'
+        $migrated = Get-Content -Raw (Join-Path $upgradeRoot '.state\organizations.json') | ConvertFrom-Json
+        Assert ($migrated.'1'.relocated -and $migrated.'1'.runner_id -eq 100 -and $migrated.'1'.runner_name -eq 'local-windows-x64-3') 'identity preserved for reconfiguration'
+        Move-PreviousLayout $upgradeRoot $arch
+    }
+    $conflictRoot = Join-Path $fixture 'conflicting-layout'
+    New-Item -ItemType Directory -Force -Path (Join-Path $conflictRoot 'x64\.state'),(Join-Path $conflictRoot 'data') | Out-Null
+    Set-Content (Join-Path $conflictRoot 'x64\.state\settings.json') '{}'
+    $failed = $false; try { Move-PreviousLayout $conflictRoot 'x64' } catch { $failed = $true }
+    Assert $failed 'conflicting layouts not merged'
+    Assert (Test-Path (Join-Path $conflictRoot 'x64\.state\settings.json')) 'conflicting layout retained'
     foreach ($arch in @('x64','arm64')) {
         $testRoot = Join-Path $fixture $arch
         New-Item -ItemType Directory -Force -Path (Join-Path $testRoot 'bin'), (Join-Path $testRoot '.state') | Out-Null
-        Copy-Item (Join-Path $repo "windows\$arch\bin\service.ps1") (Join-Path $testRoot 'bin\service.ps1')
+        Copy-Item (Join-Path $repo 'windows\service.ps1') (Join-Path $testRoot 'service.ps1')
         $env:LOCAL_RUNNER_ROOT = $testRoot
-        . (Join-Path $testRoot 'bin\service.ps1') -Mode Library -Root $testRoot
+        . (Join-Path $testRoot 'service.ps1') -Mode Library -Root $testRoot
         if (-not $onWindows) { $script:PowerShell = (Get-Process -Id $PID).Path }
         Write-Json (Join-Path $testRoot '.state\settings.json') @{ arch=$arch; poll_seconds=10; restart_seconds=1; organizations=@() }
         Write-AtomicText (Join-Path $testRoot '.state\gh-path') $script:PowerShell
@@ -21,7 +59,7 @@ try {
         $unicodePath = 'C:\' + [char]0x5DE5 + [char]0x4F5C
         Write-Json (Join-Path $testRoot '.state\unicode.json') @{ path=$unicodePath }
         Assert ((Read-Json (Join-Path $testRoot '.state\unicode.json')).path -ceq $unicodePath) 'UTF-8 paths round-trip'
-        $script:Remote = @{}; $script:NextId = 100; $script:FailDiscovery = $false
+        $script:Remote = @{}; $script:NextId = 100; $script:FailDiscovery = $false; $script:Raced = $false
         $script:Members = @(@{ state='active'; organization=@{id=1;login='alpha'} })
         function Invoke-GitHubApi([string]$Endpoint, [string]$Method='GET', [switch]$Paginate) {
             if ($Endpoint -like 'user/memberships/*') {
@@ -29,7 +67,8 @@ try {
                 return ,@($script:Members)
             }
             if ($Endpoint -match '^orgs/([^/]+)/actions/runners\?') {
-                return ,@([pscustomobject]@{runners=@($script:Remote[$Matches[1]]) | Where-Object { $null -ne $_ }})
+                $runners = @($script:Remote[$Matches[1]]) | Where-Object { $null -ne $_ }
+                return ,@([pscustomobject]@{runners=@($runners | Select-Object -First 1)},[pscustomobject]@{runners=@($runners | Select-Object -Skip 1)})
             }
             if ($Endpoint -match '^orgs/([^/]+)/actions/runners/(\d+)$' -and $Method -eq 'DELETE') {
                 $script:Remote[$Matches[1]] = @($script:Remote[$Matches[1]] | Where-Object id -ne ([long]$Matches[2]))
@@ -37,17 +76,25 @@ try {
             }
             throw "Unexpected fake API endpoint: $Endpoint"
         }
-        function Register-Runner([string]$Login) {
+        function Register-Runner([string]$Login, [string]$Name) {
+            if ($Login -eq 'race' -and -not $script:Raced) {
+                $script:Raced = $true
+                $script:Remote.race = @([pscustomobject]@{id=997;name=$Name;busy=$false})
+                throw 'Another installation took this number.'
+            }
+            if (@($script:Remote[$Login] | Where-Object name -eq $Name).Count) { throw 'Name already exists.' }
             $runnerId = $script:NextId; $script:NextId++
             $directory = Join-Path $script:Root "bin\$Login\runner"
             New-Item -ItemType Directory -Force -Path $directory, (Join-Path $script:Root "data\$Login") | Out-Null
-            Write-Json (Join-Path $directory '.runner') @{agentId=$runnerId}
-            $script:Remote[$Login] = @($script:Remote[$Login] | Where-Object { $null -ne $_ }) + @([pscustomobject]@{id=$runnerId; name=$script:Name; busy=$false; status='online'})
+            Write-Json (Join-Path $directory '.runner') @{agentId=$runnerId;agentName=$Name}
+            $script:Remote[$Login] = @($script:Remote[$Login] | Where-Object { $null -ne $_ }) + @([pscustomobject]@{id=$runnerId; name=$Name; busy=$false; status='online'})
+            if ($Login -eq 'partial') { throw 'Reported failure after registration.' }
             return $runnerId
         }
         Invoke-Reconcile
         Assert ((Get-State)['1'].runner_id -eq 100) 'registration persisted'
-        Assert ($script:Remote.alpha[0].name -eq "local-windows-$arch") 'architecture name'
+        Assert ($script:Remote.alpha[0].name -eq "$script:Prefix-1") 'architecture name and first index'
+        Assert ((Get-State)['1'].runner_name -eq "$script:Prefix-1") 'name persisted'
         Invoke-Reconcile
         Assert ($script:NextId -eq 101) 'idempotency'
         $script:FailDiscovery = $true
@@ -70,12 +117,40 @@ try {
         Save-State @{}; $previous = $script:NextId; Invoke-Reconcile
         Assert ($script:NextId -eq $previous) 'registration recovered after state loss'
         $otherArch = if ($arch -eq 'x64') { 'arm64' } else { 'x64' }
-        $script:Remote.beta = @([pscustomobject]@{id=999;name="local-windows-$otherArch";busy=$false})
+        $script:Remote.beta = @([pscustomobject]@{id=999;name="local-windows-$otherArch-50";busy=$false})
         Reconcile-Organization '2' 'beta'
         Assert ($script:Remote.beta.Count -eq 2) 'other architecture does not conflict'
-        $script:Remote.collision = @([pscustomobject]@{id=998;name=$script:Name;busy=$false})
-        $failed = $false; try { Reconcile-Organization '3' 'collision' } catch { $failed = $true }
-        Assert $failed 'same architecture collision rejected'
+        Assert ($script:Remote.beta[-1].name -eq "$script:Prefix-1") 'per-organization sequence'
+        $script:Remote.collision = @(
+            [pscustomobject]@{id=998;name="$script:Prefix-1";busy=$false},
+            [pscustomobject]@{id=990;name="$script:Prefix-3";busy=$false},
+            [pscustomobject]@{id=991;name="$script:Prefix-10";busy=$false;status='offline'},
+            [pscustomobject]@{id=992;name="$script:Prefix-99-extra";busy=$false},
+            [pscustomobject]@{id=993;name='unrelated-100';busy=$false}
+        )
+        Reconcile-Organization '3' 'collision'
+        Assert ($script:Remote.collision[-1].name -eq "$script:Prefix-11") 'maximum numeric index across pages including offline runners'
+        Assert ($script:Remote.collision[0].id -eq 998) 'other machine retained'
+        $previous = $script:NextId; Reconcile-Organization '3' 'collision'
+        Assert ($script:NextId -eq $previous) 'number stable after restart'
+        Reconcile-Organization '5' 'race'
+        Assert ($script:Remote.race[-1].name -eq "$script:Prefix-2" -and $script:Remote.race[0].id -eq 997) 'concurrent allocation retries without replacing'
+        Reconcile-Organization '6' 'partial'
+        Assert ((Get-State)['6'].runner_name -eq "$script:Prefix-1") 'partial registration recovered'
+        $state = Get-State; $state['3'] | Add-Member -NotePropertyName relocated -NotePropertyValue $true; Save-State $state
+        Reconcile-Organization '3' 'collision'
+        Assert ((Get-State)['3'].runner_name -eq "$script:Prefix-11" -and -not (Get-State)['3'].relocated) 'relocation keeps the number'
+        ($script:Remote.collision | Where-Object name -eq "$script:Prefix-11").id = 995
+        Reconcile-Organization '3' 'collision'
+        Assert ($script:Remote.collision[-1].name -eq "$script:Prefix-12" -and @($script:Remote.collision | Where-Object id -eq 995).Count -eq 1) 'taken repair number increments without replacing'
+        $script:Remote.legacy = @([pscustomobject]@{id=996;name=$script:Prefix;busy=$true})
+        $directory = Join-Path $testRoot 'bin\legacy\runner'; New-Item -ItemType Directory -Path $directory -Force | Out-Null
+        Write-Json (Join-Path $directory '.runner') @{agentId=996}
+        $state = Get-State; $state['7'] = @{login='legacy';runner_id=996;runner_name=$script:Prefix}; Save-State $state
+        Reconcile-Organization '7' 'legacy'
+        Assert ($script:Remote.legacy[0].name -eq $script:Prefix) 'busy legacy upgrade deferred'
+        $script:Remote.legacy[0].busy = $false; Reconcile-Organization '7' 'legacy'
+        Assert ($script:Remote.legacy.Count -eq 1 -and $script:Remote.legacy[0].name -eq "$script:Prefix-1") 'idle legacy name upgraded'
         $failed = $false; try { Reconcile-Organization '4' '../escape' } catch { $failed = $true }
         Assert $failed 'invalid organization rejected'
         # Exercise real native argument quoting and removal of management credentials.
@@ -89,6 +164,7 @@ try {
         Assert (-not $parsed.token) 'credential environment excluded'
         # Exercise actual wrapper restart, without real GitHub runners or host services.
         if ($onWindows) {
+        Remove-Item Env:LOCAL_RUNNER_ROOT
         $runner = Join-Path $testRoot 'bin\renamed\runner'
         $env:FAKE_RUN_MARKER = Join-Path $testRoot 'runs'
         Write-AtomicText (Join-Path $runner 'probe.ps1') 'if($env:GH_TOKEN){exit 92}; Add-Content -LiteralPath $env:FAKE_RUN_MARKER -Value run; Start-Sleep -Milliseconds 200'

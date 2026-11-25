@@ -19,7 +19,7 @@ jobs:
         run: |
           sh -n linux/install.sh
           sh -n macos/install.sh
-          for script in linux/*/bin/*.sh macos/*/bin/*.sh .test/*.sh; do
+          for script in linux/*.sh macos/*.sh .test/*.sh; do
             bash -n "$script"
           done
       - name: Exercise Shell supervisor and real child restarts
