@@ -15,7 +15,7 @@ function Write-AtomicText([string]$Path, [string]$Text) {
 }
 function Write-Json([string]$Path, $Value) { Write-AtomicText $Path ($Value | ConvertTo-Json -Depth 30) }
 function Read-Json([string]$Path) {
-    if (Test-Path -LiteralPath $Path) { return (Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json) }
+    if (Test-Path -LiteralPath $Path) { return (Get-Content -Raw -Encoding UTF8 -LiteralPath $Path | ConvertFrom-Json) }
     return $null
 }
 function Write-Log([string]$Message) {
@@ -24,7 +24,7 @@ function Write-Log([string]$Message) {
         foreach ($number in @(2,1)) { if (Test-Path "$path.$number") { Move-Item "$path.$number" "$path.$($number+1)" -Force } }
         Move-Item $path "$path.1" -Force
     }
-    Add-Content -LiteralPath $path -Value "$([DateTime]::UtcNow.ToString('o')) $Message"
+    Add-Content -Encoding UTF8 -LiteralPath $path -Value "$([DateTime]::UtcNow.ToString('o')) $Message"
 }
 function Get-State {
     $state = @{}
@@ -37,7 +37,7 @@ function Initialize-Manager {
     $script:Settings = Read-Json (Join-Path $script:Root '.state\settings.json')
     if ($script:Settings.arch -notin @('x64','arm64')) { throw 'Unsupported architecture.' }
     $script:Name = 'local-windows-' + $script:Settings.arch
-    $script:Gh = (Get-Content -Raw (Join-Path $script:Root '.state\gh-path')).Trim()
+    $script:Gh = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:Root '.state\gh-path')).Trim()
     $script:PollSeconds = [Math]::Max(10, $(if ($script:Settings.poll_seconds) { $script:Settings.poll_seconds } else { 300 }))
     $script:RestartSeconds = [Math]::Max(1, $(if ($script:Settings.restart_seconds) { $script:Settings.restart_seconds } else { 30 }))
     foreach ($directory in @('logs','data','.state\workers','.state\children','.state\paused','.state\retry')) {
@@ -61,7 +61,7 @@ function New-ProcessInfo([string]$Executable, [string[]]$Arguments, [string]$Dir
 function Invoke-Native([string]$Executable, [string[]]$Arguments, [int]$Timeout = 90, [switch]$Authentication, [string]$Directory = $script:Root) {
     $info = New-ProcessInfo $Executable $Arguments $Directory
     if ($Authentication) {
-        $info.EnvironmentVariables['GH_TOKEN'] = (Get-Content -Raw (Join-Path $script:Root '.state\github-token')).Trim()
+        $info.EnvironmentVariables['GH_TOKEN'] = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:Root '.state\github-token')).Trim()
         $info.EnvironmentVariables['GH_HOST'] = 'github.com'
         $info.EnvironmentVariables['GH_PROMPT_DISABLED'] = '1'
     }

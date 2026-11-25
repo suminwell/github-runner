@@ -77,7 +77,7 @@ if (-not $token) { throw 'No GitHub credential available.' }
 $settingsPath = Join-Path $state 'settings.json'
 $settings = @{}
 if (Test-Path $settingsPath) {
-    $previous = Get-Content -Raw $settingsPath | ConvertFrom-Json
+    $previous = Get-Content -Raw -Encoding UTF8 -LiteralPath $settingsPath | ConvertFrom-Json
     foreach ($property in $previous.PSObject.Properties) { $settings[$property.Name] = $property.Value }
 }
 $settings.platform = 'windows'; $settings.arch = $arch; $settings.gh = $ghPath; $settings.Remove('python')

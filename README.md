@@ -141,7 +141,7 @@ bash ~/.local/share/github-runner/macos/arm64/bin/service.sh status
 Get-ScheduledTask LocalGitHubRunner-x64
 Get-ScheduledTaskInfo LocalGitHubRunner-x64
 & "$env:ProgramData\local-github-runner\windows\x64\bin\service.ps1" -Mode Status
-Get-Content "$env:ProgramData\local-github-runner\windows\x64\logs\service.log" -Wait
+Get-Content "$env:ProgramData\local-github-runner\windows\x64\logs\service.log" -Encoding UTF8 -Wait
 ```
 
 `status` 查询 GitHub 返回的真实 `online`、`offline`、`busy` 状态。服务启动不等于 Runner 已成功注册。详细 Runner 日志位于 `bin/<组织>/runner/_diag/`；管理日志按 5 MiB 轮换，保留三份历史。

@@ -18,6 +18,9 @@ try {
         Write-AtomicText (Join-Path $testRoot '.state\gh-path') $script:PowerShell
         Write-AtomicText (Join-Path $testRoot '.state\github-token') 'secret-test-token'
         Initialize-Manager
+        $unicodePath = 'C:\' + [char]0x5DE5 + [char]0x4F5C
+        Write-Json (Join-Path $testRoot '.state\unicode.json') @{ path=$unicodePath }
+        Assert ((Read-Json (Join-Path $testRoot '.state\unicode.json')).path -ceq $unicodePath) 'UTF-8 paths round-trip'
         $script:Remote = @{}; $script:NextId = 100; $script:FailDiscovery = $false
         $script:Members = @(@{ state='active'; organization=@{id=1;login='alpha'} })
         function Invoke-GitHubApi([string]$Endpoint, [string]$Method='GET', [switch]$Paginate) {
