@@ -1,4 +1,5 @@
 param([Parameter(Mandatory=$true)][string]$Root, [Parameter(Mandatory=$true)][string]$OrgId)
+$WorkerOrganizationId = $OrgId
 . (Join-Path $Root 'bin\service.ps1') -Mode Library -Root $Root
 function Invoke-Worker([string]$Id) {
     if ($Id -notmatch '^\d+$') { throw 'Invalid organization ID.' }
@@ -18,5 +19,12 @@ function Invoke-Worker([string]$Id) {
         }
     } finally { Stop-Record $record; $lock.Dispose() }
 }
-Initialize-Manager
-Invoke-Worker $OrgId
+try {
+    Initialize-Manager -Control
+    $activeDirectory = Join-Path $script:Root 'conf\active-work-dir'
+    if (Test-Path $activeDirectory) { $script:LogDir = Join-Path ((Get-Content -Raw -Encoding UTF8 $activeDirectory).Trim()) 'logs' }
+    Invoke-Worker $WorkerOrganizationId
+} catch {
+    Write-Log "Worker $WorkerOrganizationId stopped: $($_.Exception.Message)"
+    exit 1
+}

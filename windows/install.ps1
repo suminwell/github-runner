@@ -72,6 +72,18 @@ if ($migrate) {
 }
 New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
 $installRoot = (Resolve-Path -LiteralPath $installRoot).Path
+$knownInstallation = $false
+foreach ($relative in @('conf\settings.json','.state\settings.json',"$arch\.state\settings.json")) {
+    $settingsFile = Join-Path $installRoot $relative
+    if (Test-Path $settingsFile) {
+        $existingSettings = Get-Content -Raw -Encoding UTF8 -LiteralPath $settingsFile | ConvertFrom-Json
+        if ($existingSettings.platform -ne 'windows') { throw 'Installation configuration belongs to a different platform.' }
+        $knownInstallation = $true
+    }
+}
+if (-not $knownInstallation) {
+    foreach ($part in @('bin','conf','runner')) { if (Test-Path (Join-Path $installRoot $part)) { throw "Refusing to reuse unrelated directory $installRoot\$part; choose another installation directory." } }
+}
 $bin = Join-Path $installRoot 'bin'; $state = Join-Path $installRoot 'conf'; $legacy = Join-Path $installRoot $arch
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $acl = New-Object Security.AccessControl.DirectorySecurity
@@ -85,7 +97,11 @@ $acl.AddAccessRule($rule)
 Set-Acl -LiteralPath $installRoot -AclObject $acl
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($task) {
-    if ($task.Actions.Arguments -notlike ('*"' + (Join-Path $installRoot 'bin\service.ps1') + '"*') -and $task.Actions.Arguments -notlike ('*"' + (Join-Path $installRoot 'service.ps1') + '"*') -and $task.Actions.Arguments -notlike ('*"' + (Join-Path $legacy 'bin\service.ps1') + '"*')) { throw 'Another installation owns this task name.' }
+    $owned = $false
+    foreach ($expected in @((Join-Path $installRoot 'bin\service.ps1'), (Join-Path $installRoot 'service.ps1'), (Join-Path $legacy 'bin\service.ps1'))) {
+        if (@($task.Actions).Count -eq 1 -and @($task.Actions)[0].Arguments.IndexOf(('"' + $expected + '"'), [StringComparison]::OrdinalIgnoreCase) -ge 0) { $owned = $true }
+    }
+    if (-not $owned) { throw 'Another installation owns this task name.' }
     Disable-ScheduledTask -TaskName $taskName | Out-Null
     Stop-ScheduledTask -TaskName $taskName
     for ($attempt = 0; $attempt -lt 30 -and (Get-ScheduledTask -TaskName $taskName).State -eq 'Running'; $attempt++) { Start-Sleep -Milliseconds 200 }

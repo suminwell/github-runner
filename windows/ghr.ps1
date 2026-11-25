@@ -38,7 +38,7 @@ function Install-Command {
 }
 function Get-OwnedTask {
     $task = Get-ScheduledTask -TaskName "LocalGitHubRunner-$($script:Settings.arch)" -ErrorAction SilentlyContinue
-    if ($task -and $task.Actions.Arguments -notlike ('*"' + (Join-Path $script:Root 'bin\service.ps1') + '"*')) { throw 'Another installation owns this task name.' }
+    if ($task -and (@($task.Actions).Count -ne 1 -or @($task.Actions)[0].Arguments.IndexOf(('"' + (Join-Path $script:Root 'bin\service.ps1') + '"'), [StringComparison]::OrdinalIgnoreCase) -lt 0)) { throw 'Another installation owns this task name.' }
     return $task
 }
 function Stop-Installation {

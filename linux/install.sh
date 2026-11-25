@@ -102,6 +102,16 @@ install_main() {
 '*) echo 'Newlines are not supported in installation paths.' >&2; exit 1 ;; esac
     mkdir -p "$root"
     root=$(cd "$root" && pwd)
+    known_installation=false
+    for settings_file in "$root/conf/settings.json" "$root/.state/settings.json" "$root/$arch/.state/settings.json"; do
+        if [ -f "$settings_file" ]; then
+            jq -e --arg platform "$platform" '.platform==$platform' "$settings_file" >/dev/null || { echo 'Installation configuration belongs to a different platform.' >&2; exit 1; }
+            known_installation=true
+        fi
+    done
+    if [ "$known_installation" = false ]; then
+        for part in bin conf runner; do [ ! -e "$root/$part" ] || { echo "Refusing to reuse unrelated directory $root/$part; choose another installation directory." >&2; exit 1; }; done
+    fi
     other_arch=x64; [ "$arch" != x64 ] || other_arch=arm64
     [ ! -f "$root/$other_arch/.state/settings.json" ] || { echo 'An installation for another architecture exists; stop it and move it aside before upgrading.' >&2; exit 1; }
     if [ -f "$root/$arch/.state/settings.json" ]; then
