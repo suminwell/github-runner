@@ -75,7 +75,7 @@ ghr config --dir [<PATH>]: 设置data和logs的父目录，默认为当前目录
 ghr uninstall: 卸载runner
 ```
 
-- `status`：显示管理进程、本机各组织 Runner 的 GitHub `online/offline/missing`、是否忙碌和本机运行状态。网络或权限失败显示 `unknown`，不会误报离线。
+- `status`：显示平台和架构、安装目录、Runner 程序目录、当前数据和日志目录、管理进程状态与 PID，并逐组织显示本机 Runner 在 GitHub 上的 `online/offline/missing/unknown`、是否忙碌、本地进程状态及 PID，最后汇总数量。网络或权限失败显示 `unknown`，不会误报离线。本地 `restarting` 表示组织管理进程仍在，但监听进程尚未启动或正在重启。
 - `start`：启动管理服务并启用开机自动启动。已运行时不会重启，也不会提前应用待生效配置。
 - `stop`：关闭自动启动，停止管理服务及各组织的 Runner，保留注册和数据。正在运行的 job 会被中断：Linux/macOS 先发送 TERM，等待官方 Runner 取消 job 并上报（最多 `stop_seconds` 秒）后再强制结束；Windows 直接强制结束。
 - `restart`：先停止再启动，并应用保存的目录配置。
@@ -84,6 +84,31 @@ ghr uninstall: 卸载runner
 - `uninstall`：停止进程，注销本机记录的 GitHub Runner，移除系统服务、命令、脚本和配置；所有工作数据与日志保留。若注册成功后尚未保存组织状态就退出，会从本地官方 `.runner` 元数据补查组织和远端身份。身份无法确认或 GitHub 注销失败时保留凭据和状态，修复后再次执行卸载。其他机器的 Runner 不会被删除。
 
 Unix 的入口为 `/usr/local/bin/ghr`，调用安装目录的 `bin/ghr.sh`。Windows 的 `bin/ghr.cmd` 调用 `bin/ghr.ps1`，安装器将其目录加入安装用户的 PATH。若已有终端找不到 `ghr`，重新打开终端；Unix 的 PATH 需要包含 `/usr/local/bin`。Windows 的启停、目录设置和卸载在管理员 PowerShell 中执行。
+
+`ghr status` 输出示例：
+
+```text
+GitHub Runner status
+Platform: linux / x64
+Manager: running (PID 4321)
+Install directory: /home/user/.local/share/github-runner/linux
+Runner directory: /home/user/.local/share/github-runner/linux/runner
+Work directory: /srv/builds (active)
+Data directory: /srv/builds/data
+Logs directory: /srv/builds/logs
+Configured work directory: /srv/builds
+Configuration: no pending directory change
+
+ORGANIZATION             RUNNER                           GITHUB    BUSY  LOCAL       PID
+organization-a           local-linux-x64-1                online    true  running     4350
+organization-b           local-linux-x64-2                offline   false restarting  4360
+
+Organizations: 2
+GitHub: 1 online, 1 offline, 0 missing, 0 unknown; 1 busy
+Local: 1 running, 1 restarting, 0 stopped/paused
+```
+
+修改目录但尚未重启时，会标记 `Configuration: pending` 并列出下次启动使用的数据和日志目录；停止后则标明上次运行的目录。即使尚未注册任何组织，也会保留完整的安装和目录概览。WSL 还会显示 Windows 宿主任务状态。
 
 ## 修改数据和日志目录
 
@@ -207,6 +232,7 @@ bash .test/shell.sh
 bash .test/wsl.sh
 bash .test/install-retry.sh
 bash .test/uninstall-recovery.sh
+bash .test/status.sh
 ```
 
 ```powershell
@@ -214,6 +240,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .test/powershell.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .test/wsl.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .test/install-retry.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .test/uninstall-recovery.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .test/status.ps1
 ```
 
 测试使用临时目录、假 GitHub API 和系统服务接口，验证注册编号、目录升级、真实子进程恢复、启停、配置生效、日志跟踪和卸载；不安装本机服务，不注册真实 Runner。CI 在 Linux、macOS、Windows 上运行，分别模拟 x64/arm64 配置。真实组织接单、两种原生硬件及系统重启恢复仍需集成验收。

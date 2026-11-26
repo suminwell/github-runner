@@ -407,22 +407,54 @@ serve() {
     done
 }
 status() {
-    local id login runner_id name remote local_status failed=0 count=0
-    if record_alive "$ROOT/conf/manager.pid"; then printf 'Manager: running\n'; else printf 'Manager: stopped\n'; fi
+    local id login runner_id name active remote row local_status local_pid remote_name remote_status busy
+    local failed=0 count=0 online=0 offline=0 missing=0 unknown=0 jobs=0 listening=0 restarting=0
+    local manager=stopped work=$WORK_DIR directory_state='configured; not started yet' work_prefix configured_prefix
+    if record_alive "$ROOT/conf/manager.pid"; then manager=running; fi
+    printf 'GitHub Runner status\nPlatform: %s / %s\n' "$OS" "$ARCH"
+    if [ "$manager" = running ]; then printf 'Manager: running (PID %s)\n' "$(head -n 1 "$ROOT/conf/manager.pid")";
+    elif [ -f "$ROOT/conf/stopped" ]; then printf 'Manager: stopped (run ghr start to resume)\n';
+    else printf 'Manager: stopped\n'; fi
+    printf 'Install directory: %s\nRunner directory: %s/runner\n' "$ROOT" "$ROOT"
+    if [ -s "$ROOT/conf/active-work-dir" ]; then
+        work=$(cat "$ROOT/conf/active-work-dir")
+        directory_state='last run; manager stopped'
+        [ "$manager" != running ] || directory_state=active
+    fi
+    work_prefix=$work; [ "$work" != / ] || work_prefix=
+    configured_prefix=$WORK_DIR; [ "$WORK_DIR" != / ] || configured_prefix=
+    printf 'Work directory: %s (%s)\nData directory: %s/data\nLogs directory: %s/logs\n' "$work" "$directory_state" "$work_prefix" "$work_prefix"
     printf 'Configured work directory: %s\n' "$WORK_DIR"
-    if [ -f "$ROOT/conf/active-work-dir" ]; then printf 'Last started work directory: %s\n' "$(cat "$ROOT/conf/active-work-dir")"; fi
-    local row_format='%-24s %-30s %-10s %-6s %s\n' remote_name remote_status busy
-    printf "$row_format" ORGANIZATION RUNNER GITHUB BUSY LOCAL
-    while IFS=$'\t' read -r id login runner_id name; do
-        count=$((count+1)); local_status=stopped
-        record_alive "$ROOT/conf/workers/$id.pid" && local_status=running
-        if remote=$(list_runners "$login"); then
-            IFS=$'\t' read -r remote_name remote_status busy < <(printf '%s' "$remote" | "$JQ" -r --argjson id "$runner_id" --arg name "$name" \
-                '([.[]|select(.id==$id)][0] // {name:$name,status:"missing",busy:false}) | [.name,.status,(.busy|tostring)] | @tsv')
-            printf "$row_format" "$login" "$remote_name" "$remote_status" "$busy" "$local_status"
-        else printf "$row_format" "$login" "$name" unknown '?' "$local_status"; failed=1; fi
-    done < <("$JQ" -r 'to_entries[]|[.key,.value.login,.value.runner_id,(.value.runner_name // "unknown")]|@tsv' "$ROOT/conf/organizations.json")
-    [ "$count" -ne 0 ] || printf 'No runners registered yet.\n'
+    if [ "$work" != "$WORK_DIR" ]; then
+        printf 'Configuration: pending; next start uses %s/data and %s/logs\n' "$configured_prefix" "$configured_prefix"
+        printf 'Run ghr restart (or stop then start) to apply.\n'
+    else printf 'Configuration: no pending directory change\n'; fi
+    local row_format='%-24s %-32s %-9s %-5s %-11s %s\n'
+    printf '\n'; printf "$row_format" ORGANIZATION RUNNER GITHUB BUSY LOCAL PID
+    while IFS=$'\t' read -r id login runner_id name active; do
+        count=$((count+1)); local_status=stopped; local_pid=-
+        if record_alive "$ROOT/conf/children/$id.pid"; then
+            local_status=running; local_pid=$(head -n 1 "$ROOT/conf/children/$id.pid"); listening=$((listening+1))
+        elif record_alive "$ROOT/conf/workers/$id.pid"; then
+            local_status=restarting; local_pid=$(head -n 1 "$ROOT/conf/workers/$id.pid"); restarting=$((restarting+1))
+        elif [ "$active" = false ] || [ -f "$ROOT/conf/paused/$id" ]; then local_status=paused; fi
+        remote_name=$name; remote_status=unknown; busy='?'
+        if remote=$(list_runners "$login") && row=$(printf '%s' "$remote" | "$JQ" -er --argjson id "$runner_id" --arg name "$name" \
+            '([.[]|select(.id==$id)][0]) as $r | if $r == null then [$name,"missing","-"] else [($r.name // $name),($r.status // "unknown"),(if $r.busy == null then "?" else ($r.busy|tostring) end)] end | @tsv'); then
+            IFS=$'\t' read -r remote_name remote_status busy <<< "$row"
+        fi
+        case "$remote_status" in
+            online) online=$((online+1)) ;; offline) offline=$((offline+1)) ;; missing) missing=$((missing+1)) ;;
+            *) remote_status=unknown; busy='?'; unknown=$((unknown+1)); failed=1 ;;
+        esac
+        [ "$busy" != true ] || jobs=$((jobs+1))
+        printf "$row_format" "$login" "$remote_name" "$remote_status" "$busy" "$local_status" "$local_pid"
+    done < <("$JQ" -r 'to_entries|sort_by(.value.login)[]|[.key,.value.login,.value.runner_id,(.value.runner_name // "unknown"),(.value.active != false)]|@tsv' "$ROOT/conf/organizations.json")
+    [ "$count" -ne 0 ] || printf 'No runners registered yet. Use ghr logs to check discovery and registration.\n'
+    printf '\nOrganizations: %s\nGitHub: %s online, %s offline, %s missing, %s unknown; %s busy\n' "$count" "$online" "$offline" "$missing" "$unknown" "$jobs"
+    printf 'Local: %s running, %s restarting, %s stopped/paused\n' "$listening" "$restarting" "$((count-listening-restarting))"
+    [ "$restarting" = 0 ] || printf 'restarting: organization worker is alive; listener is not running yet.\n'
+    [ "$failed" = 0 ] || printf 'Some GitHub statuses could not be queried; unknown does not mean offline.\n'
     return "$failed"
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

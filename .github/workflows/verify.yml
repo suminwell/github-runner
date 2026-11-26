@@ -37,6 +37,7 @@ jobs:
         run: |
           bash .test/install-retry.sh
           bash .test/uninstall-recovery.sh
+          bash .test/status.sh
       - name: Check PowerShell syntax
         if: runner.os == 'Windows'
         shell: powershell
@@ -60,3 +61,4 @@ jobs:
         run: |
           ./.test/install-retry.ps1
           ./.test/uninstall-recovery.ps1
+          ./.test/status.ps1

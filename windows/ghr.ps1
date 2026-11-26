@@ -77,23 +77,62 @@ function Start-Installation {
     Write-Host 'Runner started; automatic startup enabled.'
 }
 function Show-Status {
-    $running = $null -ne (Get-RecordedProcess (Join-Path $script:Root 'conf\manager.json'))
-    Write-Host "Manager: $(if ($running) { 'running' } else { 'stopped' })"
-    Write-Host "Configured work directory: $script:WorkDir"
+    $manager = Get-RecordedProcess (Join-Path $script:Root 'conf\manager.json')
+    Write-Host 'GitHub Runner status'
+    Write-Host "Platform: windows / $($script:Settings.arch)"
+    if ($manager) { Write-Host "Manager: running (PID $($manager.Id))" }
+    elseif (Test-Path (Join-Path $script:Root 'conf\stopped')) { Write-Host 'Manager: stopped (run ghr start to resume)' }
+    else { Write-Host 'Manager: stopped' }
+    Write-Host "Install directory: $script:Root"
+    Write-Host "Runner directory: $(Join-Path $script:Root 'runner')"
+    $work = $script:WorkDir; $directoryState = 'configured; not started yet'
     $active = Join-Path $script:Root 'conf\active-work-dir'
-    if (Test-Path $active) { Write-Host "Last started work directory: $(Get-Content -Raw -Encoding UTF8 $active)" }
+    if ((Test-Path $active) -and (Get-Item -LiteralPath $active).Length -gt 0) {
+        $work = (Get-Content -Raw -Encoding UTF8 -LiteralPath $active).TrimEnd("`r","`n")
+        $directoryState = if ($manager) { 'active' } else { 'last run; manager stopped' }
+    }
+    Write-Host "Work directory: $work ($directoryState)"
+    Write-Host "Data directory: $(Join-Path $work 'data')"
+    Write-Host "Logs directory: $(Join-Path $work 'logs')"
+    Write-Host "Configured work directory: $script:WorkDir"
+    if ($work -ne $script:WorkDir) {
+        Write-Host "Configuration: pending; next start uses $(Join-Path $script:WorkDir 'data') and $(Join-Path $script:WorkDir 'logs')"
+        Write-Host 'Run ghr restart (or stop then start) to apply.'
+    } else { Write-Host 'Configuration: no pending directory change' }
     $state = Get-State; $failed = $false
-    if (-not $state.Count) { Write-Host 'No runners registered yet.'; return }
-    $rows = foreach ($id in $state.Keys) {
-        $entry = $state[$id]; $runner = $null; $remoteStatus = 'missing'; $busy = $false
+    $online = 0; $offline = 0; $missing = 0; $unknown = 0; $jobs = 0; $listening = 0; $restarting = 0
+    # Explicit columns preserve full runner names even when PowerShell's host is narrow.
+    $rowFormat = '{0,-24} {1,-32} {2,-9} {3,-5} {4,-11} {5}'
+    Write-Host ''; Write-Host ($rowFormat -f 'ORGANIZATION','RUNNER','GITHUB','BUSY','LOCAL','PID')
+    foreach ($id in @($state.Keys | Sort-Object { $state[$_].login })) {
+        $entry = $state[$id]; $runner = $null; $remoteStatus = 'missing'; $busy = '-'; $name = $entry.runner_name
+        $listener = Get-RecordedProcess (Join-Path $script:Root "conf\children\$id.json")
+        $worker = Get-RecordedProcess (Join-Path $script:Root "conf\workers\$id.json")
+        $localStatus = 'stopped'; $localPid = '-'
+        if ($listener) { $localStatus = 'running'; $localPid = $listener.Id; $listening++ }
+        elseif ($worker) { $localStatus = 'restarting'; $localPid = $worker.Id; $restarting++ }
+        elseif ($entry.active -eq $false -or (Test-Path (Join-Path $script:Root "conf\paused\$id"))) { $localStatus = 'paused' }
         try {
             $runner = @(Get-RemoteRunners $entry.login | Where-Object id -eq $entry.runner_id) | Select-Object -First 1
-            if ($runner) { $remoteStatus = $runner.status; $busy = $runner.busy }
+            if ($runner) {
+                if ($runner.name) { $name = $runner.name }
+                $remoteStatus = $runner.status
+                $busy = if ($null -eq $runner.busy) { '?' } else { "$($runner.busy)".ToLowerInvariant() }
+            }
         } catch { $remoteStatus = 'unknown'; $busy = '?'; $failed = $true }
-        [pscustomobject]@{Organization=$entry.login;Runner=$entry.runner_name;GitHub=$remoteStatus;Busy=$busy;Local=$(if ($null -ne (Get-RecordedProcess (Join-Path $script:Root "conf\workers\$id.json"))) {'running'} else {'stopped'})}
+        switch ($remoteStatus) {
+            'online' { $online++ }; 'offline' { $offline++ }; 'missing' { $missing++ }
+            default { $remoteStatus = 'unknown'; $busy = '?'; $unknown++; $failed = $true }
+        }
+        if ($busy -eq 'true') { $jobs++ }
+        Write-Host ($rowFormat -f $entry.login,$name,$remoteStatus,$busy,$localStatus,$localPid)
     }
-    $rows | Format-Table -AutoSize | Out-Host
-    if ($failed) { throw 'Some GitHub statuses could not be queried.' }
+    if (-not $state.Count) { Write-Host 'No runners registered yet. Use ghr logs to check discovery and registration.' }
+    Write-Host "`nOrganizations: $($state.Count)"
+    Write-Host "GitHub: $online online, $offline offline, $missing missing, $unknown unknown; $jobs busy"
+    Write-Host "Local: $listening running, $restarting restarting, $($state.Count - $listening - $restarting) stopped/paused"
+    if ($restarting) { Write-Host 'restarting: organization worker is alive; listener is not running yet.' }
+    if ($failed) { throw 'Some GitHub statuses could not be queried; unknown does not mean offline.' }
 }
 function Show-Logs([switch]$Track) {
     $active = Join-Path $script:Root 'conf\active-work-dir'
