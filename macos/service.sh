@@ -118,7 +118,11 @@ api() {
     GH_TOKEN=$token GH_HOST=github.com GH_PROMPT_DISABLED=1 with_timeout 120 "$GH" api --hostname github.com "$@" 2> "$error"
     status=$?
     # The manager's stderr is the service log.
-    [ "$status" -eq 0 ] || printf '%s gh api %s failed (exit %s): %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${1%%\?*}" "$status" "$(redacted_last_line "$(cat "$error")" "$token")" >&2
+    if [ "$status" -ne 0 ]; then
+        printf '%s gh api %s failed (exit %s): %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${1%%\?*}" "$status" "$(redacted_last_line "$(cat "$error")" "$token")" >&2
+        # gh suggests "gh auth refresh", which does not change the token saved for this service.
+        ! grep -q 'admin:org' "$error" || printf '%s The saved GitHub token lacks admin:org. Run the installer again: it requests the scope and saves the new token.\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >&2
+    fi
     rm -f "$error"
     return "$status"
 }
@@ -263,7 +267,12 @@ configure_runner() {
     "$JQ" -er '.agentId' "$directory/.runner"
 }
 save_entry() { jq_update "$ROOT/conf/organizations.json" --arg id "$1" --arg login "$2" --argjson runner_id "$3" --arg name "$4" '.[$id]={login:$login,runner_id:$runner_id,runner_name:$name}'; }
-list_runners() { api "orgs/$1/actions/runners?per_page=100" --paginate --slurp | "$JQ" -ce '[.[].runners[]]'; }
+list_runners() {
+    local pages
+    # A failed request may still print an error body; never parse it as a runner list.
+    pages=$(api "orgs/$1/actions/runners?per_page=100" --paginate --slurp) || return 1
+    printf '%s' "$pages" | "$JQ" -ce '[.[].runners[]]'
+}
 indexed_name() { [[ $1 =~ ^$PREFIX-[1-9][0-9]*$ ]]; }
 next_name() {
     printf '%s' "$1" | "$JQ" -er --arg prefix "$PREFIX" '

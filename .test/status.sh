@@ -79,5 +79,14 @@ for platform in linux macos; do
     assert grep -Fq 'configured; not started yet' "$fixture/report"
     assert grep -Fq 'No runners registered yet.' "$fixture/report"
     assert grep -Fxq 'Organizations: 0' "$fixture/report"
+    # A refused request prints its error body on stdout; it must not reach the runner parser,
+    # and a missing admin:org scope points at the installer instead of gh auth refresh.
+    printf 'token\n' > "$ROOT/conf/github-token"
+    printf '#!/bin/sh\necho "{\\"message\\":\\"forbidden\\"}"\necho "gh: This API operation needs the \\"admin:org\\" scope." >&2\nexit 1\n' > "$fixture/gh"
+    chmod +x "$fixture/gh"; GH=$fixture/gh
+    unset -f list_runners; . "$repo/$platform/service.sh"; GH=$fixture/gh
+    if list_runners alpha > "$fixture/out" 2> "$fixture/err"; then echo 'Accepted a refused runner list' >&2; exit 1; fi
+    if grep -q 'jq: error' "$fixture/err"; then cat "$fixture/err" >&2; exit 1; fi
+    assert grep -q 'Run the installer again' "$fixture/err"
     printf 'PASS %s status: directories, pending config, process states and GitHub results\n' "$platform"
 done

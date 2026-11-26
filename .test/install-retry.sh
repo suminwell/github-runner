@@ -28,6 +28,12 @@ gh() {
         'auth status') [ "$INSTALL_FAILURE" != login ] ;;
         'auth login') echo 'Simulated login cancellation' >&2; return 41 ;;
         'auth token') echo fixture-token ;;
+        # Scopes are reported only when a scenario sets them; a refresh adds admin:org.
+        'api --hostname')
+            [ -n "${INSTALL_SCOPES:-}" ] || return 93
+            scopes=$INSTALL_SCOPES; [ ! -f "$INSTALL_HOME/refreshed" ] || scopes="$scopes, admin:org"
+            printf 'HTTP/2.0 200 OK\r\nX-Oauth-Scopes: %s\r\n\r\n{}\n' "$scopes" ;;
+        'auth refresh') printf 'refresh %s\n' "$*" >> "$INSTALL_HOME/host-calls"; touch "$INSTALL_HOME/refreshed" ;;
         *) return 93 ;;
     esac
 }
@@ -96,6 +102,21 @@ for target in linux macos; do
     printf '{"platform":"%s"}\n' "$target" > "$home/$target/arm64/conf/settings.json"
     run_install "$target" login "$home" "$FIXTURE" 1
     assert test -f "$home/$target/arm64/conf/settings.json"
+done
+# An existing gh login without admin:org is refreshed before its token is saved; a
+# supplied token without it is refused instead of producing an idle service.
+for target in linux macos; do
+    home=$FIXTURE/$target-scope; work=$FIXTURE/scope-$target
+    INSTALL_SCOPES='gist, read:org, repo, workflow' run_install "$target" none "$home" "$work" 0
+    assert grep -q '^refresh auth refresh --hostname github.com --scopes admin:org,repo$' "$home/host-calls"
+    assert grep -q 'lacks the admin:org scope' "$home/output"
+    home=$FIXTURE/$target-scope-ok
+    INSTALL_SCOPES='admin:org, repo' run_install "$target" none "$home" "$work" 0
+    if grep -q '^refresh' "$home/host-calls" 2>/dev/null; then echo 'Refreshed a sufficient login' >&2; exit 1; fi
+    home=$FIXTURE/$target-scope-env
+    GH_TOKEN=env-token INSTALL_SCOPES='repo' run_install "$target" none "$home" "$work" 1
+    assert grep -q 'Use a token with admin:org and run the installer again' "$home/output"
+    if grep -q '^refresh' "$home/host-calls" 2>/dev/null; then echo 'Refreshed despite a supplied token' >&2; exit 1; fi
 done
 # A dropped GitHub connection is retried; a persistent failure explains how to resume.
 (

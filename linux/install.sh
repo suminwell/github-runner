@@ -12,6 +12,14 @@ systemd_property() (
         *) printf 'Missing systemd property %s for %s.\n' "$property_name" "$property_unit" >&2; exit 1 ;;
     esac
 )
+# Classic OAuth tokens report their scopes; other token kinds (fine-grained, GitHub App)
+# do not, and are left to the API itself.
+token_has_admin_org() {
+    token_scopes=$(GH_TOKEN=$1 GH_HOST=github.com GH_PROMPT_DISABLED=1 "$gh_path" api --hostname github.com -i user 2>/dev/null | tr -d '\r' | \
+        sed -n 's/^[Xx]-[Oo][Aa][Uu][Tt][Hh]-[Ss][Cc][Oo][Pp][Ee][Ss]: *//p' | head -n 1) || token_scopes=
+    [ -n "$token_scopes" ] || return 0
+    case ", $token_scopes," in *", admin:org,"*) return 0 ;; *) return 1 ;; esac
+}
 sha256_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 xml() { printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 unit_quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; }
@@ -379,9 +387,18 @@ install_main() {
         jq_path=$root/bin/tools/jq
     fi
     "$gh_path" auth status --hostname github.com >/dev/null 2>&1 || "$gh_path" auth login --hostname github.com --web --scopes admin:org,repo
+    # An existing gh login may predate this installer and lack admin:org, which runner
+    # registration requires. Ask gh to add it before the token is saved for the service.
+    if [ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] && ! token_has_admin_org "$("$gh_path" auth token --hostname github.com)"; then
+        printf 'The current GitHub login lacks the admin:org scope required to register organization runners.\nAuthorize the additional scope:\n'
+        "$gh_path" auth refresh --hostname github.com --scopes admin:org,repo
+    fi
     if [ -n "${GH_TOKEN:-}" ]; then printf '%s\n' "$GH_TOKEN" > "$root/conf/github-token";
     elif [ -n "${GITHUB_TOKEN:-}" ]; then printf '%s\n' "$GITHUB_TOKEN" > "$root/conf/github-token";
     else "$gh_path" auth token --hostname github.com > "$root/conf/github-token"; fi
+    token_has_admin_org "$(cat "$root/conf/github-token")" || {
+        echo 'The GitHub token lacks the admin:org scope required to register organization runners. Use a token with admin:org and run the installer again.' >&2; exit 1;
+    }
     chmod 600 "$root/conf/github-token"
     printf '%s\n' "$gh_path" > "$root/conf/gh-path"
     printf '%s\n' "$jq_path" > "$root/conf/jq-path"
