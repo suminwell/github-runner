@@ -265,7 +265,10 @@ RUN
     for attempt in $(seq 1 100); do record_alive "$ROOT/conf/manager.pid" && break; sleep 0.1; done
     assert record_alive "$ROOT/conf/manager.pid"
     new_work=$FIXTURE/"new work $arch"
-    "$command_path" config "--dir=$new_work"
+    "$command_path" config "--dir=$new_work-equals"
+    assert jq -e --arg work "$new_work-equals" '.work_dir==$work' "$ROOT/conf/settings.json"
+    "$command_path" config --dir "$new_work"
+    assert jq -e --arg work "$new_work" '.work_dir==$work' "$ROOT/conf/settings.json"
     assert test "$(cat "$ROOT/conf/active-work-dir")" = "$ROOT"
     (command_main restart)
     for attempt in $(seq 1 100); do

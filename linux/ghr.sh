@@ -9,7 +9,7 @@ ghr start: 启动runner
 ghr stop: 停止runner
 ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
-ghr config --dir=<PATH>: 设置data和logs的父目录，默认为当前目录，重启后生效
+ghr config --dir <PATH>: 设置data和logs的父目录，默认为当前目录，重启后生效（也支持 --dir=<PATH>）
 ghr uninstall: 卸载runner
 HELP
 }
@@ -145,6 +145,7 @@ command_main() {
         config)
             if [ "$#" -eq 0 ]; then configure_directory .;
             elif [ "$#" -eq 1 ]; then case "$1" in --dir=*) configure_directory "${1#--dir=}" ;; *) usage >&2; return 2 ;; esac;
+            elif [ "$#" -eq 2 ] && [ "$1" = --dir ]; then configure_directory "$2";
             else usage >&2; return 2; fi ;;
         logs) [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = -f ]; } || { usage >&2; return 2; }; show_logs "${1:-}" ;;
         status|start|stop|restart|uninstall|help|--help|-h)

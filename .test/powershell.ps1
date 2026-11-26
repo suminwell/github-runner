@@ -258,8 +258,10 @@ try {
             $deadline = [DateTime]::UtcNow.AddSeconds(15)
             while ($null -eq (Get-RecordedProcess (Join-Path $testRoot 'conf\manager.json')) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
             Assert ($script:TaskEnabled) 'start enables startup'
-            & $launcher config "--dir=$newWork"
-            Assert ($LASTEXITCODE -eq 0) 'public --dir syntax'
+            & $launcher config "--dir=$newWork-equals"
+            Assert ($LASTEXITCODE -eq 0 -and (Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq "$newWork-equals") 'public --dir= syntax'
+            & $launcher config --dir $newWork
+            Assert ($LASTEXITCODE -eq 0 -and (Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq $newWork) 'public --dir space syntax with spaces in path'
             Assert ((Get-Content -Raw -Encoding UTF8 (Join-Path $testRoot 'conf\active-work-dir')) -eq $testRoot) 'configuration remains pending'
             Stop-Installation; Start-Installation
             $deadline = [DateTime]::UtcNow.AddSeconds(15)

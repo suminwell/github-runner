@@ -40,7 +40,7 @@ ghr start: 启动runner
 ghr stop: 停止runner
 ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
-ghr config --dir=<PATH>: 设置data和logs的父目录，默认为当前目录，重启后生效
+ghr config --dir <PATH>: 设置data和logs的父目录，默认为当前目录，重启后生效（也支持 --dir=<PATH>）
 ghr uninstall: 卸载runner
 ```
 
@@ -49,7 +49,7 @@ ghr uninstall: 卸载runner
 - `stop`：关闭自动启动，停止管理服务及各组织的 Runner，保留注册和数据。正在运行的 job 会被中断。
 - `restart`：先停止再启动，并应用保存的目录配置。
 - `logs`：显示管理日志最后 200 行；`logs -f` 持续跟踪新增日志，日志轮换后继续跟踪，按 Ctrl+C 结束。
-- `config --dir=<PATH>`：设置数据和日志的父目录；`config` 或 `config --dir=.` 使用当前目录。
+- `config --dir <PATH>`：设置数据和日志的父目录，也支持 `config --dir=<PATH>`；`config` 或 `config --dir .` 使用当前目录。路径包含空格时用引号括起。
 - `uninstall`：停止进程，注销本机记录的 GitHub Runner，移除系统服务、命令、脚本和配置；所有工作数据与日志保留。GitHub 注销失败时保留凭据和状态，修复网络或权限后再次执行卸载。其他机器的 Runner 不会被删除。
 
 Unix 的入口为 `/usr/local/bin/ghr`，调用安装目录的 `bin/ghr.sh`。Windows 的 `bin/ghr.cmd` 调用 `bin/ghr.ps1`，安装器将其目录加入安装用户的 PATH。若已有终端找不到 `ghr`，重新打开终端；Unix 的 PATH 需要包含 `/usr/local/bin`。Windows 的启停、目录设置和卸载在管理员 PowerShell 中执行。
@@ -59,14 +59,14 @@ Unix 的入口为 `/usr/local/bin/ghr`，调用安装目录的 `bin/ghr.sh`。Wi
 Linux / macOS：
 
 ```sh
-ghr config --dir=/srv/builds
+ghr config --dir /srv/builds
 ghr restart
 ```
 
 Windows：
 
 ```powershell
-ghr config "--dir=D:\Build Workspace"
+ghr config --dir "D:\Build Workspace"
 ghr restart
 ```
 
