@@ -129,7 +129,7 @@ api() {
 clean_exec() { env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u GH_CONFIG_DIR -u RUNNER_MANUALLY_TRAP_SIG "$@"; }
 safe_org() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]; }
 safe_id() { [[ $1 =~ ^[0-9]+$ ]]; }
-stamp() { ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || :; }
+stamp() { LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || :; }
 record_pid() { local mark; mark=$(stamp "$2"); [ -n "$mark" ] || return 1; printf '%s\n%s\n' "$2" "$mark" | atomic "$1"; }
 record_alive() {
     [ -f "$1" ] || return 1
