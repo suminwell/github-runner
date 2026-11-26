@@ -35,11 +35,33 @@ root 安装目录及其父目录必须由 root 拥有，且其他用户不能写
 
 卸载 root 安装时保留专用账户及 HOME，避免遗留数据和日志变成无主文件；重新安装复用原 UID。账户记录保存在 root 管理的 `/var/lib/github-runner/account.json`，不随 `config --dir` 改变。
 
-Linux 版本须符合 [GitHub 官方支持范围](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#linux)，例如 Ubuntu 20.04+、Debian 10+、RHEL/CentOS/Oracle Linux 8+；新部署建议选择仍在维护的 Ubuntu 24.04、Debian 12 或 RHEL 9。**CentOS 7 不支持**，仅更新 libstdc++ 不能使它满足当前 Runner 和 JavaScript Actions 的要求；需要保留旧业务系统时，可在独立的现代 Linux 主机或虚拟机中部署 Runner。
+符合 [GitHub 官方支持范围](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#linux) 的 Linux（例如 Ubuntu 20.04+、Debian 10+、RHEL/CentOS/Oracle Linux 8+）直接在宿主机运行；新部署建议选择仍在维护的 Ubuntu 24.04、Debian 12 或 RHEL 9。低于这些版本的 glibc 发行版（例如 **CentOS 7**、Ubuntu 18.04）自动改用下面的 **Docker 模式**；Alpine/musl 仍不支持。
 
-安装器在提权、创建账户或停止旧服务之前拒绝已知不支持的发行版版本。安装依赖后，还会以实际运行账户执行官方 `Runner.Listener --version` 和包内各个 glibc 版 `node --version`，检查 C++、glibc 和运行环境是否真正可用。检查失败时打印完整的版本缺失错误，退出安装并保留配置供修复后重试，不启用新服务；未知发行版也必须通过二进制运行检查。已有旧系统上的失败安装可用 `ghr stop` 停止重试。Linux 管理命令使用兼容 systemd 219 的属性查询和启停方式，供历史安装停止、卸载使用；新安装仍需满足上述系统要求。
+安装器在提权、创建账户或停止旧服务之前拒绝不支持的系统。安装依赖后，还会以实际运行账户执行官方 `Runner.Listener --version` 和包内各个 glibc 版 `node --version`，检查 C++、glibc 和运行环境是否真正可用。检查失败时打印完整的版本缺失错误，退出安装并保留配置供修复后重试，不启用新服务；未知发行版也必须通过二进制运行检查。已有旧系统上的失败安装可用 `ghr stop` 停止重试。Linux 管理命令使用兼容 systemd 219 的属性查询和启停方式，供历史安装停止、卸载使用；新安装仍需满足上述系统要求。
 
-Linux 需要 systemd、glibc、Bash、curl、tar、util-linux 的 `flock`，不支持 Alpine；macOS 使用系统 Bash 3.2、launchd、`shlock`；Windows 使用 Windows PowerShell 5.1 和任务计划程序。无需 Python 或 C# 服务宿主。
+Linux 需要 systemd、glibc、Bash、curl、tar、util-linux 的 `flock`，不支持 Alpine；只有 `yum` 的系统（CentOS 7）缺少 `jq` 时，安装器下载固定 SHA-256 的官方静态 jq 1.8.1 到 `bin/tools/`；macOS 使用系统 Bash 3.2、launchd、`shlock`；Windows 使用 Windows PowerShell 5.1 和任务计划程序。无需 Python 或 C# 服务宿主。
+
+## 旧版 Linux：Docker 模式
+
+官方 Runner 基于 .NET 8，并且 Actions 使用 Node 20/24，需要较新的 glibc 和 libstdc++。CentOS 7（glibc 2.17）等旧系统无法直接运行，替换系统库也不能解决。安装器检测到这类系统时自动改用 Docker 模式：
+
+- 宿主机的 systemd 只负责启停一个容器；管理进程、官方 Runner 和所有 job 都在本地构建的 Ubuntu 22.04 镜像 `local-github-runner:<架构>` 中运行，以安装用户或 `ghrunner` 的 UID 运行，不以 root 运行。
+- 安装目录、数据目录和 HOME 以**相同路径**挂载进容器，并共享宿主机的进程号空间和网络，所以 `ghr status/stop/logs/config` 等命令用法不变。
+- 镜像内带有 git、curl、jq、python3、Docker CLI（含 buildx、compose）等常用工具；宿主机上安装的工具在 job 中不可用。需要更多工具时，可基于 `linux/Dockerfile` 构建自定义镜像，安装时用 `LOCAL_RUNNER_DOCKER_IMAGE=<镜像>` 指定。
+- **job 默认可以使用宿主机的 Docker**（`docker build`、`container:` 和 service 容器都可用），因为路径相同，job 里 `docker run -v "$PWD":/src` 也能挂载正确的目录。代价是：能运行 job 的人通过 Docker 套接字可以获得宿主机 root 权限，`ghrunner` 账户隔离在此模式下不再构成安全边界。只应让受信任的仓库使用这台 Runner。
+
+Docker 需要 20.10.10 或更高版本。安装器在改动任何内容之前完成以下检查和确认：
+
+1. 未安装 Docker：从 Docker 官方源自动安装最新的 docker-ce（CentOS 7 上为 26.1.x，Debian/Ubuntu 系使用对应发行版的仓库）。
+2. 已安装旧版本 Docker（例如 CentOS 7 自带的 1.13）：说明升级会替换旧软件包并重启 Docker 守护进程，正在运行的容器会停止，旧存储驱动下的镜像可能不再显示，然后询问是否升级。**不同意则终止安装，主机不做任何改动。**
+3. CentOS 7 的官方软件源已下线时：询问是否把 `CentOS-*.repo` 备份到 `/etc/yum.repos.d/ghr-backup-<时间>/`，并把基础源指向 CentOS 7.9.2009 归档源（vault）。不同意同样终止安装。
+4. 其他旧发行版没有自动安装 Docker 的路径时，提示手动安装 Docker 后重试。
+
+软件源按机器公网 IP 所在地区自动选择：中国大陆使用阿里云的 docker-ce、CentOS vault 和 Ubuntu 镜像源，其他地区使用官方源。也可用 `LOCAL_RUNNER_REGION=cn` 或 `global` 指定。基础镜像先尝试 `ubuntu:22.04`（会使用 Docker 守护进程已配置的 registry-mirrors），在中国大陆还会依次尝试 `docker.m.daocloud.io` 和 `docker.1ms.run` 的镜像；都不可用时，用 `LOCAL_RUNNER_DOCKER_BASE=<可访问的 ubuntu:22.04 镜像>` 指定。job 自己拉取的镜像不受这些设置影响，大陆主机需要自行给 Docker 配置镜像加速。
+
+无交互输入时不会自动同意升级或修改软件源；无人值守安装可设置 `LOCAL_RUNNER_ASSUME_YES=yes`，表示同意上述全部询问。也可以在受支持的系统上设置 `LOCAL_RUNNER_RUNTIME=docker` 主动使用 Docker 模式；之后重复安装会沿用已记录的模式。WSL 内不支持 Docker 模式。
+
+`ghr status` 会显示 `Runtime: Docker (...)`。`ghr uninstall` 保留 Docker 和镜像，因为同一主机上的其他安装可能还在使用；确认不再需要后自行执行 `docker rmi local-github-runner:<架构>`。
 
 ## WSL2 安装与 Windows 未登录时启动
 
@@ -67,6 +89,8 @@ ghr wsl setup
 配置完成后仍在 WSL 内使用 `ghr`：`status` 显示 Windows 任务状态，`stop` 禁用该任务并停止 runner，`start`/`restart` 重新启用，`uninstall` 删除本安装拥有的任务。保活进程看到停止标记或安装被删除时自行退出，不调用 `wsl --shutdown`，不停止其他发行版。需要启用 WSL 的 Windows 程序互操作，首次设置时 `powershell.exe` 应在 WSL 的 PATH 中；若关闭了互操作或从缺少互操作环境的 SSH 会话执行，命令会明确报错供重试。
 
 只有 Linux 安装完成、尚未完成 Windows 配合设置时，安装命令会报告未完成，保留 Linux 安装供 `ghr wsl setup` 重试。Windows 密码变更后也使用此命令更新；仅有 PIN、没有可用账户密码，或组织策略禁止批处理登录时，应先处理账户条件。这里的自启不能恢复关机前被中断的 job，也不能让已关机或睡眠的主机继续接活。
+
+**安全边界：**保活依赖 WSL 互操作，而互操作开启时，发行版内任何进程都能启动 `powershell.exe`、`cmd.exe` 等 Windows 程序，并以拥有该发行版的 Windows 账户身份运行，可访问该账户的 Windows 文件、凭据和网络权限。workflow job 也不例外，root 安装的专用账户 `ghrunner` 同样如此；保活任务还会让这一能力在 Windows 用户未登录时持续可用。因此 WSL runner 的隔离程度低于原生 Linux，只应运行受信任仓库的 workflow，并为该 Windows 账户只授予必要权限。WSL 默认追加到 PATH 的 `/mnt/...` Windows 目录不会写入 runner 服务的 PATH，避免 job 误用 Windows 版 `node`、`npm`、`git` 等工具；这只影响命令查找，不构成隔离。
 
 `ghr wsl setup` 更新凭据会保留已有的停止状态。想主动关闭 WSL 时应先执行 `ghr stop`，否则启用中的宿主任务会在下一次检查时重新拉起发行版。
 

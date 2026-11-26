@@ -41,6 +41,7 @@ jobs:
         run: |
           bash .test/install-retry.sh
           bash .test/linux-compatibility.sh
+          bash .test/docker.sh
           bash .test/systemd-control.sh
           bash .test/uninstall-recovery.sh
           bash .test/status.sh

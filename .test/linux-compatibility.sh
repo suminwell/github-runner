@@ -7,11 +7,13 @@ success=false
 trap 'if $success; then rm -rf "$FIXTURE"; else printf "Retained fixture: %s\n" "$FIXTURE"; fi' EXIT
 assert() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; }
 sed '/^if \[ -t 0 \]/,$d' "$REPO/linux/install.sh" > "$FIXTURE/install.sh"
+# Legacy glibc distributions switch to Docker mode (.test/docker.sh); a host that cannot
+# run the Runner even there must be rejected before anything changes.
 cat > "$FIXTURE/os-release" <<'OS'
-NAME="CentOS Linux"
-VERSION_ID="7"
-ID=centos
-PRETTY_NAME="CentOS Linux 7 (Core)"
+NAME="Alpine Linux"
+VERSION_ID="3.20.0"
+ID=alpine
+PRETTY_NAME="Alpine Linux v3.20"
 OS
 # Exercise the real installer entry before privileged setup or any existing service
 # can be changed. Only the host description and privileged boundary are replaced.
@@ -22,7 +24,7 @@ cat > "$FIXTURE/run-install.sh" <<'INSTALL'
     . "$FIXTURE/install.sh"
     uname() { case "$1" in -s) echo Linux ;; -m) echo x86_64 ;; esac; }
     read_linux_release() { cat "$FIXTURE/os-release"; }
-    getconf() { echo 'glibc 2.17'; }
+    getconf() { echo 'musl'; }
     check_linux_host() { :; }
     id() { echo 1001; }
     sudo() { printf 'privileged setup reached\n' > "$FIXTURE/mutated"; exit 77; }
@@ -31,17 +33,17 @@ INSTALL
 FIXTURE=$FIXTURE /bin/bash "$FIXTURE/run-install.sh" > "$FIXTURE/unsupported-output" 2>&1 || result=$?
 if [ "$result" != 1 ] || [ -e "$FIXTURE/mutated" ]; then
     cat "$FIXTURE/unsupported-output" >&2
-    echo "FAIL: CentOS 7 reached privileged setup (installer exit $result)" >&2; exit 1
+    echo "FAIL: Alpine reached privileged setup (installer exit $result)" >&2; exit 1
 fi
-assert grep -q 'CentOS Linux 7' "$FIXTURE/unsupported-output"
-assert grep -q 'glibc 2.17' "$FIXTURE/unsupported-output"
+assert grep -q 'Alpine/musl is unsupported' "$FIXTURE/unsupported-output"
 (
     . "$FIXTURE/install.sh"
     read_linux_release() { printf 'ID=%s\nVERSION_ID="%s"\nPRETTY_NAME="Fixture Linux"\n' "$distribution" "$version"; }
     getconf() { echo 'glibc 2.36'; }
     for pair in 'centos 7.9' 'rhel 7' 'ol 7.9' 'ubuntu 18.04' 'ubuntu 20.03' 'debian 9' 'linuxmint 19' 'fedora 28' 'opensuse-leap 15.1' 'sles 15.1'; do
         read -r distribution version <<< "$pair"
-        if check_linux_compatibility >/dev/null 2>&1; then echo "Accepted unsupported $pair" >&2; exit 1; fi
+        status=0; check_linux_compatibility >/dev/null 2>&1 || status=$?
+        [ "$status" = 3 ] || { echo "Legacy $pair not routed to Docker mode (status $status)" >&2; exit 1; }
     done
     for pair in 'centos 9' 'rhel 8.10' 'ol 8' 'ubuntu 20.04' 'ubuntu 24.04' 'debian 12' 'linuxmint 20' 'fedora 29' 'opensuse-leap 15.2' 'sles 15.2' 'custom 1'; do
         read -r distribution version <<< "$pair"

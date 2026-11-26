@@ -16,13 +16,18 @@ sha256_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{
 xml() { printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 unit_quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; }
 # systemd unquotes Environment= and ExecStart=, but rejects a quoted WorkingDirectory=.
+# A fifth argument (the Docker socket group) selects Docker mode: the unit then only
+# starts and stops the supervisor's container, as the same account.
 systemd_unit() {
     exec_path=$(unit_quote "$4/bin/service.sh" | sed 's/\$/$$/g')
+    docker_path=$(unit_quote "$4/bin/docker.sh" | sed 's/\$/$$/g')
+    after=network-online.target
+    [ -z "${5:-}" ] || after="network-online.target docker.service"
     cat <<UNIT
 [Unit]
 Description=GitHub organization runner supervisor
-Wants=network-online.target
-After=network-online.target
+Wants=$after
+After=$after
 StartLimitIntervalSec=0
 [Service]
 Type=simple
@@ -30,7 +35,13 @@ User=$1
 WorkingDirectory=$(printf '%s' "$4" | sed 's/%/%%/g')
 Environment="HOME=$(unit_quote "$2")"
 Environment="PATH=$(unit_quote "$3")"
-ExecStart=/bin/bash "$exec_path"
+UNIT
+    if [ -n "${5:-}" ]; then
+        printf 'SupplementaryGroups=%s\nExecStart=/bin/bash "%s" run\nExecStop=/bin/bash "%s" stop\n' "$5" "$docker_path" "$docker_path"
+    else
+        printf 'ExecStart=/bin/bash "%s"\n' "$exec_path"
+    fi
+    cat <<UNIT
 Restart=always
 RestartSec=10
 KillMode=control-group
@@ -68,6 +79,11 @@ detect_architecture() {
 is_wsl() {
     [ -n "${WSL_DISTRO_NAME:-}${WSL_INTEROP:-}" ] || uname -r | grep -qi microsoft
 }
+# WSL appends Windows directories under /mnt; services should not resolve Linux tools to Windows binaries.
+linux_service_path() {
+    is_wsl || { printf '%s\n' "$PATH"; return; }
+    printf '%s\n' "$PATH" | tr ':' '\n' | grep -v '^/mnt/' | paste -sd: -
+}
 systemd_running() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
 read_linux_release() { cat /etc/os-release 2>/dev/null; }
 linux_release_field() {
@@ -99,10 +115,35 @@ check_linux_compatibility() {
         for (i=1;i<=n;i++) {if (x[i]+0>y[i]+0) exit 0; if (x[i]+0<y[i]+0) exit 1} exit 0
     }'; then
         libc=$(getconf GNU_LIBC_VERSION 2>/dev/null || printf unknown)
-        printf 'Unsupported Linux: %s (%s). %s %s or later is required.\n' "${description:-$distribution $version}" "$libc" "$distribution" "$minimum" >&2
-        printf 'Use a supported Linux host or VM. Replacing a system library does not make this OS supported.\nhttps://docs.github.com/en/actions/reference/runners/self-hosted-runners#linux\n' >&2
-        return 1
+        printf 'Linux %s (%s) cannot run the official Runner directly; %s %s or later is required.\n' "${description:-$distribution $version}" "$libc" "$distribution" "$minimum" >&2
+        printf 'https://docs.github.com/en/actions/reference/runners/self-hosted-runners#linux\n' >&2
+        return 3
     fi
+}
+install_static_jq() {
+    case "$arch" in
+        x64) jq_asset=jq-linux-amd64; jq_sum=020468de7539ce70ef1bceaf7cde2e8c4f2ca6c3afb84642aabc5c97d9fc2a0d ;;
+        *) jq_asset=jq-linux-arm64; jq_sum=6bc62f25981328edd3cfcfe6fe51b073f2d7e7710d7ef7fcdac28d4e384fc3d4 ;;
+    esac
+    jq_bootstrap=$(mktemp -d)
+    curl -fsSL --connect-timeout 15 --max-time 600 "https://github.com/jqlang/jq/releases/download/jq-1.8.1/$jq_asset" -o "$jq_bootstrap/jq"
+    [ "$(sha256_file "$jq_bootstrap/jq")" = "$jq_sum" ] || { echo 'jq SHA-256 mismatch.' >&2; rm -rf "$jq_bootstrap"; exit 1; }
+    chmod 755 "$jq_bootstrap/jq"
+    PATH=$jq_bootstrap:$PATH
+}
+# Docker mode: consent, then install, upgrade or start Docker before any other change.
+prepare_docker_engine() {
+    [ "$docker_engine_ready" = false ] || return 0
+    docker_helper=$(mktemp -d)
+    fetch linux/docker.sh "$docker_helper/docker.sh"
+    /bin/bash "$docker_helper/docker.sh" engine || { rm -rf "$docker_helper"; exit 1; }
+    rm -rf "$docker_helper"
+    docker_engine_ready=true
+}
+# sudo drops the environment; pass the documented Docker mode overrides explicitly.
+docker_privileged() {
+    privileged env "LOCAL_RUNNER_REGION=${LOCAL_RUNNER_REGION:-}" "LOCAL_RUNNER_DOCKER_BASE=${LOCAL_RUNNER_DOCKER_BASE:-}" \
+        "LOCAL_RUNNER_DOCKER_IMAGE=${LOCAL_RUNNER_DOCKER_IMAGE:-}" "LOCAL_RUNNER_UBUNTU_MIRROR=${LOCAL_RUNNER_UBUNTU_MIRROR:-}" "$@"
 }
 check_linux_host() {
     if is_wsl; then
@@ -190,9 +231,20 @@ install_main() {
     detect_architecture
     if [ "${1:-auto}" != auto ] && [ "$1" != "$arch" ]; then echo "Architecture mismatch: requested $1, host $arch" >&2; exit 1; fi
     check_linux_host
-    check_linux_compatibility
+    runtime=native; compatibility=0
+    check_linux_compatibility || compatibility=$?
+    case "$compatibility" in 0) ;; 3) runtime=docker ;; *) exit 1 ;; esac
+    [ "${LOCAL_RUNNER_RUNTIME:-}" != docker ] || runtime=docker
     root_install=false
     if [ "$(id -u)" = 0 ]; then root_install=true; else sudo -v; fi
+    base=${LOCAL_RUNNER_BASE_URL:-https://raw.githubusercontent.com/suminwell/github-runner/main}
+    docker_engine_ready=false
+    if [ "$runtime" = docker ]; then
+        if is_wsl; then echo 'Docker mode is not supported in WSL; use a WSL distribution supported by the official Runner.' >&2; exit 1; fi
+        printf '\nDocker mode: the supervisor, the official Runner and all jobs run in an Ubuntu 22.04 container.\n'
+        printf 'Jobs can use the host Docker daemon, which gives them root-equivalent control of this host.\n\n'
+        prepare_docker_engine
+    fi
     if ! command -v jq >/dev/null 2>&1; then
         if [ "$platform" = macos ]; then
             if ! command -v brew >/dev/null 2>&1; then
@@ -206,16 +258,17 @@ install_main() {
         elif command -v dnf >/dev/null; then privileged dnf install -y jq ca-certificates;
         elif command -v zypper >/dev/null; then privileged zypper --non-interactive install jq ca-certificates;
         elif command -v pacman >/dev/null; then privileged pacman -S --needed --noconfirm jq ca-certificates;
+        elif command -v yum >/dev/null; then install_static_jq;
         else echo 'Install jq before running this installer.' >&2; exit 1; fi
     fi
     if [ "$platform" = linux ]; then command -v flock >/dev/null || { echo 'Install util-linux (flock) first.' >&2; exit 1; }; fi
-    base=${LOCAL_RUNNER_BASE_URL:-https://raw.githubusercontent.com/suminwell/github-runner/main}
     if $root_install; then
         if ! command -v setfacl >/dev/null; then
             if command -v apt-get >/dev/null; then apt-get update; apt-get install -y acl;
             elif command -v dnf >/dev/null; then dnf install -y acl;
             elif command -v zypper >/dev/null; then zypper --non-interactive install acl;
             elif command -v pacman >/dev/null; then pacman -S --needed --noconfirm acl;
+            elif command -v yum >/dev/null; then yum install -y acl;
             else echo 'Install acl (setfacl) before running this installer as root.' >&2; exit 1; fi
         fi
         command -v runuser >/dev/null && command -v useradd >/dev/null || { echo 'Install util-linux (runuser) and shadow/passwd (useradd) first.' >&2; exit 1; }
@@ -250,6 +303,11 @@ install_main() {
             known_installation=true
         fi
     done
+    if [ -f "$root/conf/settings.json" ] && jq -e '.runtime=="docker"' "$root/conf/settings.json" >/dev/null 2>&1; then
+        runtime=docker
+        if is_wsl; then echo 'Docker mode is not supported in WSL.' >&2; exit 1; fi
+        prepare_docker_engine
+    fi
     if [ "$known_installation" = false ]; then
         for part in bin conf runner; do [ ! -e "$root/$part" ] || { echo "Refusing to reuse unrelated directory $root/$part; choose another installation directory." >&2; exit 1; }; done
     fi
@@ -301,9 +359,14 @@ install_main() {
         gh_path=$root/bin/tools/gh
         rm -rf "$temporary"
     fi
-    if $root_install && [ "$gh_path" != "$root/bin/tools/gh" ]; then
+    # Docker mode runs the same gh inside the container; the official build is static.
+    if { $root_install || [ "$runtime" = docker ]; } && [ "$gh_path" != "$root/bin/tools/gh" ]; then
         cp "$gh_path" "$root/bin/tools/gh"
         gh_path=$root/bin/tools/gh
+    fi
+    if [ -n "${jq_bootstrap:-}" ]; then
+        cp "$jq_bootstrap/jq" "$root/bin/tools/jq"; chmod 700 "$root/bin/tools/jq"
+        jq_path=$root/bin/tools/jq
     fi
     "$gh_path" auth status --hostname github.com >/dev/null 2>&1 || "$gh_path" auth login --hostname github.com --web --scopes admin:org,repo
     if [ -n "${GH_TOKEN:-}" ]; then printf '%s\n' "$GH_TOKEN" > "$root/conf/github-token";
@@ -315,8 +378,8 @@ install_main() {
     default_work=$(pwd -P)
     [ ! -f "$root/conf/settings.json" ] || default_work=$root
     [ -f "$root/conf/settings.json" ] || printf '{}\n' > "$root/conf/settings.json"
-    "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" --argjson owner_uid "${runtime_uid:-$(id -u)}" --arg default_work "$default_work" \
-        '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
+    "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" --argjson owner_uid "${runtime_uid:-$(id -u)}" --arg default_work "$default_work" --arg runtime "$runtime" \
+        '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.runtime=$runtime|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
         "$root/conf/settings.json" > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
     if $root_install; then fetch linux/account.sh "$root/bin/account.sh"; fi
@@ -326,26 +389,40 @@ install_main() {
     fetch "$platform/runner.sh" "$root/bin/runner.sh"
     fetch 'linux/wsl.sh' "$root/bin/wsl.sh"
     fetch 'linux/wsl.ps1' "$root/bin/wsl.ps1"
-    chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh"
+    fetch linux/docker.sh "$root/bin/docker.sh"
+    fetch linux/Dockerfile "$root/bin/Dockerfile"
+    chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh" "$root/bin/docker.sh"
+    if [ "$runtime" = docker ]; then
+        printf 'Building the Docker mode image.\n'
+        docker_image=$(docker_privileged /bin/bash "$root/bin/docker.sh" build) || { echo 'Docker image build failed; the existing service was left stopped. Fix the error and retry.' >&2; exit 1; }
+        "$jq_path" --arg image "$docker_image" '.docker_image=$image' "$root/conf/settings.json" > "$root/conf/settings.new"
+        mv "$root/conf/settings.new" "$root/conf/settings.json"
+    fi
     if $root_install; then
-        chgrp "$account_gid" "$root/bin/"*.sh "$root/bin/"*.ps1 "$root/bin/tools" "$root/bin/tools/gh"
-        chmod 755 "$root/bin/"*.sh "$root/bin/tools" "$root/bin/tools/gh"
+        chgrp "$account_gid" "$root/bin/"*.sh "$root/bin/"*.ps1 "$root/bin/tools" "$root/bin/tools/"*
+        chmod 755 "$root/bin/"*.sh "$root/bin/tools" "$root/bin/tools/"*
         chmod 644 "$root/bin/"*.ps1
         account_protect_config
         work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
         account_work_directory "$work_dir"
-        account_prepare_package
-        account_run env -i HOME="$account_home" PATH=/usr/local/bin:/usr/bin:/bin /bin/bash "$root/bin/service.sh" verify
+        account_prepare_package "$runtime"
+        if [ "$runtime" = docker ]; then
+            LOCAL_RUNNER_DOCKER_USER=$account_uid:$account_gid LOCAL_RUNNER_DOCKER_HOME=$account_home /bin/bash "$root/bin/docker.sh" verify
+        else account_run env -i HOME="$account_home" PATH=/usr/local/bin:/usr/bin:/bin /bin/bash "$root/bin/service.sh" verify; fi
     else
         /bin/bash "$root/bin/service.sh" prepare
-        privileged /bin/bash "$root/bin/.cache/package/bin/installdependencies.sh"
-        env -i HOME="$HOME" PATH="$PATH" /bin/bash "$root/bin/service.sh" verify
+        if [ "$runtime" = docker ]; then
+            privileged env LOCAL_RUNNER_DOCKER_USER="$(id -u):$(id -g)" LOCAL_RUNNER_DOCKER_HOME="$HOME" /bin/bash "$root/bin/docker.sh" verify
+        else
+            privileged /bin/bash "$root/bin/.cache/package/bin/installdependencies.sh"
+            env -i HOME="$HOME" PATH="$(linux_service_path)" /bin/bash "$root/bin/service.sh" verify
+        fi
     fi
     /bin/bash "$root/bin/ghr.sh" --install-command
     work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
     mkdir -p "$work_dir/data" "$work_dir/logs"
     printf 'Data/logs directory: %s\n' "$work_dir"
-    user=$(id -un); user_id=$(id -u); service_home=$HOME; service_path=$PATH
+    user=$(id -un); user_id=$(id -u); service_home=$HOME; service_path=$(linux_service_path)
     if $root_install; then
         user=$account_user; user_id=$account_uid; service_home=$account_home
         service_path=/usr/local/bin:/usr/bin:/bin
@@ -355,7 +432,12 @@ install_main() {
     if [ "$platform" = linux ]; then
         [ -d /run/systemd/system ] || { echo 'Linux must be booted with systemd.' >&2; rm -f "$definition"; exit 1; }
         service_name=local-github-runner-$user_id-$arch.service
-        systemd_unit "$user" "$service_home" "$service_path" "$root" > "$definition"
+        docker_group=
+        if [ "$runtime" = docker ]; then
+            docker_group=$(stat -c %G /var/run/docker.sock)
+            [ -n "$docker_group" ] && [ "$docker_group" != root ] && [ "$docker_group" != UNKNOWN ] || { echo 'The Docker socket has no dedicated group; cannot grant the runner account access.' >&2; rm -f "$definition"; exit 1; }
+        fi
+        systemd_unit "$user" "$service_home" "$service_path" "$root" "$docker_group" > "$definition"
         privileged install -m 644 "$definition" "/etc/systemd/system/$service_name"
         privileged systemctl daemon-reload
         if [ -f "$root/conf/stopped" ]; then privileged systemctl disable "$service_name";
@@ -377,6 +459,7 @@ install_main() {
         fi
     fi
     rm -f "$definition" "$root/install.sh" "$root/service.sh" "$root/ghr.sh"
+    [ -z "${jq_bootstrap:-}" ] || rm -rf "$jq_bootstrap"
     printf '\nInstalled %s\n\n' "$service_name"
     /bin/bash "$root/bin/ghr.sh" help
     case ":$PATH:" in *:/usr/local/bin:*) ;; *) printf '\nAdd /usr/local/bin to PATH: export PATH="/usr/local/bin:$PATH"\n' ;; esac

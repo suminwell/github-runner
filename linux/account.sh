@@ -13,7 +13,8 @@ account_validate_path() (
 )
 account_load() {
     account_user=ghrunner
-    account_uid=$(jq -er '.uid | select(type=="number" and .>0) | tostring' "$ROOT/conf/account.json") || return 1
+    # The installed jq: CentOS 7 hosts only have the bundled static binary.
+    account_uid=$("${JQ:-jq}" -er '.uid | select(type=="number" and .>0) | tostring' "$ROOT/conf/account.json") || return 1
     account_home=/var/lib/github-runner/home
     [ "$(id -u "$account_user")" = "$account_uid" ] || { echo 'Runner account identity changed; repair it before continuing.' >&2; return 1; }
     account_gid=$(id -g "$account_user") || return 1
@@ -123,7 +124,8 @@ account_prepare_package() (
     cp "$ROOT/conf/gh-path" "$ROOT/conf/jq-path" "$ROOT/conf/github-token" "$staging/conf/"
     jq --arg work "$staging" '.work_dir=$work' "$ROOT/conf/settings.json" > "$staging/conf/settings.json"
     LOCAL_RUNNER_ROOT=$staging /bin/bash "$ROOT/bin/service.sh" prepare || exit 1
-    /bin/bash "$staging/bin/.cache/package/bin/installdependencies.sh" || exit 1
+    # Docker mode installs the Runner's libraries in the image, not on this host.
+    [ "${1:-}" = docker ] || /bin/bash "$staging/bin/.cache/package/bin/installdependencies.sh" || exit 1
     account_run rm -rf "$ROOT/bin/.cache/package" || exit 1
     tar -C "$staging/bin/.cache" -cf - package | account_run tar -C "$ROOT/bin/.cache" --no-same-owner -xf - || exit 1
 )
@@ -132,8 +134,8 @@ account_prepare_package() (
 # job-writable files and PID records run with the runner's UID, including uninstall.
 account_command() {
     [ -r "$ROOT/conf/account.json" ] || { echo 'Manage this installation as root (sudo ghr ...).' >&2; return 1; }
-    account_load || return 1
     JQ=$(cat "$ROOT/conf/jq-path") || return 1
+    account_load || return 1
     ARCH=$("$JQ" -er '.arch' "$ROOT/conf/settings.json") || return 1
     case "$ARCH" in x64|arm64) ;; *) return 1 ;; esac
     command=${1:-help}; [ "$#" = 0 ] || shift
@@ -180,12 +182,14 @@ account_command() {
                     account_run /bin/bash "$ROOT/bin/ghr.sh" --runtime-unregister || return 1
                     native_service remove && wsl_host remove || return 1
                     command_path=$("$JQ" -r '.command_path // empty' "$ROOT/conf/settings.json")
+                    hint=$(docker_hint)
                     if [ -n "$command_path" ] && [ -e "$command_path" ]; then
                         [ ! -L "$command_path" ] && grep -Fqx "# ghr: $ROOT" "$command_path" || return 1
                         rm -f "$command_path" || return 1
                     fi
                     rm -rf "$ROOT/bin" "$ROOT/conf" "$ROOT/runner" || return 1
-                    echo 'Runner uninstalled. Data, logs and the locked ghrunner account/home are retained.' ;;
+                    echo 'Runner uninstalled. Data, logs and the locked ghrunner account/home are retained.'
+                    [ -z "$hint" ] || printf '%s\n' "$hint" ;;
                 *) usage ;;
             esac ;;
         *) usage >&2; return 2 ;;

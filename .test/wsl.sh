@@ -25,6 +25,9 @@ assert() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; }
     assert grep -q 'Linux must be booted with systemd' "$fixture/error"
     export WSL_DISTRO_NAME='Ubuntu Work'; kernel=6.8.0-custom; systemd=yes
     check_linux_host
+    [ "$(PATH='/usr/bin:/mnt/c/Windows/system32:/bin:/mnt/c/Program Files/nodejs' linux_service_path)" = /usr/bin:/bin ]
+    unset WSL_DISTRO_NAME; kernel=6.8.0-generic
+    [ "$(PATH=/usr/bin:/mnt/tools linux_service_path)" = /usr/bin:/mnt/tools ]
 )
 root=$fixture/'program files'
 mkdir -p "$root/bin" "$root/conf" "$fixture/commands"

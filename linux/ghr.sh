@@ -15,6 +15,12 @@ ghr wsl setup: 在WSL内配置或修复Windows未登录时的自动启动
 HELP
 }
 privileged() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
+# Another installation on this host may share the Docker mode image, so it is kept.
+docker_hint() {
+    local image
+    image=$("$JQ" -r 'select(.runtime=="docker") | .docker_image // empty' "$ROOT/conf/settings.json" 2>/dev/null) || return 0
+    [ -z "$image" ] || printf 'Docker image %s and Docker itself were kept; remove the image with docker rmi %s when unused.\n' "$image" "$image"
+}
 wsl_host() { [ ! -f "$ROOT/bin/wsl.sh" ] || /bin/bash "$ROOT/bin/wsl.sh" "$1"; }
 cli_contents() {
     printf '#!/bin/bash\n# ghr: %s\nunset LOCAL_RUNNER_ROOT\n' "$ROOT"
@@ -179,18 +185,20 @@ unregister_runners() {
     return "$failed"
 }
 uninstall() {
-    local command_path
+    local command_path hint
     stop_installation || return 1
     unregister_runners || { printf 'Uninstall incomplete. State and credentials retained; run ghr uninstall again.\n' >&2; return 1; }
     native_service remove || return 1
     wsl_host remove || return 1
     command_path=$("$JQ" -r '.command_path // empty' "$ROOT/conf/settings.json")
+    hint=$(docker_hint)
     if [ -n "$command_path" ] && [ -e "$command_path" ]; then
         [ ! -L "$command_path" ] && grep -Fqx "# ghr: $ROOT" "$command_path" || { printf 'Command ownership changed; refusing removal.\n' >&2; return 1; }
         privileged rm -f "$command_path" || return 1
     fi
     rm -rf "$ROOT/runner" "$ROOT/bin" "$ROOT/conf" || return 1
     printf 'Runner uninstalled. Data and logs retained in their original directories. Configured directory: %s\n' "$WORK_DIR"
+    [ -z "$hint" ] || printf '%s\n' "$hint"
 }
 command_main() {
     local command=${1:-help}; [ "$#" -eq 0 ] || shift

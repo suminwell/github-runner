@@ -25,12 +25,13 @@ log() {
 init() {
     STATE=$ROOT/conf
     RUNNER_UID=
+    # Docker mode supplies the container's own jq; the host's may not run there.
+    JQ=${LOCAL_RUNNER_JQ:-$(cat "$ROOT/conf/jq-path")} || return 1
     if [ -f "$ROOT/conf/account.json" ]; then
         STATE=$ROOT/conf/runtime
-        RUNNER_UID=$(jq -er .uid "$ROOT/conf/account.json") || return 1
+        RUNNER_UID=$("$JQ" -er .uid "$ROOT/conf/account.json") || return 1
         [ "$(id -u)" = "$RUNNER_UID" ] || { echo 'Use ghr or systemd to run this installation as its dedicated account.' >&2; return 1; }
     fi
-    JQ=$(cat "$ROOT/conf/jq-path") || return 1
     GH=$(cat "$ROOT/conf/gh-path") || return 1
     ARCH=$("$JQ" -r '.arch' "$ROOT/conf/settings.json") || return 1
     case "$ARCH" in x64|arm64) ;; *) return 1 ;; esac
@@ -134,7 +135,8 @@ api() {
 clean_exec() { env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u GH_CONFIG_DIR -u RUNNER_MANUALLY_TRAP_SIG "$@"; }
 safe_org() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]; }
 safe_id() { [[ $1 =~ ^[0-9]+$ ]]; }
-stamp() { ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || :; }
+# UTC and the C locale, so a record written inside the Docker mode container matches the host's view.
+stamp() { TZ=UTC LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || :; }
 record_pid() { local mark; mark=$(stamp "$2"); [ -n "$mark" ] || return 1; printf '%s\n%s\n' "$2" "$mark" | atomic "$1"; }
 record_alive() {
     [ -f "$1" ] || return 1
@@ -450,6 +452,9 @@ status() {
     if [ "$manager" = running ]; then printf 'Manager: running (PID %s)\n' "$(head -n 1 "$STATE/manager.pid")";
     elif [ -f "$ROOT/conf/stopped" ]; then printf 'Manager: stopped (run ghr start to resume)\n';
     else printf 'Manager: stopped\n'; fi
+    if [ "$("$JQ" -r '.runtime // "native"' "$ROOT/conf/settings.json")" = docker ]; then
+        printf 'Runtime: Docker (%s); jobs can control the host Docker daemon\n' "$("$JQ" -r '.docker_image // "image not built"' "$ROOT/conf/settings.json")"
+    fi
     if [ -f "$ROOT/conf/account.json" ]; then printf 'Runner account: ghrunner (UID %s)\n' "$("$JQ" -r .owner_uid "$ROOT/conf/settings.json")"; fi
     printf 'Install directory: %s\nRunner directory: %s/runner\n' "$ROOT" "$ROOT"
     if [ -s "$STATE/active-work-dir" ]; then
