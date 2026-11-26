@@ -16,7 +16,13 @@ function Write-AtomicText([string]$Path, [string]$Text) {
 }
 function Write-Json([string]$Path, $Value) { Write-AtomicText $Path ($Value | ConvertTo-Json -Depth 30) }
 function Read-Json([string]$Path) {
-    if (Test-Path -LiteralPath $Path) { return (Get-Content -Raw -Encoding UTF8 -LiteralPath $Path | ConvertFrom-Json) }
+    try {
+        if (Test-Path -LiteralPath $Path) { return (Get-Content -Raw -Encoding UTF8 -LiteralPath $Path | ConvertFrom-Json) }
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        # Concurrent replacement/removal can invalidate the existence check.
+        # Missing records have always meant absent; retain other read/JSON errors.
+        return $null
+    }
     return $null
 }
 function Write-Log([string]$Message) {

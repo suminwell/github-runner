@@ -110,6 +110,22 @@ try {
         $unicodePath = 'C:\' + [char]0x5DE5 + [char]0x4F5C
         Write-Json (Join-Path $testRoot 'conf\unicode.json') @{ path=$unicodePath }
         Assert ((Read-Json (Join-Path $testRoot 'conf\unicode.json')).path -ceq $unicodePath) 'UTF-8 paths round-trip'
+        # A runner/PID record may disappear after the existence check. Force that
+        # ordering at the filesystem boundary while exercising the real reader.
+        & {
+            $vanishing = Join-Path $testRoot 'conf\vanishing.json'
+            Write-Json $vanishing @{ value=1 }
+            function Get-Content {
+                param([switch]$Raw, [string]$Encoding, [string]$LiteralPath)
+                Remove-Item -LiteralPath $LiteralPath -Force
+                Microsoft.PowerShell.Management\Get-Content -Raw -Encoding $Encoding -LiteralPath $LiteralPath
+            }
+            Assert ($null -eq (Read-Json $vanishing)) 'record removed during read is absent, not a fatal error'
+        }
+        $invalidJson = Join-Path $testRoot 'conf\invalid.json'
+        Write-AtomicText $invalidJson '{invalid'
+        $failed = $false; try { $null = Read-Json $invalidJson } catch { $failed = $true }
+        Assert $failed 'malformed JSON is still reported'
         $script:Remote = @{}; $script:NextId = 100; $script:FailDiscovery = $false; $script:Raced = $false
         $script:Members = @(@{ state='active'; organization=@{id=1;login='alpha'} })
         function Invoke-GitHubApi([string]$Endpoint, [string]$Method='GET', [switch]$Paginate) {
