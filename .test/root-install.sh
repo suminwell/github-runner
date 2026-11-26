@@ -65,6 +65,21 @@ cat > /fixture/package/bin/installdependencies.sh <<'MOCK'
 #!/bin/sh
 id -u > /fixture/dependencies-uid
 MOCK
+cat > /fixture/package/bin/Runner.Listener <<'MOCK'
+#!/bin/sh
+[ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] || exit 95
+id -u >> /fixture/runtime-check-uids
+if [ -f /fixture/incompatible-runtime ]; then
+    echo "Runner.Listener: /lib64/libstdc++.so.6: version GLIBCXX_3.4.21 not found" >&2
+    exit 127
+fi
+echo 2.338.2
+MOCK
+mkdir -p /fixture/package/externals/node24/bin
+printf '#!/bin/sh\necho v24.0.0\n' > /fixture/package/externals/node24/bin/node
+chmod +x /fixture/package/bin/Runner.Listener /fixture/package/externals/node24/bin/node
+: > /fixture/runtime-check-uids
+chmod 666 /fixture/runtime-check-uids
 cat > /fixture/package/config.sh <<'MOCK'
 #!/bin/sh
 set -eu
@@ -108,9 +123,17 @@ assert test "$result" = 41
 rm /fixture/cancel-login
 mkdir /root/retry
 cd /root/retry
+touch /fixture/incompatible-runtime
+result=0; sh "$REPO/install.sh" </dev/null > /fixture/runtime-output 2>&1 || result=$?
+if [ "$result" = 0 ]; then echo 'FAIL: installer reported success with an incompatible Runner.Listener' >&2; exit 1; fi
+assert grep -q GLIBCXX_3.4.21 /fixture/runtime-output
+assert test ! -f /fixture/active
+assert test ! -e /usr/local/bin/ghr
+rm /fixture/incompatible-runtime
 sh "$REPO/install.sh" </dev/null
 root=/opt/github-runner/linux
 uid=$(id -u ghrunner)
+assert test "$(sort -u /fixture/runtime-check-uids)" = "$uid"
 wait_file() {
     for attempt in $(seq 1 600); do [ ! -f "$1" ] || return 0; sleep 0.1; done
     cat /fixture/manager-output >&2

@@ -35,6 +35,10 @@ root 安装目录及其父目录必须由 root 拥有，且其他用户不能写
 
 卸载 root 安装时保留专用账户及 HOME，避免遗留数据和日志变成无主文件；重新安装复用原 UID。账户记录保存在 root 管理的 `/var/lib/github-runner/account.json`，不随 `config --dir` 改变。
 
+Linux 版本须符合 [GitHub 官方支持范围](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#linux)，例如 Ubuntu 20.04+、Debian 10+、RHEL/CentOS/Oracle Linux 8+；新部署建议选择仍在维护的 Ubuntu 24.04、Debian 12 或 RHEL 9。**CentOS 7 不支持**，仅更新 libstdc++ 不能使它满足当前 Runner 和 JavaScript Actions 的要求；需要保留旧业务系统时，可在独立的现代 Linux 主机或虚拟机中部署 Runner。
+
+安装器在提权、创建账户或停止旧服务之前拒绝已知不支持的发行版版本。安装依赖后，还会以实际运行账户执行官方 `Runner.Listener --version` 和包内各个 glibc 版 `node --version`，检查 C++、glibc 和运行环境是否真正可用。检查失败时打印完整的版本缺失错误，退出安装并保留配置供修复后重试，不启用新服务；未知发行版也必须通过二进制运行检查。已有旧系统上的失败安装可用 `ghr stop` 停止重试。
+
 Linux 需要 systemd、glibc、Bash、curl、tar、util-linux 的 `flock`，不支持 Alpine；macOS 使用系统 Bash 3.2、launchd、`shlock`；Windows 使用 Windows PowerShell 5.1 和任务计划程序。无需 Python 或 C# 服务宿主。
 
 ## WSL2 安装与 Windows 未登录时启动
@@ -238,6 +242,7 @@ Windows 管理员 PowerShell 执行 `powershell -ExecutionPolicy Bypass -File .\
 bash .test/shell.sh
 bash .test/wsl.sh
 bash .test/install-retry.sh
+bash .test/linux-compatibility.sh
 bash .test/uninstall-recovery.sh
 bash .test/status.sh
 # 需要 Docker；只在一次性 Linux 容器内创建账户并验证 root 安装

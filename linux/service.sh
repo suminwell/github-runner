@@ -224,6 +224,27 @@ ensure_workers() {
 }
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 mtime() { if [ "$(uname -s)" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi; }
+verify_runtime() {
+    local package=$ROOT/bin/.cache/package binary output result node_directory nodes=0
+    for binary in "$package/bin/Runner.Listener" "$package"/externals/node*/bin/node; do
+        if [ "$binary" != "$package/bin/Runner.Listener" ]; then
+            node_directory=${binary%/bin/node}; node_directory=${node_directory##*/}
+            # A glibc host must not try to launch the optional musl/Alpine bundle.
+            [[ $node_directory =~ ^node[0-9]+$ ]] || continue
+            nodes=$((nodes+1))
+        fi
+        [ -x "$binary" ] || { printf 'Runtime check failed: executable missing: %s\n' "$binary" >&2; return 1; }
+        result=0
+        output=$(cd "$package" && with_timeout 30 clean_exec "$binary" --version 2>&1) || result=$?
+        if [ "$result" != 0 ]; then
+            printf 'Runtime check failed: %s (exit %s)\n%s\n' "${binary#"$package/"}" "$result" "$output" >&2
+            printf 'Runner service was not enabled by this installation. Fix system compatibility/dependencies and retry.\n' >&2
+            return 1
+        fi
+    done
+    [ "$nodes" -gt 0 ] || { printf 'Runtime check failed: no bundled Node.js runtime found.\n' >&2; return 1; }
+    printf 'Runtime check passed: Runner.Listener and %s bundled Node.js runtime(s).\n' "$nodes"
+}
 ensure_package() {
     local release version runner_os filename url digest temporary age
     PACKAGE=$ROOT/bin/.cache/package
@@ -474,6 +495,6 @@ status() {
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     umask 077
-    init || exit 1
-    case "${1:-serve}" in serve) serve ;; worker) /bin/bash "$ROOT/bin/runner.sh" "$ROOT" "${2:?organization ID required}" ;; prepare) ensure_package ;; status) status ;; once) reconcile ;; *) exit 1 ;; esac
+    if [ "${1:-serve}" = verify ]; then init control || exit 1; else init || exit 1; fi
+    case "${1:-serve}" in serve) serve ;; worker) /bin/bash "$ROOT/bin/runner.sh" "$ROOT" "${2:?organization ID required}" ;; prepare) ensure_package ;; verify) verify_runtime ;; status) status ;; once) reconcile ;; *) exit 1 ;; esac
 fi

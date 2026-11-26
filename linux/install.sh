@@ -59,6 +59,41 @@ is_wsl() {
     [ -n "${WSL_DISTRO_NAME:-}${WSL_INTEROP:-}" ] || uname -r | grep -qi microsoft
 }
 systemd_running() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
+read_linux_release() { cat /etc/os-release 2>/dev/null; }
+linux_release_field() {
+    awk -F= -v key="$1" '$1==key {v=substr($0,index($0,"=")+1); gsub(/^["\047]|["\047]$/,"",v); print v; exit}'
+}
+check_linux_compatibility() {
+    # Match GitHub's documented distro floors before sudo, packages, account
+    # creation or stopping an existing installation. Unknown distros still have
+    # to pass execution of the downloaded Listener and bundled Node.js binaries.
+    release=$(read_linux_release || :)
+    distribution=$(printf '%s\n' "$release" | linux_release_field ID)
+    version=$(printf '%s\n' "$release" | linux_release_field VERSION_ID)
+    description=$(printf '%s\n' "$release" | linux_release_field PRETTY_NAME)
+    minimum=
+    case "$distribution" in
+        rhel|centos|ol|rocky|almalinux) minimum=8 ;;
+        debian) minimum=10 ;;
+        ubuntu) minimum=20.04 ;;
+        linuxmint) minimum=20 ;;
+        fedora) minimum=29 ;;
+        opensuse-leap|sles) minimum=15.2 ;;
+        alpine) echo 'Alpine/musl is unsupported; the official Linux Runner requires a compatible glibc system.' >&2; return 1 ;;
+    esac
+    [ -n "$minimum" ] || return 0
+    # Rolling or nonnumeric vendor versions are checked by the actual binaries.
+    printf '%s\n' "$version" | grep -Eq '^[0-9]+(\.[0-9]+)*$' || return 0
+    if ! awk -v actual="$version" -v minimum="$minimum" 'BEGIN {
+        a=split(actual,x,"."); b=split(minimum,y,"."); n=(a>b?a:b);
+        for (i=1;i<=n;i++) {if (x[i]+0>y[i]+0) exit 0; if (x[i]+0<y[i]+0) exit 1} exit 0
+    }'; then
+        libc=$(getconf GNU_LIBC_VERSION 2>/dev/null || printf unknown)
+        printf 'Unsupported Linux: %s (%s). %s %s or later is required.\n' "${description:-$distribution $version}" "$libc" "$distribution" "$minimum" >&2
+        printf 'Use a supported Linux host or VM. Replacing a system library does not make this OS supported.\nhttps://docs.github.com/en/actions/reference/runners/self-hosted-runners#linux\n' >&2
+        return 1
+    fi
+}
 check_linux_host() {
     if is_wsl; then
         case "$(uname -r | tr '[:upper:]' '[:lower:]')" in
@@ -142,6 +177,7 @@ install_main() {
     detect_architecture
     if [ "${1:-auto}" != auto ] && [ "$1" != "$arch" ]; then echo "Architecture mismatch: requested $1, host $arch" >&2; exit 1; fi
     check_linux_host
+    check_linux_compatibility
     root_install=false
     if [ "$(id -u)" = 0 ]; then root_install=true; else sudo -v; fi
     if ! command -v jq >/dev/null 2>&1; then
@@ -286,9 +322,11 @@ install_main() {
         work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
         account_work_directory "$work_dir"
         account_prepare_package
+        account_run env -i HOME="$account_home" PATH=/usr/local/bin:/usr/bin:/bin /bin/bash "$root/bin/service.sh" verify
     else
         /bin/bash "$root/bin/service.sh" prepare
         privileged /bin/bash "$root/bin/.cache/package/bin/installdependencies.sh"
+        env -i HOME="$HOME" PATH="$PATH" /bin/bash "$root/bin/service.sh" verify
     fi
     /bin/bash "$root/bin/ghr.sh" --install-command
     work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
