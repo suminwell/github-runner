@@ -31,6 +31,12 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: bash .test/wsl.sh
+      - name: Exercise interrupted installs and uninstall recovery
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bash .test/install-retry.sh
+          bash .test/uninstall-recovery.sh
       - name: Check PowerShell syntax
         if: runner.os == 'Windows'
         shell: powershell
@@ -48,3 +54,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: ./.test/wsl.ps1
+      - name: Exercise Windows install retry and uninstall recovery
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          ./.test/install-retry.ps1
+          ./.test/uninstall-recovery.ps1

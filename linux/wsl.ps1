@@ -41,7 +41,7 @@ function Initialize-WslHost {
     $script:WslArguments = @('--distribution',$Distribution,'--user',$LinuxUser,'--exec','/bin/bash',"$script:InstallRoot/bin/wsl.sh")
     $script:HoldArguments = (($script:WslArguments + @('hold') | ForEach-Object { Quote-WslArgument $_ }) -join ' ')
 }
-function Invoke-WslHelper([string[]]$Arguments) {
+function Invoke-WslHelper([string[]]$Arguments, [ValidateRange(1,120)][int]$TimeoutSeconds = 120) {
     $info = New-Object Diagnostics.ProcessStartInfo
     $info.FileName = $script:WslExe
     $info.Arguments = (($script:WslArguments + $Arguments | ForEach-Object { Quote-WslArgument $_ }) -join ' ')
@@ -49,13 +49,20 @@ function Invoke-WslHelper([string[]]$Arguments) {
     $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
     $info.StandardOutputEncoding = [Text.Encoding]::UTF8; $info.StandardErrorEncoding = [Text.Encoding]::UTF8
     $process = [Diagnostics.Process]::Start($info)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     try {
         $output = $process.StandardOutput.ReadToEndAsync(); $errors = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'WSL did not respond within 120 seconds. Check the distribution and retry.' }
+        $exited = $process.WaitForExit($TimeoutSeconds * 1000)
+        $remaining = [int][Math]::Max(0, $TimeoutSeconds * 1000 - $timer.ElapsedMilliseconds)
+        if (-not $exited -or -not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($output,$errors), $remaining)) {
+            if (-not $process.HasExited) { $process.Kill() }
+            if ($exited) { throw "WSL did not respond within $TimeoutSeconds seconds. Output streams remained open after the process exited." }
+            throw "WSL did not respond within $TimeoutSeconds seconds. Check the distribution and retry."
+        }
         $text = $output.GetAwaiter().GetResult(); $detail = $errors.GetAwaiter().GetResult()
         if ($process.ExitCode -ne 0) { throw "WSL helper failed: $detail" }
         return $text
-    } finally { $process.Dispose() }
+    } finally { $process.StandardOutput.Dispose(); $process.StandardError.Dispose(); $process.Dispose() }
 }
 function Get-OwnedWslTask {
     $task = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue

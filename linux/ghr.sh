@@ -91,12 +91,13 @@ start_installation() {
     printf 'Runner started; automatic startup enabled.\n'
 }
 configure_directory() {
-    local requested=${1:-.} absolute
+    local requested=${1:-.} absolute program_root
     case "$requested" in ''|*'
 '*) printf 'A nonempty directory path without newlines is required.\n' >&2; return 1 ;; esac
     mkdir -p "$requested" || return 1
     absolute=$(cd "$requested" && pwd -P) || return 1
-    case "$absolute" in "$ROOT/bin"|"$ROOT/bin/"*|"$ROOT/conf"|"$ROOT/conf/"*|"$ROOT/runner"|"$ROOT/runner/"*) printf 'Data must be outside the program and state directories.\n' >&2; return 1 ;; esac
+    program_root=$(cd "$ROOT" && pwd -P) || return 1
+    case "$absolute" in "$program_root/bin"|"$program_root/bin/"*|"$program_root/conf"|"$program_root/conf/"*|"$program_root/runner"|"$program_root/runner/"*) printf 'Data must be outside the program and state directories.\n' >&2; return 1 ;; esac
     mkdir -p "$absolute/data" "$absolute/logs" || return 1
     jq_update "$ROOT/conf/settings.json" --arg directory "$absolute" '.work_dir=$directory' || return 1
     printf 'Work directory saved: %s\nRun ghr restart (or stop then start) to apply. Existing data and logs are not moved.\n' "$absolute"
@@ -111,8 +112,44 @@ show_logs() {
     elif [ -f "$file" ]; then tail -n 200 "$file";
     else printf 'No logs yet.\n'; fi
 }
+unregister_untracked_runners() {
+    # A registration can finish before save_entry. Its official metadata remains the
+    # ownership evidence until the entire uninstall succeeds, including retry failures.
+    local config directory runner_id name login organization id remote targets failed=0
+    "$JQ" -e 'type=="object" and all(to_entries[]; (.key|test("^[1-9][0-9]*$")) and (.value|type=="object") and (.value.login|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")) and (.value.runner_id|type=="number" and .>0 and floor==.))' "$ROOT/conf/organizations.json" >/dev/null || { printf 'Invalid registration state; retained installation for repair.\n' >&2; return 1; }
+    targets=$(mktemp "$ROOT/conf/unregister.XXXXXX") || return 1
+    for config in "$ROOT"/runner/*/app/.runner; do
+        [ -e "$config" ] || [ -L "$config" ] || continue
+        directory=${config%/app/.runner}
+        if [ -L "$ROOT/runner" ] || [ -L "$directory" ] || [ -L "$directory/app" ] || [ -L "$config" ]; then failed=1; break; fi
+        runner_id=$("$JQ" -er '.agentId | select(type=="number" and .>0 and floor==.) | tostring' "$config") || { failed=1; break; }
+        # A runner ID is scoped to its organization. The existing directory/state
+        # pair supports older metadata; all other directories use the official URL.
+        if "$JQ" -e '.gitHubUrl==null' "$config" >/dev/null && "$JQ" -e --arg login "${directory##*/}" --argjson runner_id "$runner_id" 'any(.[]; .login==$login and .runner_id==$runner_id)' "$ROOT/conf/organizations.json" >/dev/null; then continue; fi
+        name=$("$JQ" -er '.agentName | select(type=="string")' "$config") || { failed=1; break; }
+        if [ "$name" != "$PREFIX" ] && ! indexed_name "$name"; then failed=1; break; fi
+        login=$("$JQ" -er '.gitHubUrl | capture("^https://github\\.com/(?<login>[A-Za-z0-9][A-Za-z0-9-]{0,38})/?$";"i") | .login' "$config") || { failed=1; break; }
+        organization=$(api "orgs/$login") || { failed=1; break; }
+        id=$(printf '%s' "$organization" | "$JQ" -er '.id | select(type=="number" and .>0 and floor==.) | tostring') || { failed=1; break; }
+        login=$(printf '%s' "$organization" | "$JQ" -er '.login') || { failed=1; break; }
+        safe_org "$login" || { failed=1; break; }
+        if "$JQ" -e --arg id "$id" --argjson runner_id "$runner_id" '.[$id].runner_id==$runner_id' "$ROOT/conf/organizations.json" >/dev/null; then continue; fi
+        remote=$(list_runners "$login") || { failed=1; break; }
+        if ! printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" 'any(.[]; .id==$id)' >/dev/null; then continue; fi
+        printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" --arg name "$name" '[.[]|select(.id==$id)] | length==1 and .[0].name==$name' >/dev/null || { failed=1; break; }
+        if ! grep -Fqx "$login"$'\t'"$runner_id" "$targets"; then printf '%s\t%s\n' "$login" "$runner_id" >> "$targets"; fi
+    done
+    if [ "$failed" = 0 ]; then
+        while IFS=$'\t' read -r login runner_id; do
+            api "orgs/$login/actions/runners/$runner_id" --method DELETE >/dev/null || { failed=1; break; }
+        done < "$targets"
+    fi
+    rm -f "$targets"
+    [ "$failed" = 0 ] || { printf 'Cannot verify or unregister a local registration; retained metadata and credentials for retry.\n' >&2; return 1; }
+}
 unregister_runners() {
     local id login runner_id organization remote failed=0
+    unregister_untracked_runners || return 1
     while IFS=$'\t' read -r id login runner_id; do
         safe_id "$id" && safe_id "$runner_id" && safe_org "$login" || { failed=1; continue; }
         # Resolve by immutable ID so an organization rename cannot redirect cleanup.

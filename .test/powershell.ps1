@@ -230,8 +230,59 @@ try {
         Write-AtomicText $failing '[Console]::Error.WriteLine("bad token super-secret-value"); exit 3'
         $message = ''; try { $null = Invoke-Native $script:PowerShell @('-NoProfile','-File',$failing) -Redact @('super-secret-value') } catch { $message = $_.Exception.Message }
         Assert ($message -match 'exit 3' -and $message -match 'bad token \*\*\*' -and $message -notmatch 'super-secret') 'native failure explains itself without secrets'
+        # The parent exits promptly, but its child retains the redirected pipe handles.
+        # The same deadline must cover output draining, not just the parent's lifetime.
+        $pipeChild = Join-Path $testRoot 'pipe child.ps1'
+        $pipeParent = Join-Path $testRoot 'pipe parent.ps1'
+        $pipeRecord = Join-Path $testRoot 'pipe-child.json'
+        Write-AtomicText $pipeChild 'Start-Sleep -Seconds 10; [Console]::Out.WriteLine("late output")'
+        Write-AtomicText $pipeParent @'
+param($Executable,$Child,$Record)
+$info = New-Object Diagnostics.ProcessStartInfo
+$info.FileName = $Executable; $info.UseShellExecute = $false
+$info.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "' + $Child + '"'
+$childProcess = [Diagnostics.Process]::Start($info)
+@{id=$childProcess.Id;started=$childProcess.StartTime.ToUniversalTime().Ticks} | ConvertTo-Json | Set-Content -LiteralPath $Record
+exit 0
+'@
+        $timer = [Diagnostics.Stopwatch]::StartNew(); $message = ''
+        try {
+            try { $null = Invoke-Native $script:PowerShell @('-NoProfile','-ExecutionPolicy','Bypass','-File',$pipeParent,$script:PowerShell,$pipeChild,$pipeRecord) -Timeout 2 }
+            catch { $message = $_.Exception.Message }
+            Assert ($message -match 'after the process exited' -and (Test-Path $pipeRecord) -and $timer.Elapsed.TotalSeconds -lt 6) 'native deadline includes inherited output pipes after parent exit'
+        } finally {
+            $record = Read-Json $pipeRecord
+            if ($record) {
+                $childProcess = Get-Process -Id $record.id -ErrorAction SilentlyContinue
+                if ($childProcess -and $childProcess.StartTime.ToUniversalTime().Ticks -eq [long]$record.started) { $childProcess.Kill(); $childProcess.WaitForExit(); $childProcess.Dispose() }
+            }
+        }
+        # WSL's Windows bridge uses the same bounded output handling. Exercise its
+        # real process invocation with a fixture executable, without launching WSL.
+        & {
+            . (Join-Path $repo 'linux/wsl.ps1') -Action Library
+            $script:WslExe = $script:PowerShell
+            $script:WslArguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$pipeParent,$script:PowerShell,$pipeChild,$pipeRecord)
+            $timer = [Diagnostics.Stopwatch]::StartNew(); $message = ''
+            try {
+                try { $null = Invoke-WslHelper @() -TimeoutSeconds 2 } catch { $message = $_.Exception.Message }
+                Assert ($message -match 'after the process exited' -and (Test-Path $pipeRecord) -and $timer.Elapsed.TotalSeconds -lt 6) 'WSL bridge deadline includes inherited output pipes after parent exit'
+            } finally {
+                $record = Read-Json $pipeRecord
+                if ($record) {
+                    $childProcess = Get-Process -Id $record.id -ErrorAction SilentlyContinue
+                    if ($childProcess -and $childProcess.StartTime.ToUniversalTime().Ticks -eq [long]$record.started) { $childProcess.Kill(); $childProcess.WaitForExit(); $childProcess.Dispose() }
+                }
+            }
+        }
         # Exercise actual wrapper restart, without real GitHub runners or host services.
         if ($onWindows) {
+        # Fixtures run as the CI user; production records may only stop LocalService.
+        # Keep this override limited to processes whose command line names this fixture.
+        function Test-StoppableProcess([int]$ProcessId) {
+            $candidate = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+            return ($candidate -and $candidate.CommandLine -and $candidate.CommandLine.Contains($fixture))
+        }
         Remove-Item Env:LOCAL_RUNNER_ROOT
         $runner = Join-Path $testRoot 'runner\renamed\app'
         $env:FAKE_RUN_MARKER = Join-Path $testRoot 'runs'
@@ -250,8 +301,10 @@ try {
         New-Item -ItemType Directory -Force -Path (Join-Path $legacyState 'workers') | Out-Null
         $sleeper = [Diagnostics.Process]::Start((New-ProcessInfo $script:PowerShell @('-NoProfile','-Command','Start-Sleep -Seconds 60')))
         Record-Process (Join-Path $legacyState 'workers\9.json') $sleeper
-        $null = Invoke-Native $script:PowerShell @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $repo 'windows\service.ps1'),'-Mode','Stop','-Root',$testRoot,'-StateDir',$legacyState)
-        Assert ($sleeper.WaitForExit(10000) -and -not (Test-Path (Join-Path $legacyState 'workers\9.json'))) 'stop mode works from an explicit state directory'
+        try {
+            $null = Invoke-Native $script:PowerShell @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $repo 'windows\service.ps1'),'-Mode','Stop','-Root',$testRoot,'-StateDir',$legacyState)
+            Assert (-not $sleeper.HasExited -and -not (Test-Path (Join-Path $legacyState 'workers\9.json'))) 'forged state cannot stop an administrator-owned process'
+        } finally { if (-not $sleeper.HasExited) { $sleeper.Kill(); $sleeper.WaitForExit() }; $sleeper.Dispose() }
         }
         $script:Members = @(); Invoke-Reconcile
         Assert (@((Get-State).Values | Where-Object active -ne $false).Count -eq 0) 'removed membership stopped and retained for uninstall'

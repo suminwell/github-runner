@@ -125,6 +125,15 @@ migrate_layout() {
         rmdir "$organization" 2>/dev/null || :
     done
 }
+initialize_install_settings() {
+    [ ! -f "$root/conf/settings.json" ] || return 0
+    mkdir -p "$root/conf"
+    # Claim this fresh installation before downloads or login can fail. Keep the first
+    # invocation's data directory when a retry is launched from a different directory.
+    jq -n --arg platform "$platform" --arg arch "$arch" --arg work_dir "$(pwd -P)" --argjson owner_uid "$(id -u)" \
+        '{platform:$platform,arch:$arch,owner_uid:$owner_uid,work_dir:$work_dir}' > "$root/conf/settings.new"
+    mv "$root/conf/settings.new" "$root/conf/settings.json"
+}
 install_main() {
     umask 077
     platform=linux
@@ -170,7 +179,7 @@ install_main() {
     mkdir -p "$root"
     root=$(cd "$root" && pwd)
     known_installation=false
-    for settings_file in "$root/conf/settings.json" "$root/.state/settings.json" "$root/$arch/.state/settings.json"; do
+    for settings_file in "$root/conf/settings.json" "$root/.state/settings.json" "$root/$arch/.state/settings.json" "$root/$arch/conf/settings.json"; do
         if [ -f "$settings_file" ]; then
             jq -e --arg platform "$platform" '.platform==$platform' "$settings_file" >/dev/null || { echo 'Installation configuration belongs to a different platform.' >&2; exit 1; }
             known_installation=true
@@ -180,14 +189,15 @@ install_main() {
         for part in bin conf runner; do [ ! -e "$root/$part" ] || { echo "Refusing to reuse unrelated directory $root/$part; choose another installation directory." >&2; exit 1; }; done
     fi
     other_arch=x64; [ "$arch" != x64 ] || other_arch=arm64
-    [ ! -f "$root/$other_arch/.state/settings.json" ] || { echo 'An installation for another architecture exists; stop it and move it aside before upgrading.' >&2; exit 1; }
-    if [ -f "$root/$arch/.state/settings.json" ]; then
+    { [ ! -f "$root/$other_arch/.state/settings.json" ] && [ ! -f "$root/$other_arch/conf/settings.json" ]; } || { echo 'An installation for another architecture exists; stop it and move it aside before upgrading.' >&2; exit 1; }
+    if [ -f "$root/$arch/.state/settings.json" ] || [ -f "$root/$arch/conf/settings.json" ]; then
         for part in bin data logs .state; do
             [ ! -e "$root/$part" ] || { echo "Both layouts exist at $root; resolve them before upgrading." >&2; exit 1; }
         done
     fi
     stop_installed_service
     migrate_layout
+    initialize_install_settings
     mkdir -p "$root/bin/.cache" "$root/bin/tools" "$root/conf"
     jq_path=$(command -v jq)
     gh_path=$(command -v gh || :)
@@ -245,7 +255,6 @@ install_main() {
     work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
     mkdir -p "$work_dir/data" "$work_dir/logs"
     printf 'Data/logs directory: %s\n' "$work_dir"
-    rm -f "$root/conf/stopped"
     user=$(id -un); user_id=$(id -u)
     definition=$(mktemp)
     if [ "$platform" = linux ]; then
@@ -254,17 +263,23 @@ install_main() {
         systemd_unit "$user" "$HOME" "$PATH" "$root" > "$definition"
         sudo install -m 644 "$definition" "/etc/systemd/system/$service_name"
         sudo systemctl daemon-reload
-        sudo systemctl enable "$service_name"
-        sudo systemctl restart "$service_name"
-        sudo systemctl is-active --quiet "$service_name"
+        if [ -f "$root/conf/stopped" ]; then sudo systemctl disable "$service_name";
+        else
+            sudo systemctl enable "$service_name"
+            sudo systemctl restart "$service_name"
+            sudo systemctl is-active --quiet "$service_name"
+        fi
     else
         service_name=com.suminwell.github-runner.$user_id.$arch
         launchd_plist "$service_name" "$user" "$HOME" "$PATH" "$root" > "$definition"
         sudo launchctl bootout "system/$service_name" 2>/dev/null || :
         sudo install -o root -g wheel -m 644 "$definition" "/Library/LaunchDaemons/$service_name.plist"
-        sudo launchctl enable "system/$service_name"
-        sudo launchctl bootstrap system "/Library/LaunchDaemons/$service_name.plist"
-        sudo launchctl print "system/$service_name" >/dev/null
+        if [ -f "$root/conf/stopped" ]; then sudo launchctl disable "system/$service_name";
+        else
+            sudo launchctl enable "system/$service_name"
+            sudo launchctl bootstrap system "/Library/LaunchDaemons/$service_name.plist"
+            sudo launchctl print "system/$service_name" >/dev/null
+        fi
     fi
     rm -f "$definition" "$root/install.sh" "$root/service.sh" "$root/ghr.sh"
     printf '\nInstalled %s\n\n' "$service_name"

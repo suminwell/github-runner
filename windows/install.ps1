@@ -46,6 +46,18 @@ function Grant-ServiceWrite([string]$Directory) {
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-5-19')), 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
     $item.SetAccessControl($acl)
 }
+function Initialize-InstallSettings([string]$InstallRoot, [string]$Arch) {
+    $path = Join-Path $InstallRoot 'conf\settings.json'
+    if (Test-Path -LiteralPath $path) { return }
+    New-Item -ItemType Directory -Force -Path (Split-Path $path -Parent) | Out-Null
+    # Persist ownership and the original data directory before download/login can fail.
+    $settings = @{platform='windows'; arch=$Arch; work_dir=(Get-Location).ProviderPath}
+    $temporary = "$path.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temporary, ($settings | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::Move($temporary, $path)
+    } finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+}
 function Protect-AdminFile([string]$Path) {
     # Keep the inherited owners, but LocalService may only read this file.
     $item = Get-Item -LiteralPath $Path
@@ -81,8 +93,8 @@ if (-not $env:LOCAL_RUNNER_HOME -and -not [Console]::IsInputRedirected -and [Env
 $bin = Join-Path $installRoot 'bin'; $state = Join-Path $installRoot 'conf'; $taskName = "LocalGitHubRunner-$arch"
 $legacy = Join-Path $installRoot $arch
 $otherArch = if ($arch -eq 'x64') { 'arm64' } else { 'x64' }
-if (Test-Path (Join-Path $installRoot "$otherArch\.state\settings.json")) { throw 'An installation for another architecture exists; stop it and move it aside before upgrading.' }
-$migrate = Test-Path (Join-Path $legacy '.state\settings.json')
+if ((Test-Path (Join-Path $installRoot "$otherArch\.state\settings.json")) -or (Test-Path (Join-Path $installRoot "$otherArch\conf\settings.json"))) { throw 'An installation for another architecture exists; stop it and move it aside before upgrading.' }
+$migrate = (Test-Path (Join-Path $legacy '.state\settings.json')) -or (Test-Path (Join-Path $legacy 'conf\settings.json'))
 if ($migrate) {
     foreach ($part in @('bin','data','logs','.state')) {
         if (Test-Path (Join-Path $installRoot $part)) { throw "Both layouts exist at $installRoot; resolve them before upgrading." }
@@ -91,7 +103,7 @@ if ($migrate) {
 New-Item -ItemType Directory -Force -Path $installRoot | Out-Null
 $installRoot = (Resolve-Path -LiteralPath $installRoot).Path
 $knownInstallation = $false
-foreach ($relative in @('conf\settings.json','.state\settings.json',"$arch\.state\settings.json")) {
+foreach ($relative in @('conf\settings.json','.state\settings.json',"$arch\.state\settings.json","$arch\conf\settings.json")) {
     $settingsFile = Join-Path $installRoot $relative
     if (Test-Path $settingsFile) {
         $existingSettings = Get-Content -Raw -Encoding UTF8 -LiteralPath $settingsFile | ConvertFrom-Json
@@ -153,7 +165,9 @@ if (@($stateDirectories).Count) {
     } finally { Remove-Item -LiteralPath $stopScript -Force -ErrorAction SilentlyContinue }
 }
 Move-PreviousLayout $installRoot $arch
+Initialize-InstallSettings $installRoot $arch
 New-Item -ItemType Directory -Force -Path $bin, $state, (Join-Path $bin 'tools'), (Join-Path $bin '.cache'), (Join-Path $installRoot 'runner') | Out-Null
+Protect-AdminFile (Join-Path $state 'settings.json')
 foreach ($writable in @($state, (Join-Path $bin '.cache'), (Join-Path $installRoot 'runner'))) { Grant-ServiceWrite $writable }
 $ghPath = Join-Path $bin 'tools\gh.exe'
 $existing = Get-Command gh -ErrorAction SilentlyContinue
@@ -215,17 +229,17 @@ if ($LASTEXITCODE -ne 0) { throw 'Runner preparation failed.' }
 & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'ghr.ps1') install-command
 if ($LASTEXITCODE -ne 0) { throw 'Management command setup failed.' }
 $env:Path = "$bin;$env:Path"
-Remove-Item (Join-Path $state 'stopped') -Force -ErrorAction SilentlyContinue
 $action = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$bin\service.ps1`"" -WorkingDirectory $installRoot
 $boot = New-ScheduledTaskTrigger -AtStartup
 # Indefinite repetition also recovers clean exits; IgnoreNew keeps only one manager.
 $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
 $taskSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$taskSettings.Enabled = -not (Test-Path (Join-Path $state 'stopped'))
 $localService = (New-Object Security.Principal.SecurityIdentifier('S-1-5-19')).Translate([Security.Principal.NTAccount]).Value
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $localService -LogonType ServiceAccount
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($boot,$watchdog) -Settings $taskSettings -Principal $taskPrincipal -Force | Out-Null
-Enable-ScheduledTask -TaskName $taskName | Out-Null
-Start-ScheduledTask -TaskName $taskName
+if (Test-Path (Join-Path $state 'stopped')) { Disable-ScheduledTask -TaskName $taskName | Out-Null }
+else { Enable-ScheduledTask -TaskName $taskName | Out-Null; Start-ScheduledTask -TaskName $taskName }
 foreach ($old in @('manager.py','windows-service.cs','LocalGitHubRunner.exe')) { Remove-Item (Join-Path $bin $old) -Force -ErrorAction SilentlyContinue }
 Remove-Item (Join-Path $state 'python') -Recurse -Force -ErrorAction SilentlyContinue
 foreach ($file in @('install.ps1','service.ps1','ghr.ps1')) { Remove-Item (Join-Path $installRoot $file) -Force -ErrorAction SilentlyContinue }

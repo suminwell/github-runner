@@ -76,14 +76,24 @@ function Invoke-Native([string]$Executable, [string[]]$Arguments, [int]$Timeout 
     }
     $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
     $process = [Diagnostics.Process]::Start($info)
-    $output = $process.StandardOutput.ReadToEndAsync(); $errors = $process.StandardError.ReadToEndAsync()
-    if (-not $process.WaitForExit($Timeout * 1000)) {
-        & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null
-        $process.Dispose(); throw 'Native command timed out.'
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $output = $process.StandardOutput.ReadToEndAsync(); $errors = $process.StandardError.ReadToEndAsync()
+        $exited = $process.WaitForExit($Timeout * 1000)
+        $remaining = [int][Math]::Max(0, $Timeout * 1000 - $timer.ElapsedMilliseconds)
+        # A descendant may inherit the output handles after the executable exits.
+        # Bound pipe draining by the same deadline instead of waiting for EOF forever.
+        if (-not $exited -or -not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($output,$errors), $remaining)) {
+            if (-not $process.HasExited) { & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null }
+            if ($exited) { throw 'Native command timed out. Output streams remained open after the process exited.' }
+            throw 'Native command timed out.'
+        }
+        $code = $process.ExitCode
+        $text = $output.GetAwaiter().GetResult(); $errorText = $errors.GetAwaiter().GetResult()
+    } finally {
+        $process.StandardOutput.Dispose(); $process.StandardError.Dispose()
+        $process.Dispose()
     }
-    $code = $process.ExitCode
-    $text = $output.GetAwaiter().GetResult(); $errorText = $errors.GetAwaiter().GetResult()
-    $process.Dispose()
     if ($code -ne 0) {
         # Keep the last diagnostic line so the log says why; never echo secrets.
         $detail = @(("$errorText`n$text") -split '\r?\n' | Where-Object { $_.Trim() }) | Select-Object -Last 1
@@ -96,7 +106,7 @@ function Invoke-Native([string]$Executable, [string[]]$Arguments, [int]$Timeout 
 function Invoke-GitHubApi([string]$Endpoint, [string]$Method = 'GET', [switch]$Paginate) {
     $arguments = @('api','--hostname','github.com',$Endpoint,'--method',$Method)
     if ($Paginate) { $arguments += @('--paginate','--slurp') }
-    $text = Invoke-Native $script:Gh $arguments -Authentication
+    $text = Invoke-Native $script:Gh $arguments -Timeout 120 -Authentication
     if ($text.Trim()) { return ,($text | ConvertFrom-Json) }
     return $null
 }
@@ -121,7 +131,9 @@ function Test-StoppableProcess([int]$ProcessId) {
     if ($null -eq $process) { return $false }
     $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction SilentlyContinue
     if ($null -eq $owner -or -not $owner.Sid) { return $false }
-    return ($owner.Sid -eq 'S-1-5-19' -or $owner.Sid -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    # The installed task always uses LocalService. Including the administrator who
+    # invokes ghr would let a job forge records targeting that administrator's apps.
+    return ($owner.Sid -eq 'S-1-5-19')
 }
 function Stop-Record([string]$Path) {
     $process = Get-RecordedProcess $Path

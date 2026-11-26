@@ -24,7 +24,7 @@ irm https://raw.githubusercontent.com/suminwell/github-runner/main/install.ps1 |
 | macOS | `~/.local/share/github-runner/macos` | LaunchDaemon，以安装用户运行 |
 | Windows | `C:\ProgramData\local-github-runner\windows` | 计划任务，以 LocalService 运行 |
 
-安装器自动安装或更新 GitHub CLI `gh`（最低 2.62），缺少登录时引导授权，然后下载官方 Actions Runner、校验 SHA-256、配置开机启动。Linux/macOS 缺少 `jq` 时通过系统包管理器或 Homebrew 安装；Linux 同时安装官方 Runner 所需系统依赖。
+安装器自动安装或更新 GitHub CLI `gh`（最低 2.62），缺少登录时引导授权，然后下载官方 Actions Runner、校验 SHA-256、配置开机启动。下载失败或取消登录后可直接重试，保留首次安装时的数据目录选择。Linux/macOS 缺少 `jq` 时通过系统包管理器或 Homebrew 安装；Linux 同时安装官方 Runner 所需系统依赖。
 
 首次安装需要 GitHub 授权、Unix 的 sudo 权限或 Windows 管理员权限。无交互输入时使用默认安装目录；也可设置 `LOCAL_RUNNER_HOME` 跳过目录询问，安装器会追加平台名。重复安装会保留已有配置、编号和数据。
 
@@ -81,7 +81,7 @@ ghr uninstall: 卸载runner
 - `restart`：先停止再启动，并应用保存的目录配置。
 - `logs`：显示管理日志最后 200 行；`logs -f` 持续跟踪新增日志，日志轮换后继续跟踪，按 Ctrl+C 结束。
 - `config --dir <PATH>` 或 `config -d <PATH>`：等价，设置数据和日志的父目录。`config`、`config --dir`、`config -d` 或路径为 `.` 时使用当前目录。路径包含空格时用引号括起；不支持 `--dir=<PATH>` 写法。
-- `uninstall`：停止进程，注销本机记录的 GitHub Runner，移除系统服务、命令、脚本和配置；所有工作数据与日志保留。GitHub 注销失败时保留凭据和状态，修复网络或权限后再次执行卸载。其他机器的 Runner 不会被删除。
+- `uninstall`：停止进程，注销本机记录的 GitHub Runner，移除系统服务、命令、脚本和配置；所有工作数据与日志保留。若注册成功后尚未保存组织状态就退出，会从本地官方 `.runner` 元数据补查组织和远端身份。身份无法确认或 GitHub 注销失败时保留凭据和状态，修复后再次执行卸载。其他机器的 Runner 不会被删除。
 
 Unix 的入口为 `/usr/local/bin/ghr`，调用安装目录的 `bin/ghr.sh`。Windows 的 `bin/ghr.cmd` 调用 `bin/ghr.ps1`，安装器将其目录加入安装用户的 PATH。若已有终端找不到 `ghr`，重新打开终端；Unix 的 PATH 需要包含 `/usr/local/bin`。Windows 的启停、目录设置和卸载在管理员 PowerShell 中执行。
 
@@ -188,7 +188,7 @@ jobs:
 
 凭据保存在受权限保护的 `conf/github-token`，不会传给构建子进程或写入日志。同一 OS 身份的任务仍能读取本机文件，只应接入可信组织和 workflow。Windows 上 LocalService 对 `bin\` 只读，只能写入 `conf\`、`runner\`、`bin\.cache` 和数据、日志目录，且 `conf\settings.json`、`conf\github-token` 仅可读，防止任务篡改管理员执行的脚本和配置。Windows LocalService 不具有管理员权限、交互桌面或个人钥匙串；Java、Docker、Xcode 等构建工具链需自行准备。
 
-再次执行安装命令即可更新，请在没有 job 运行时升级。旧版架构目录、`.state` 和组织程序目录会迁移到新布局，保留注册和数据；存在冲突目录时停止，不覆盖。此前安装的工作数据默认保留原位置，新安装默认使用当前目录。
+再次执行安装命令即可更新，请在没有 job 运行时升级。通过 `ghr stop` 停止的安装在升级后仍保持停止，使用 `ghr start` 恢复。旧版架构目录、`.state` 和组织程序目录会迁移到新布局，保留注册和数据；存在冲突目录时停止，不覆盖。此前安装的工作数据默认保留原位置，新安装默认使用当前目录。
 
 本地源码安装：
 
@@ -204,10 +204,16 @@ Windows 管理员 PowerShell 执行 `powershell -ExecutionPolicy Bypass -File .\
 
 ```sh
 bash .test/shell.sh
+bash .test/wsl.sh
+bash .test/install-retry.sh
+bash .test/uninstall-recovery.sh
 ```
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .test/powershell.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .test/wsl.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .test/install-retry.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .test/uninstall-recovery.ps1
 ```
 
 测试使用临时目录、假 GitHub API 和系统服务接口，验证注册编号、目录升级、真实子进程恢复、启停、配置生效、日志跟踪和卸载；不安装本机服务，不注册真实 Runner。CI 在 Linux、macOS、Windows 上运行，分别模拟 x64/arm64 配置。真实组织接单、两种原生硬件及系统重启恢复仍需集成验收。

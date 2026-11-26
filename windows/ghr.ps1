@@ -149,8 +149,47 @@ function Set-WorkDirectory([string]$Directory) {
     Write-Host "Work directory saved: $absolute"
     Write-Host 'Run ghr restart (or stop then start) to apply. Existing data and logs are not moved.'
 }
+function Unregister-UntrackedRunners($State) {
+    # Keep official .runner evidence until all cleanup succeeds, so interrupted
+    # registration and failed DELETE requests remain retryable without guessing names.
+    $raw = Read-Json (Join-Path $script:Root 'conf\organizations.json')
+    if ($null -eq $raw -or $raw -isnot [pscustomobject]) { throw 'Invalid registration state; retained installation for repair.' }
+    foreach ($id in $State.Keys) {
+        $entry = $State[$id]
+        if ($id -notmatch '^[1-9][0-9]*$' -or "$($entry.runner_id)" -notmatch '^[1-9][0-9]*$' -or -not (Test-Organization $entry.login)) { throw 'Invalid registration state; retained installation for repair.' }
+    }
+    $targets = @{}
+    $runners = Join-Path $script:Root 'runner'
+    if (-not (Test-Path -LiteralPath $runners)) { return }
+    if ((Get-Item -Force -LiteralPath $runners).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing registration recovery through a linked runner directory.' }
+    foreach ($directory in @(Get-ChildItem -Force -LiteralPath $runners | Where-Object PSIsContainer)) {
+        $app = Join-Path $directory.FullName 'app'
+        $path = Join-Path $app '.runner'
+        if (-not (Test-Path -LiteralPath $path)) { continue }
+        foreach ($item in @($directory, (Get-Item -Force -LiteralPath $app), (Get-Item -Force -LiteralPath $path))) {
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing registration recovery through linked metadata.' }
+        }
+        $local = Read-Json $path
+        if ($null -eq $local -or "$($local.agentId)" -notmatch '^[1-9][0-9]*$') { throw 'Invalid local registration; retained metadata for repair.' }
+        # Existing directory/state pairs support older metadata, but an ID alone
+        # never identifies a registration in another organization.
+        if ($null -eq $local.gitHubUrl -and @($State.Values | Where-Object { $_.runner_id -eq $local.agentId -and $_.login -ceq $directory.Name }).Count) { continue }
+        if ($local.agentName -cne $script:Prefix -and -not (Test-IndexedName $local.agentName)) { throw 'Local runner name does not identify this installation.' }
+        if ($local.gitHubUrl -notmatch '^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/?$') { throw 'Local registration does not identify a GitHub organization URL.' }
+        $organization = Invoke-GitHubApi "orgs/$($Matches[1])"
+        if ("$($organization.id)" -notmatch '^[1-9][0-9]*$' -or -not (Test-Organization $organization.login)) { throw 'Invalid organization identity.' }
+        $login = $organization.login
+        if ($State.ContainsKey("$($organization.id)") -and $State["$($organization.id)"].runner_id -eq $local.agentId) { continue }
+        $remote = @(Get-RemoteRunners $login | Where-Object id -eq $local.agentId)
+        if (-not $remote.Count) { continue }
+        if ($remote.Count -ne 1 -or $remote[0].name -cne $local.agentName) { throw 'Local and remote runner identities disagree; retained metadata for repair.' }
+        $targets["$login/$($local.agentId)"] = @{login=$login;runner_id=$local.agentId}
+    }
+    foreach ($target in $targets.Values) { $null = Invoke-GitHubApi "orgs/$($target.login)/actions/runners/$($target.runner_id)" -Method DELETE }
+}
 function Unregister-Runners {
     $state = Get-State; $failed = $false
+    Unregister-UntrackedRunners $state
     foreach ($id in @($state.Keys)) {
         $entry = $state[$id]
         try {
