@@ -88,5 +88,19 @@ for platform in linux macos; do
     if list_runners alpha > "$fixture/out" 2> "$fixture/err"; then echo 'Accepted a refused runner list' >&2; exit 1; fi
     if grep -q 'jq: error' "$fixture/err"; then cat "$fixture/err" >&2; exit 1; fi
     assert grep -q 'Run the installer again' "$fixture/err"
-    printf 'PASS %s status: directories, pending config, process states and GitHub results\n' "$platform"
+    # stamp() must force the C locale for ps, so a timestamp recorded under one locale
+    # matches record_alive() under another (e.g. a zh-Hans terminal reading an English record).
+    # Mock ps reports the locale it was called with as its stdout. stamp() must
+    # force LC_ALL=C, so the output is the English token regardless of the
+    # ambient locale. No files/env vars shared with the child shell are needed,
+    # which keeps the test portable across Linux, macOS and Git Bash on Windows.
+    cat > "$fixture/ps" <<'PS'
+#!/bin/sh
+printf '%s\n' "${LC_ALL-unset}"
+PS
+    chmod +x "$fixture/ps"
+    stamp_out=$(PATH="$fixture:$PATH" stamp 123) || :
+    assert test "$stamp_out" = C
+    rm -f "$fixture/ps"
+    printf 'PASS %s status: directories, pending config, process states, GitHub results and locale-stable stamp\n' "$platform"
 done
