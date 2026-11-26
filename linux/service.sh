@@ -226,6 +226,15 @@ ensure_workers() {
 }
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 mtime() { if [ "$(uname -s)" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi; }
+# Connections to GitHub can drop mid-handshake (curl 35, "EOF"); retry before failing.
+download() {
+    local url=$1 output=$2 attempt
+    for attempt in 1 2 3 4; do
+        curl -fsSL --connect-timeout 15 --max-time 600 "$url" -o "$output" && return 0
+        [ "$attempt" = 4 ] || { printf 'Download attempt %s failed; retrying in %ss: %s\n' "$attempt" "$((attempt * 5))" "$url" >&2; sleep "$((attempt * 5))"; }
+    done
+    return 1
+}
 verify_runtime() {
     local package=$ROOT/bin/.cache/package binary output result node_directory nodes=0
     for binary in "$package/bin/Runner.Listener" "$package"/externals/node*/bin/node; do
@@ -254,7 +263,7 @@ ensure_package() {
         age=$(( $(date +%s) - $(mtime "$PACKAGE/.complete") ))
         [ "$age" -ge 86400 ] || return 0
     fi
-    release=$(api repos/actions/runner/releases/latest) || return 1
+    release=$(api repos/actions/runner/releases/latest) || { sleep 5; release=$(api repos/actions/runner/releases/latest); } || { sleep 10; release=$(api repos/actions/runner/releases/latest); } || return 1
     version=$(printf '%s' "$release" | "$JQ" -r '.tag_name | ltrimstr("v")') || return 1
     runner_os=linux; [ "$OS" != macos ] || runner_os=osx
     filename=actions-runner-$runner_os-$ARCH-$version.tar.gz
@@ -262,7 +271,7 @@ ensure_package() {
     digest=$(printf '%s' "$release" | "$JQ" -r --arg name "$filename" '.assets[] | select(.name==$name) | .digest')
     [[ $digest =~ ^sha256:[a-fA-F0-9]{64}$ ]] || { log 'Runner release has no SHA-256 digest'; return 1; }
     temporary=$(mktemp -d "$ROOT/bin/.cache/download.XXXXXX") || return 1
-    if ! curl -fsSL --connect-timeout 15 --max-time 600 "$url" -o "$temporary/runner.tgz"; then rm -rf "$temporary"; return 1; fi
+    if ! download "$url" "$temporary/runner.tgz"; then rm -rf "$temporary"; log "Runner download failed: $url"; return 1; fi
     if [ "$(sha256 "$temporary/runner.tgz")" != "${digest#sha256:}" ]; then rm -rf "$temporary"; log 'Runner SHA-256 mismatch'; return 1; fi
     if ! tar -tzf "$temporary/runner.tgz" | awk '/^\/|(^|\/)\.\.(\/|$)/ {bad=1} END {exit bad}'; then rm -rf "$temporary"; return 1; fi
     mkdir "$temporary/package"

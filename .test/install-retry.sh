@@ -32,6 +32,7 @@ gh() {
     esac
 }
 curl() { echo 'Simulated download failure' >&2; return 42; }
+sleep() { :; }
 fetch() { printf '#!/bin/sh\nexit 0\n' > "$2"; }
 install_main auto
 RUN
@@ -50,7 +51,8 @@ run_install() {
 for target in linux macos; do
     for failure in login download; do
         home=$FIXTURE/$target-$failure; first=$FIXTURE/first-$target-$failure; second=$FIXTURE/second-$target-$failure
-        expected=41; [ "$failure" != download ] || expected=42
+        # Linux retries the download and then reports failure itself; macOS returns curl's status.
+        expected=41; [ "$failure" != download ] || { expected=42; [ "$target" != linux ] || expected=1; }
         run_install "$target" "$failure" "$home" "$first" "$expected"
         assert jq -e --arg p "$target" --arg work "$first" '.platform==$p and .arch=="x64" and .work_dir==$work' "$home/$target/conf/settings.json"
         run_install "$target" "$failure" "$home" "$second" "$expected"
@@ -95,5 +97,28 @@ for target in linux macos; do
     run_install "$target" login "$home" "$FIXTURE" 1
     assert test -f "$home/$target/arm64/conf/settings.json"
 done
+# A dropped GitHub connection is retried; a persistent failure explains how to resume.
+(
+    sed '/^if \[ -t 0 \]/,$d' "$REPO/linux/install.sh" > "$FIXTURE/helpers.sh"
+    . "$FIXTURE/helpers.sh"
+    sleep() { :; }
+    curl() { attempts=$((attempts + 1)); [ "$attempts" -ge "$succeed_on" ] && printf ok > "$8"; }
+    attempts=0; succeed_on=3
+    download https://example.invalid/file "$FIXTURE/downloaded" 2> "$FIXTURE/download-log"
+    [ "$attempts" = 3 ] && [ "$(cat "$FIXTURE/downloaded")" = ok ] || { echo "download retry: $attempts attempts" >&2; exit 1; }
+    [ "$(grep -c 'retrying' "$FIXTURE/download-log")" = 2 ] || exit 1
+    attempts=0; succeed_on=9
+    if download https://example.invalid/file "$FIXTURE/downloaded" 2> "$FIXTURE/download-log"; then echo 'Ignored download failure' >&2; exit 1; fi
+    [ "$attempts" = 4 ] || exit 1
+    grep -q 'run the same install command again' "$FIXTURE/download-log"
+)
+(
+    . "$REPO/linux/service.sh"
+    sleep() { :; }
+    curl() { attempts=$((attempts + 1)); [ "$attempts" -ge 2 ] && printf ok > "$8"; }
+    attempts=0
+    download https://example.invalid/runner.tgz "$FIXTURE/runner.tgz" 2>/dev/null
+    [ "$attempts" = 2 ] || { echo "service download retry: $attempts" >&2; exit 1; }
+)
 success=true
 printf 'PASS installer retry, original data directory, stopped upgrade and layout ownership\n'

@@ -67,9 +67,19 @@ launchd_plist() {
 </dict></plist>
 PLIST
 }
+# Connections to GitHub can drop mid-handshake (curl 35, "EOF"); retry before failing.
+download() {
+    download_attempt=1
+    while ! curl -fsSL --connect-timeout 15 --max-time "${3:-600}" "$1" -o "$2"; do
+        [ "$download_attempt" -lt 4 ] || { printf 'Download failed after 4 attempts: %s\nCheck the network to GitHub and run the same install command again; completed steps are kept.\n' "$1" >&2; return 1; }
+        printf 'Download attempt %s failed; retrying in %ss: %s\n' "$download_attempt" "$((download_attempt * 5))" "$1" >&2
+        sleep "$((download_attempt * 5))"
+        download_attempt=$((download_attempt + 1))
+    done
+}
 fetch() {
     if [ -n "${LOCAL_RUNNER_SOURCE_DIR:-}" ]; then cp "$LOCAL_RUNNER_SOURCE_DIR/$1" "$2.new";
-    else curl -fsSL --connect-timeout 15 --max-time 120 "$base/$1" -o "$2.new"; fi
+    else download "$base/$1" "$2.new" 120; fi
     mv -f "$2.new" "$2"
 }
 detect_architecture() {
@@ -126,7 +136,7 @@ install_static_jq() {
         *) jq_asset=jq-linux-arm64; jq_sum=6bc62f25981328edd3cfcfe6fe51b073f2d7e7710d7ef7fcdac28d4e384fc3d4 ;;
     esac
     jq_bootstrap=$(mktemp -d)
-    curl -fsSL --connect-timeout 15 --max-time 600 "https://github.com/jqlang/jq/releases/download/jq-1.8.1/$jq_asset" -o "$jq_bootstrap/jq"
+    download "https://github.com/jqlang/jq/releases/download/jq-1.8.1/$jq_asset" "$jq_bootstrap/jq"
     [ "$(sha256_file "$jq_bootstrap/jq")" = "$jq_sum" ] || { echo 'jq SHA-256 mismatch.' >&2; rm -rf "$jq_bootstrap"; exit 1; }
     chmod 755 "$jq_bootstrap/jq"
     PATH=$jq_bootstrap:$PATH
@@ -340,7 +350,7 @@ install_main() {
         download_cache=$root/bin/.cache
         if $root_install; then download_cache=$root/conf; fi
         temporary=$(mktemp -d "$download_cache/gh.XXXXXX")
-        curl -fsSL --max-time 120 https://api.github.com/repos/cli/cli/releases/latest -o "$temporary/release.json"
+        download https://api.github.com/repos/cli/cli/releases/latest "$temporary/release.json" 120
         version=$("$jq_path" -r '.tag_name|ltrimstr("v")' "$temporary/release.json")
         cli_arch=$arch; [ "$arch" != x64 ] || cli_arch=amd64
         cli_os=linux; extension=tar.gz
@@ -349,7 +359,7 @@ install_main() {
         url=$("$jq_path" -r --arg name "$filename" '.assets[]|select(.name==$name)|.browser_download_url' "$temporary/release.json")
         digest=$("$jq_path" -r --arg name "$filename" '.assets[]|select(.name==$name)|.digest' "$temporary/release.json")
         printf '%s' "$digest" | grep -Eq '^sha256:[a-fA-F0-9]{64}$' || { echo 'Missing gh asset digest.' >&2; exit 1; }
-        curl -fsSL --max-time 600 "$url" -o "$temporary/$filename"
+        download "$url" "$temporary/$filename"
         [ "$(sha256_file "$temporary/$filename")" = "${digest#sha256:}" ] || { echo 'gh SHA-256 mismatch.' >&2; exit 1; }
         mkdir "$temporary/unpacked"
         if [ "$extension" = zip ]; then unzip -q "$temporary/$filename" -d "$temporary/unpacked";
@@ -405,12 +415,12 @@ install_main() {
         account_protect_config
         work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
         account_work_directory "$work_dir"
-        account_prepare_package "$runtime"
+        account_prepare_package "$runtime" || { echo 'Preparing the official Runner failed (see the error above). Run the same install command again to retry.' >&2; exit 1; }
         if [ "$runtime" = docker ]; then
             LOCAL_RUNNER_DOCKER_USER=$account_uid:$account_gid LOCAL_RUNNER_DOCKER_HOME=$account_home /bin/bash "$root/bin/docker.sh" verify
         else account_run env -i HOME="$account_home" PATH=/usr/local/bin:/usr/bin:/bin /bin/bash "$root/bin/service.sh" verify; fi
     else
-        /bin/bash "$root/bin/service.sh" prepare
+        /bin/bash "$root/bin/service.sh" prepare || { echo 'Preparing the official Runner failed (see the error above). Run the same install command again to retry.' >&2; exit 1; }
         if [ "$runtime" = docker ]; then
             privileged env LOCAL_RUNNER_DOCKER_USER="$(id -u):$(id -g)" LOCAL_RUNNER_DOCKER_HOME="$HOME" /bin/bash "$root/bin/docker.sh" verify
         else
