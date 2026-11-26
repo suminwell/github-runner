@@ -37,15 +37,29 @@ service_identity() {
     if [ "$OS" = linux ]; then SERVICE_NAME=local-github-runner-$OWNER_UID-$ARCH.service; DEFINITION=/etc/systemd/system/$SERVICE_NAME;
     else SERVICE_NAME=com.suminwell.github-runner.$OWNER_UID.$ARCH; DEFINITION=/Library/LaunchDaemons/$SERVICE_NAME.plist; fi
 }
+systemd_property() (
+    property_unit=$1; property_name=$2
+    property_output=$(privileged systemctl show "$property_unit" -p "$property_name" --all) || {
+        printf 'Cannot read systemd property %s for %s.\n' "$property_name" "$property_unit" >&2; exit 1;
+    }
+    case "$property_output" in
+        "$property_name="*) printf '%s\n' "${property_output#*=}" ;;
+        *) printf 'Missing systemd property %s for %s.\n' "$property_name" "$property_unit" >&2; exit 1 ;;
+    esac
+)
 native_service() {
-    local action=$1 installed_root command_path
+    local action=$1 installed_root command_path state
     service_identity || return 1
     if [ "$OS" = linux ]; then
         if [ -f "$DEFINITION" ]; then
-            installed_root=$(systemctl show "$SERVICE_NAME" -p WorkingDirectory --value 2>/dev/null) || return 1
+            installed_root=$(systemd_property "$SERVICE_NAME" WorkingDirectory) || return 1
             [ "$installed_root" = "$ROOT" ] || { printf 'Another installation owns %s\n' "$SERVICE_NAME" >&2; return 1; }
             if [ "$action" = start ]; then privileged systemctl enable "$SERVICE_NAME" && privileged systemctl start "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; return $?; fi
-            privileged systemctl disable --now "$SERVICE_NAME" || return 1
+            privileged systemctl disable "$SERVICE_NAME" && privileged systemctl stop "$SERVICE_NAME" || {
+                printf 'Failed to stop %s; operation incomplete.\n' "$SERVICE_NAME" >&2; return 1;
+            }
+            state=$(systemd_property "$SERVICE_NAME" ActiveState) || return 1
+            case "$state" in inactive|failed) ;; *) printf 'Service %s did not stop (state: %s).\n' "$SERVICE_NAME" "$state" >&2; return 1 ;; esac
         elif [ "$action" = start ]; then printf 'Service definition missing; re-run the installer.\n' >&2; return 1
         elif systemctl is-active --quiet "$SERVICE_NAME"; then printf 'Service ownership cannot be verified.\n' >&2; return 1
         fi
@@ -196,11 +210,14 @@ command_main() {
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     umask 077
+    command_result=0
     if [ -f "$ROOT/bin/account.sh" ]; then
         . "$ROOT/bin/account.sh"
-        account_command "$@"
-        exit $?
+        account_command "$@" || command_result=$?
+    else
+        if init control; then command_main "$@" || command_result=$?;
+        else printf 'Cannot load runner configuration: %s/conf\n' "$ROOT" >&2; command_result=1; fi
     fi
-    init control || exit 1
-    command_main "$@"
+    [ "$command_result" = 0 ] || printf 'ghr %s failed (exit %s); operation incomplete.\n' "${1:-help}" "$command_result" >&2
+    exit "$command_result"
 fi

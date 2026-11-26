@@ -15,8 +15,15 @@ chmod 700 /root /root/builds
 cat > /usr/local/bin/systemctl <<'MOCK'
 #!/bin/sh
 printf '%s\n' "$*" >> /fixture/systemctl-calls
+for argument in "$@"; do
+    case "$argument" in --value|--now) echo "systemctl: unrecognized option $argument" >&2; exit 1 ;; esac
+done
 case "$1" in
-    show) case "$*" in *FragmentPath*) [ ! -f "/etc/systemd/system/$2" ] || echo "/etc/systemd/system/$2" ;; *WorkingDirectory*) sed -n 's/^WorkingDirectory=//p' "/etc/systemd/system/$2" ;; esac ;;
+    show) case "$4" in
+        FragmentPath) printf 'FragmentPath='; [ ! -f "/etc/systemd/system/$2" ] || printf '%s' "/etc/systemd/system/$2"; printf '\n' ;;
+        WorkingDirectory) sed -n '/^WorkingDirectory=/p' "/etc/systemd/system/$2" ;;
+        ActiveState) if [ -f /fixture/active ]; then echo ActiveState=active; else echo ActiveState=inactive; fi ;;
+    esac ;;
     start|restart)
         user=$(sed -n 's/^User=//p' "/etc/systemd/system/$2")
         root=$(sed -n 's/^WorkingDirectory=//p' "/etc/systemd/system/$2")
@@ -24,7 +31,8 @@ case "$1" in
             /bin/bash "$root/bin/service.sh" > /fixture/manager-output 2>&1 &
         echo "$!" > /fixture/launcher.pid
         touch /fixture/active ;;
-    disable)
+    disable) touch /fixture/disabled ;;
+    stop)
         if [ -f /fixture/active ]; then kill -TERM "$(cat /fixture/launcher.pid)"; sleep 3; fi
         rm -f /fixture/active ;;
     is-active) [ -f /fixture/active ] ;;
@@ -176,6 +184,9 @@ ghr logs > /fixture/logs
 assert grep -q 'Started Shell supervisor' /fixture/logs
 ghr stop
 assert test -f "$root/conf/stopped"
+ghr status > /fixture/stopped-status
+assert grep -q 'Manager: stopped' /fixture/stopped-status
+assert test ! -f /fixture/active
 # A forged PID file must never let root management signal an unrelated root process.
 sleep 120 & unrelated=$!
 mark=$(ps -p "$unrelated" -o lstart= | awk '{$1=$1; print}')

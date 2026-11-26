@@ -2,6 +2,16 @@
 # Complete POSIX entry point; safe for curl ... | sh.
 set -eu
 privileged() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
+systemd_property() (
+    property_unit=$1; property_name=$2
+    property_output=$(privileged systemctl show "$property_unit" -p "$property_name" --all) || {
+        printf 'Cannot read systemd property %s for %s.\n' "$property_name" "$property_unit" >&2; exit 1;
+    }
+    case "$property_output" in
+        "$property_name="*) printf '%s\n' "${property_output#*=}" ;;
+        *) printf 'Missing systemd property %s for %s.\n' "$property_name" "$property_unit" >&2; exit 1 ;;
+    esac
+)
 sha256_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 xml() { printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 unit_quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; }
@@ -119,11 +129,14 @@ stop_installed_service() {
     user_id=${runtime_uid:-$(id -u)}
     if [ "$platform" = linux ]; then
         service_name=local-github-runner-$user_id-$arch.service
-        definition_path=$(privileged systemctl show "$service_name" -p FragmentPath --value 2>/dev/null || :)
+        definition_path=$(systemd_property "$service_name" FragmentPath)
         if [ -n "$definition_path" ]; then
-            installed_root=$(privileged systemctl show "$service_name" -p WorkingDirectory --value)
+            installed_root=$(systemd_property "$service_name" WorkingDirectory)
             case "$installed_root" in "$root"|"$root/$arch") ;; *) echo 'Another installation owns this service name.' >&2; exit 1 ;; esac
-            privileged systemctl disable --now "$service_name"
+            privileged systemctl disable "$service_name"
+            privileged systemctl stop "$service_name"
+            installed_state=$(systemd_property "$service_name" ActiveState)
+            case "$installed_state" in inactive|failed) ;; *) printf 'Service %s did not stop (state: %s).\n' "$service_name" "$installed_state" >&2; exit 1 ;; esac
         fi
     else
         service_name=com.suminwell.github-runner.$user_id.$arch

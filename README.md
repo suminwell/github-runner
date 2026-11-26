@@ -37,7 +37,7 @@ root 安装目录及其父目录必须由 root 拥有，且其他用户不能写
 
 Linux 版本须符合 [GitHub 官方支持范围](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#linux)，例如 Ubuntu 20.04+、Debian 10+、RHEL/CentOS/Oracle Linux 8+；新部署建议选择仍在维护的 Ubuntu 24.04、Debian 12 或 RHEL 9。**CentOS 7 不支持**，仅更新 libstdc++ 不能使它满足当前 Runner 和 JavaScript Actions 的要求；需要保留旧业务系统时，可在独立的现代 Linux 主机或虚拟机中部署 Runner。
 
-安装器在提权、创建账户或停止旧服务之前拒绝已知不支持的发行版版本。安装依赖后，还会以实际运行账户执行官方 `Runner.Listener --version` 和包内各个 glibc 版 `node --version`，检查 C++、glibc 和运行环境是否真正可用。检查失败时打印完整的版本缺失错误，退出安装并保留配置供修复后重试，不启用新服务；未知发行版也必须通过二进制运行检查。已有旧系统上的失败安装可用 `ghr stop` 停止重试。
+安装器在提权、创建账户或停止旧服务之前拒绝已知不支持的发行版版本。安装依赖后，还会以实际运行账户执行官方 `Runner.Listener --version` 和包内各个 glibc 版 `node --version`，检查 C++、glibc 和运行环境是否真正可用。检查失败时打印完整的版本缺失错误，退出安装并保留配置供修复后重试，不启用新服务；未知发行版也必须通过二进制运行检查。已有旧系统上的失败安装可用 `ghr stop` 停止重试。Linux 管理命令使用兼容 systemd 219 的属性查询和启停方式，供历史安装停止、卸载使用；新安装仍需满足上述系统要求。
 
 Linux 需要 systemd、glibc、Bash、curl、tar、util-linux 的 `flock`，不支持 Alpine；macOS 使用系统 Bash 3.2、launchd、`shlock`；Windows 使用 Windows PowerShell 5.1 和任务计划程序。无需 Python 或 C# 服务宿主。
 
@@ -88,7 +88,7 @@ ghr uninstall: 卸载runner
 
 - `status`：显示平台和架构、安装目录、Runner 程序目录、当前数据和日志目录、管理进程状态与 PID，并逐组织显示本机 Runner 在 GitHub 上的 `online/offline/missing/unknown`、是否忙碌、本地进程状态及 PID，最后汇总数量。网络或权限失败显示 `unknown`，不会误报离线。本地 `restarting` 表示组织管理进程仍在，但监听进程尚未启动或正在重启。
 - `start`：启动管理服务并启用开机自动启动。已运行时不会重启，也不会提前应用待生效配置。
-- `stop`：关闭自动启动，停止管理服务及各组织的 Runner，保留注册和数据。正在运行的 job 会被中断：Linux/macOS 先发送 TERM，等待官方 Runner 取消 job 并上报（最多 `stop_seconds` 秒）后再强制结束；Windows 直接强制结束。
+- `stop`：关闭自动启动，停止管理服务及各组织的 Runner，保留注册和数据。Linux 会核验原生服务已停止；查询或停止失败会显示错误并返回非零退出码。正在运行的 job 会被中断：Linux/macOS 先发送 TERM，等待官方 Runner 取消 job 并上报（最多 `stop_seconds` 秒）后再强制结束；Windows 直接强制结束。
 - `restart`：先停止再启动，并应用保存的目录配置。
 - `logs`：显示管理日志最后 200 行；`logs -f` 持续跟踪新增日志，日志轮换后继续跟踪，按 Ctrl+C 结束。
 - `config --dir <PATH>` 或 `config -d <PATH>`：等价，设置数据和日志的父目录。`config`、`config --dir`、`config -d` 或路径为 `.` 时使用当前目录。路径包含空格时用引号括起；不支持 `--dir=<PATH>` 写法。
@@ -243,6 +243,7 @@ bash .test/shell.sh
 bash .test/wsl.sh
 bash .test/install-retry.sh
 bash .test/linux-compatibility.sh
+bash .test/systemd-control.sh
 bash .test/uninstall-recovery.sh
 bash .test/status.sh
 # 需要 Docker；只在一次性 Linux 容器内创建账户并验证 root 安装
