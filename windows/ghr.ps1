@@ -8,7 +8,7 @@ ghr start: 启动runner
 ghr stop: 停止runner
 ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
-ghr config --dir <PATH>: 设置data和logs的父目录，默认为当前目录，重启后生效（也支持 --dir=<PATH>）
+ghr config --dir [<PATH>]: 设置data和logs的父目录，默认为当前目录，重启后生效（--dir 可简写为 -d）
 ghr uninstall: 卸载runner
 '@
 }
@@ -184,9 +184,10 @@ if ($Command -ne 'library') {
     Initialize-Manager -Control
     if ($Command -eq 'config') {
         if ($CommandOptions.Count -eq 0) { $directory = '.' }
-        elseif ($CommandOptions.Count -eq 1 -and $CommandOptions[0] -match '^--dir=(.*)$') { $directory = $Matches[1] }
-        elseif ($CommandOptions.Count -eq 2 -and $CommandOptions[0] -ceq '--dir') { $directory = $CommandOptions[1] }
-        else { throw 'Usage: ghr config --dir <PATH> (or --dir=<PATH>)' }
+        elseif ($CommandOptions.Count -le 2 -and ($CommandOptions[0] -ceq '--dir' -or $CommandOptions[0] -ceq '-d')) {
+            $directory = if ($CommandOptions.Count -eq 2) { $CommandOptions[1] } else { '.' }
+        }
+        else { throw 'Usage: ghr config [--dir [<PATH>] | -d [<PATH>]]' }
     } elseif ($Command -eq 'logs') {
         if ($CommandOptions.Count -gt 1 -or ($CommandOptions.Count -eq 1 -and $CommandOptions[0] -ne '-f')) { throw 'Usage: ghr logs [-f]' }
     } elseif ($CommandOptions.Count) { throw 'Invalid arguments. Run ghr help.' }

@@ -264,11 +264,20 @@ RUN
     command_main start
     for attempt in $(seq 1 100); do record_alive "$ROOT/conf/manager.pid" && break; sleep 0.1; done
     assert record_alive "$ROOT/conf/manager.pid"
+    default_work=$FIXTURE/"default work $arch"
+    mkdir -p "$default_work"
+    for flag in --dir -d; do
+        (cd "$default_work" && "$command_path" config "$flag")
+        assert jq -e --arg work "$default_work" '.work_dir==$work' "$ROOT/conf/settings.json"
+    done
     new_work=$FIXTURE/"new work $arch"
-    "$command_path" config "--dir=$new_work-equals"
-    assert jq -e --arg work "$new_work-equals" '.work_dir==$work' "$ROOT/conf/settings.json"
+    "$command_path" config -d "$new_work-short"
+    assert jq -e --arg work "$new_work-short" '.work_dir==$work' "$ROOT/conf/settings.json"
     "$command_path" config --dir "$new_work"
     assert jq -e --arg work "$new_work" '.work_dir==$work' "$ROOT/conf/settings.json"
+    if "$command_path" config "--dir=$new_work-equals" > /dev/null 2>&1; then echo 'Accepted removed --dir= syntax' >&2; exit 1; fi
+    assert jq -e --arg work "$new_work" '.work_dir==$work' "$ROOT/conf/settings.json"
+    assert test ! -e "$new_work-equals"
     assert test "$(cat "$ROOT/conf/active-work-dir")" = "$ROOT"
     (command_main restart)
     for attempt in $(seq 1 100); do

@@ -258,10 +258,23 @@ try {
             $deadline = [DateTime]::UtcNow.AddSeconds(15)
             while ($null -eq (Get-RecordedProcess (Join-Path $testRoot 'conf\manager.json')) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
             Assert ($script:TaskEnabled) 'start enables startup'
-            & $launcher config "--dir=$newWork-equals"
-            Assert ($LASTEXITCODE -eq 0 -and (Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq "$newWork-equals") 'public --dir= syntax'
+            $defaultWork = Join-Path $fixture "default work $arch"
+            New-Item -ItemType Directory -Path $defaultWork | Out-Null
+            Push-Location $defaultWork
+            try {
+                foreach ($flag in @('--dir','-d')) {
+                    & $launcher config $flag
+                    Assert ($LASTEXITCODE -eq 0 -and (Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq $defaultWork) 'omitted path uses current directory'
+                }
+            } finally { Pop-Location }
+            & $launcher config -d "$newWork-short"
+            Assert ($LASTEXITCODE -eq 0 -and (Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq "$newWork-short") 'public -d syntax with spaces in path'
             & $launcher config --dir $newWork
             Assert ($LASTEXITCODE -eq 0 -and (Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq $newWork) 'public --dir space syntax with spaces in path'
+            $failed = $false
+            try { $null = Invoke-Native $script:PowerShell @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $testRoot 'bin\ghr.ps1'),'config',"--dir=$newWork-equals") } catch { $failed = $true }
+            Assert ($failed -and -not (Test-Path "$newWork-equals")) 'removed --dir= syntax rejected without creating directory'
+            Assert ((Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq $newWork) 'invalid syntax leaves configuration unchanged'
             Assert ((Get-Content -Raw -Encoding UTF8 (Join-Path $testRoot 'conf\active-work-dir')) -eq $testRoot) 'configuration remains pending'
             Stop-Installation; Start-Installation
             $deadline = [DateTime]::UtcNow.AddSeconds(15)
