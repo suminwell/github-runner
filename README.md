@@ -59,7 +59,7 @@ ghr wsl setup
 
 `ghr wsl setup` 更新凭据会保留已有的停止状态。想主动关闭 WSL 时应先执行 `ghr stop`，否则启用中的宿主任务会在下一次检查时重新拉起发行版。
 
-实现依据：[微软 WSL systemd 说明](https://learn.microsoft.com/en-us/windows/wsl/systemd)、[WSL 发行版按 Windows 用户隔离](https://learn.microsoft.com/en-us/windows/wsl/setup/environment)。自动测试使用临时文件和模拟任务计划程序；真实 WSL 无人登录重启仍需在目标 Windows 主机验证。
+实现依据：[微软 WSL systemd 说明](https://learn.microsoft.com/en-us/windows/wsl/systemd)、[WSL 发行版按 Windows 用户隔离](https://learn.microsoft.com/en-us/windows/wsl/setup/environment)。自动测试覆盖临时文件、模拟任务管理，以及 Windows 上禁用的临时任务的参数回读和真实权限接口，测试后删除任务；不会启动真实 WSL，真实 WSL 无人登录重启仍需在目标 Windows 主机验证。
 
 ## 管理命令
 

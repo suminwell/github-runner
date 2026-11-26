@@ -10,6 +10,7 @@ cleanup() {
         stop_record "$ROOT/conf/manager.pid" 2>/dev/null || :
         [ ! -f "$FIXTURE/follower.pid" ] || stop_record "$FIXTURE/follower.pid" 2>/dev/null || :
         for id in 1 2 3 4 5 6 7; do stop_worker "$id" 2>/dev/null || :; done
+        for record in "$FIXTURE/watchdog-records/"*.pid; do stop_record "$record" 2>/dev/null || :; done
     fi
     if [ "${TEST_FAILED:-1}" = 0 ]; then rm -rf "$FIXTURE"; else printf "Retained fixture: %s\n" "$FIXTURE"; fi
 }
@@ -210,6 +211,32 @@ RUN
     GH=$real_gh
     assert grep -q 'gh api orgs/denied/actions/runners failed (exit 1): HTTP 403: Must have admin rights' "$FIXTURE/api-error"
     if grep -q secret-test-token "$FIXTURE/api-error"; then echo 'api leaked the token' >&2; exit 1; fi
+    # Rapid failures race watchdog initialization and cancellation. Track real sleeper
+    # PIDs/start times so orphaned timers are detected, even after they lose their parent.
+    (
+        export REAL_SLEEP=$(command -v sleep) FAKE_WATCHDOG_DIR=$FIXTURE/watchdog-records
+        mkdir -p "$FIXTURE/watchdog-bin" "$FAKE_WATCHDOG_DIR"
+        cat > "$FIXTURE/watchdog-bin/sleep" <<'SLEEP'
+#!/bin/sh
+mark=$(ps -p "$$" -o lstart= | awk '{$1=$1; print}')
+printf '%s\n%s\n' "$$" "$mark" > "$FAKE_WATCHDOG_DIR/$$.pid"
+exec "$REAL_SLEEP" "$@"
+SLEEP
+        chmod +x "$FIXTURE/watchdog-bin/sleep"
+        export PATH=$FIXTURE/watchdog-bin:$PATH
+        GH=$FIXTURE/failing-gh
+        for attempt in $(seq 1 32); do
+            if api 'orgs/denied/actions/runners?per_page=1' 2> "$FIXTURE/api-error" >/dev/null; then exit 1; else status=$?; fi
+            assert test "$status" = 1
+            assert grep -q 'gh api orgs/denied/actions/runners failed (exit 1): HTTP 403: Must have admin rights' "$FIXTURE/api-error"
+            assert test "$(wc -l < "$FIXTURE/api-error" | tr -d ' ')" = 1
+            assert with_timeout 30 true
+        done
+        "$REAL_SLEEP" 0.2
+        for record in "$FAKE_WATCHDOG_DIR/"*.pid; do
+            if record_alive "$record"; then echo 'A cancelled watchdog left its sleeper running' >&2; exit 1; fi
+        done
+    )
     # Stopping waits for a graceful exit, and forces processes that ignore TERM.
     bash -c 'trap "sleep 1; echo graceful > \"$1\"; exit 0" TERM; while :; do sleep 0.1; done' _ "$FIXTURE/graceful" &
     record_pid "$FIXTURE/graceful.pid" "$!"

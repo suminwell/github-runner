@@ -26,7 +26,14 @@ if ($env:OS -eq 'Windows_NT') {
         $readback = Get-ScheduledTask -TaskName $name
         Assert ($readback.Actions[0].Arguments -ceq $script:HoldArguments) 'native task action quoting round trip'
         Assert ((Resolve-WindowsSid $readback.Principal.UserId) -eq $script:Owner.Sid -and "$($readback.Principal.RunLevel)" -eq 'Limited') 'native principal readback'
-        Assert ($task.GetSecurityDescriptor(4).Contains($script:Owner.Sid)) 'native task grants owning user access'
+        $sddl = $task.GetSecurityDescriptor(4)
+        $descriptor = New-Object Security.AccessControl.RawSecurityDescriptor($sddl)
+        $ownerAccess = @($descriptor.DiscretionaryAcl | Where-Object {
+            $_.AceQualifier -eq [Security.AccessControl.AceQualifier]::AccessAllowed -and
+            $_.SecurityIdentifier.Value -eq $script:Owner.Sid -and
+            (($_.AccessMask -band 0x1f01ff) -eq 0x1f01ff -or ($_.AccessMask -band 0x10000000) -ne 0)
+        })
+        Assert ($ownerAccess.Count -gt 0) "native task grants owning user full access: $sddl"
     } finally { if ($nativeRegistered) { $folder.DeleteTask($name, 0) } }
     Write-Host 'PASS native Windows task definition, action round trip, principal SID and task ACL'
 }

@@ -44,57 +44,63 @@ init() {
 # stragglers) are terminated the same way, so nothing keeps the caller's output pipe or
 # inherits the manager lock (fd 9). A live group keeps its ID from being reused as a PID,
 # and the deadline signals the group only while the leader's PID and start time match.
-with_timeout() {
-    local seconds=$1 leader mark watchdog status fired waited monitor= record=
+# Only the command writes to the caller's stderr (passed in as fd 7). The plumbing runs
+# with stderr discarded: the shell reports jobs that die from a signal ("Terminated")
+# on its own stderr at a time of its choosing, and those notices must never mix into a
+# captured error message.
+with_timeout() { timeout_plumbing "$@" 7>&2 2>/dev/null; }
+timeout_plumbing() {
+    local seconds=$1 leader mark watchdog status waited monitor= record=
     shift
     case $- in *m*) monitor=1 ;; esac
     set -m
     (
         set +m
         exec 9>&-
-        trap ':' TERM
-        "$@" &
+        # Return the timeout status immediately; the parent gives descendants their
+        # TERM grace period before forcing the rest of this group to exit.
+        trap 'exit 124' TERM
+        "$@" 2>&7 7>&- &
         child=$!
+        exec 7>&-
         while :; do
             wait "$child"; status=$?
-            kill -0 "$child" 2>/dev/null || break
+            kill -0 "$child" || break
         done
         # A wait interrupted by TERM reports the signal, not the result; ask again.
         [ "$status" -le 128 ] || { wait "$child"; status=$?; }
         exit "$status"
     ) &
     leader=$!
-    [ -n "$monitor" ] || set +m
     mark=$(stamp "$leader")
     # The manager's shutdown and ghr stop find in-flight commands through these records.
     if [ -n "$mark" ] && [ -d "$ROOT/conf/timeouts" ]; then
         record=$ROOT/conf/timeouts/$leader.pid
-        printf '%s\n%s\n' "$leader" "$mark" > "$record" 2>/dev/null || record=
+        printf '%s\n%s\n' "$leader" "$mark" > "$record" || record=
     fi
+    # Give the watchdog and its sleep a separate group so both can be cancelled together.
     (
-        exec 9>&-
-        sleeper= fired=0
-        # Cancelled during the grace period still reports that the deadline fired.
-        trap '[ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null; exit "$fired"' TERM
-        sleep "$seconds" & sleeper=$!; wait "$sleeper"; sleeper=
+        set +m
+        exec 9>&- 7>&-
+        sleep "$seconds" & wait "$!"
         [ -n "$mark" ] && process_alive "$leader" "$mark" || exit 0
-        fired=124
-        kill -TERM -- "-$leader" 2>/dev/null
-        sleep 2 & sleeper=$!; wait "$sleeper"; sleeper=
-        ! process_alive "$leader" "$mark" || kill -KILL -- "-$leader" 2>/dev/null
-        exit 124
-    ) </dev/null >/dev/null 2>&1 &
+        kill -TERM -- "-$leader"
+    ) </dev/null >/dev/null &
     watchdog=$!
+    [ -n "$monitor" ] || set +m
     wait "$leader"; status=$?
-    if kill -0 -- "-$leader" 2>/dev/null; then
-        kill -TERM -- "-$leader" 2>/dev/null
+    if kill -0 -- "-$leader"; then
+        kill -TERM -- "-$leader"
         waited=0
-        while [ "$waited" -lt 20 ] && kill -0 -- "-$leader" 2>/dev/null; do sleep 0.1; waited=$((waited + 1)); done
-        kill -KILL -- "-$leader" 2>/dev/null
+        while [ "$waited" -lt 20 ] && kill -0 -- "-$leader"; do sleep 0.1; waited=$((waited + 1)); done
+        kill -KILL -- "-$leader"
     fi
-    kill -TERM "$watchdog" 2>/dev/null; wait "$watchdog"; fired=$?
+    # Cancellation must not depend on a trap that may still be initializing. Kill the
+    # watchdog itself, reap it, then sweep its group for a concurrently forked sleep.
+    kill -KILL "$watchdog" || :
+    wait "$watchdog" || :
+    kill -KILL -- "-$watchdog" || :
     [ -z "$record" ] || rm -f "$record"
-    [ "$fired" != 124 ] || status=124
     return "$status"
 }
 # Last non-blank line of $1, with every occurrence of $2 masked before truncation, so a
