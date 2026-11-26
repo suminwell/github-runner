@@ -27,7 +27,7 @@ install_cli() {
     cli_contents > "$temporary"
     privileged mkdir -p "$(dirname "$destination")" && privileged install -m 755 "$temporary" "$destination" || { rm -f "$temporary"; return 1; }
     rm -f "$temporary"
-    "$JQ" --arg path "$destination" '.command_path=$path' "$ROOT/conf/settings.json" | atomic "$ROOT/conf/settings.json"
+    jq_update "$ROOT/conf/settings.json" --arg path "$destination" '.command_path=$path'
 }
 service_identity() {
     OWNER_UID=$("$JQ" -er '.owner_uid' "$ROOT/conf/settings.json") || return 1
@@ -64,11 +64,10 @@ native_service() {
     fi
 }
 stop_processes() {
-    local record
     stop_record "$ROOT/conf/manager.pid"
-    acquire_lock || { printf 'Manager is still running.\n' >&2; return 1; }
+    wait_for_lock || { printf 'Manager is still running.\n' >&2; return 1; }
     trap 'if [ "$OS" = macos ]; then rm -f "$ROOT/conf/service.lock"; fi' EXIT
-    for record in "$ROOT"/conf/workers/*.pid "$ROOT"/conf/children/*.pid; do [ ! -f "$record" ] || stop_record "$record"; done
+    stop_records "$ROOT"/conf/workers/*.pid "$ROOT"/conf/children/*.pid "$ROOT"/conf/timeouts/*.pid
 }
 stop_installation() {
     native_service stop || return 1
@@ -95,7 +94,7 @@ configure_directory() {
     absolute=$(cd "$requested" && pwd -P) || return 1
     case "$absolute" in "$ROOT/bin"|"$ROOT/bin/"*|"$ROOT/conf"|"$ROOT/conf/"*|"$ROOT/runner"|"$ROOT/runner/"*) printf 'Data must be outside the program and state directories.\n' >&2; return 1 ;; esac
     mkdir -p "$absolute/data" "$absolute/logs" || return 1
-    "$JQ" --arg directory "$absolute" '.work_dir=$directory' "$ROOT/conf/settings.json" | atomic "$ROOT/conf/settings.json" || return 1
+    jq_update "$ROOT/conf/settings.json" --arg directory "$absolute" '.work_dir=$directory' || return 1
     printf 'Work directory saved: %s\nRun ghr restart (or stop then start) to apply. Existing data and logs are not moved.\n' "$absolute"
 }
 show_logs() {
@@ -120,7 +119,7 @@ unregister_runners() {
         if printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" 'any(.[]; .id==$id)' >/dev/null; then
             if ! api "orgs/$login/actions/runners/$runner_id" --method DELETE >/dev/null; then printf 'Cannot unregister %s/%s; retry uninstall.\n' "$login" "$runner_id" >&2; failed=1; continue; fi
         fi
-        "$JQ" --arg id "$id" 'del(.[$id])' "$ROOT/conf/organizations.json" | atomic "$ROOT/conf/organizations.json" || return 1
+        jq_update "$ROOT/conf/organizations.json" --arg id "$id" 'del(.[$id])' || return 1
     done < <("$JQ" -r 'to_entries[]|[.key,.value.login,.value.runner_id]|@tsv' "$ROOT/conf/organizations.json")
     return "$failed"
 }
@@ -135,7 +134,6 @@ uninstall() {
         privileged rm -f "$command_path" || return 1
     fi
     rm -rf "$ROOT/runner" "$ROOT/bin" "$ROOT/conf" || return 1
-    rm -f "$ROOT/bin/install.sh" "$ROOT/bin/service.sh" "$ROOT/bin/ghr.sh" || return 1
     printf 'Runner uninstalled. Data and logs retained in their original directories. Configured directory: %s\n' "$WORK_DIR"
 }
 command_main() {

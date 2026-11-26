@@ -4,6 +4,47 @@ set -eu
 sha256_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 xml() { printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 unit_quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; }
+# systemd unquotes Environment= and ExecStart=, but rejects a quoted WorkingDirectory=.
+systemd_unit() {
+    exec_path=$(unit_quote "$4/bin/service.sh" | sed 's/\$/$$/g')
+    cat <<UNIT
+[Unit]
+Description=GitHub organization runner supervisor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+User=$1
+WorkingDirectory=$(printf '%s' "$4" | sed 's/%/%%/g')
+Environment="HOME=$(unit_quote "$2")"
+Environment="PATH=$(unit_quote "$3")"
+ExecStart=/bin/bash "$exec_path"
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=90
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+launchd_plist() {
+    cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$(xml "$1")</string>
+<key>UserName</key><string>$(xml "$2")</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>$(xml "$5/bin/service.sh")</string></array>
+<key>WorkingDirectory</key><string>$(xml "$5")</string>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><false/>
+<key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>90</integer>
+<key>EnvironmentVariables</key><dict><key>HOME</key><string>$(xml "$3")</string><key>PATH</key><string>$(xml "$4")</string></dict>
+<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string>
+</dict></plist>
+PLIST
+}
 fetch() {
     if [ -n "${LOCAL_RUNNER_SOURCE_DIR:-}" ]; then cp "$LOCAL_RUNNER_SOURCE_DIR/$1" "$2.new";
     else curl -fsSL --connect-timeout 15 --max-time 120 "$base/$1" -o "$2.new"; fi
@@ -12,6 +53,31 @@ fetch() {
 detect_architecture() {
     case "$(uname -m)" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) echo 'Only x64/arm64 are supported.' >&2; return 1 ;; esac
     if [ "$platform" = macos ] && [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || :)" = 1 ]; then arch=arm64; fi
+}
+is_wsl() {
+    [ -n "${WSL_DISTRO_NAME:-}${WSL_INTEROP:-}" ] || uname -r | grep -qi microsoft
+}
+systemd_running() { [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; }
+check_linux_host() {
+    if is_wsl; then
+        case "$(uname -r | tr '[:upper:]' '[:lower:]')" in
+            *microsoft-standard*|*wsl2*) ;;
+            *microsoft*) echo 'WSL1 is unsupported. Convert this distribution to WSL2 using wsl --set-version <distribution> 2 in Windows.' >&2; return 1 ;;
+        esac
+        if ! systemd_running; then
+            cat >&2 <<'WSL'
+WSL2 requires systemd before installing ghr. Update WSL in Windows with wsl --update.
+Merge the following into /etc/wsl.conf, preserving its other settings:
+[boot]
+systemd=true
+Then save your work, restart this distribution from Windows and retry installation.
+No host settings have been changed by this installer.
+WSL
+            return 1
+        fi
+    elif ! systemd_running; then
+        echo 'Linux must be booted with systemd before installing ghr.' >&2; return 1
+    fi
 }
 stop_installed_service() {
     user_id=$(id -u)
@@ -65,6 +131,7 @@ install_main() {
     case "$platform:$(uname -s)" in linux:Linux|macos:Darwin) ;; *) echo 'Incorrect platform installer' >&2; exit 1 ;; esac
     detect_architecture
     if [ "${1:-auto}" != auto ] && [ "$1" != "$arch" ]; then echo "Architecture mismatch: requested $1, host $arch" >&2; exit 1; fi
+    check_linux_host
     [ "$(id -u)" -ne 0 ] || { echo 'Use a normal user; sudo is used for system setup.' >&2; exit 1; }
     sudo -v
     if ! command -v jq >/dev/null 2>&1; then
@@ -169,6 +236,8 @@ install_main() {
     fetch "$platform/service.sh" "$root/bin/service.sh"
     fetch "$platform/ghr.sh" "$root/bin/ghr.sh"
     fetch "$platform/runner.sh" "$root/bin/runner.sh"
+    fetch 'linux/wsl.sh' "$root/bin/wsl.sh"
+    fetch 'linux/wsl.ps1' "$root/bin/wsl.ps1"
     chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh"
     /bin/bash "$root/bin/service.sh" prepare
     if [ "$platform" = linux ]; then sudo /bin/bash "$root/bin/.cache/package/bin/installdependencies.sh"; fi
@@ -182,28 +251,7 @@ install_main() {
     if [ "$platform" = linux ]; then
         [ -d /run/systemd/system ] || { echo 'Linux must be booted with systemd.' >&2; rm -f "$definition"; exit 1; }
         service_name=local-github-runner-$user_id-$arch.service
-        exec_path=$(unit_quote "$root/bin/service.sh" | sed 's/\$/$$/g')
-        cat > "$definition" <<UNIT
-[Unit]
-Description=GitHub organization runner supervisor
-Wants=network-online.target
-After=network-online.target
-StartLimitIntervalSec=0
-[Service]
-Type=simple
-User=$user
-WorkingDirectory="$(unit_quote "$root")"
-Environment="HOME=$(unit_quote "$HOME")"
-Environment="PATH=$(unit_quote "$PATH")"
-ExecStart=/bin/bash "$exec_path"
-Restart=always
-RestartSec=10
-KillMode=control-group
-TimeoutStopSec=90
-UMask=0077
-[Install]
-WantedBy=multi-user.target
-UNIT
+        systemd_unit "$user" "$HOME" "$PATH" "$root" > "$definition"
         sudo install -m 644 "$definition" "/etc/systemd/system/$service_name"
         sudo systemctl daemon-reload
         sudo systemctl enable "$service_name"
@@ -211,20 +259,7 @@ UNIT
         sudo systemctl is-active --quiet "$service_name"
     else
         service_name=com.suminwell.github-runner.$user_id.$arch
-        cat > "$definition" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>$service_name</string>
-<key>UserName</key><string>$(xml "$user")</string>
-<key>ProgramArguments</key><array><string>/bin/bash</string><string>$(xml "$root/bin/service.sh")</string></array>
-<key>WorkingDirectory</key><string>$(xml "$root")</string>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><false/>
-<key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>90</integer>
-<key>EnvironmentVariables</key><dict><key>HOME</key><string>$(xml "$HOME")</string><key>PATH</key><string>$(xml "$PATH")</string></dict>
-<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string>
-</dict></plist>
-PLIST
+        launchd_plist "$service_name" "$user" "$HOME" "$PATH" "$root" > "$definition"
         sudo launchctl bootout "system/$service_name" 2>/dev/null || :
         sudo install -o root -g wheel -m 644 "$definition" "/Library/LaunchDaemons/$service_name.plist"
         sudo launchctl enable "system/$service_name"
@@ -235,6 +270,11 @@ PLIST
     printf '\nInstalled %s\n\n' "$service_name"
     /bin/bash "$root/bin/ghr.sh" help
     case ":$PATH:" in *:/usr/local/bin:*) ;; *) printf '\nAdd /usr/local/bin to PATH: export PATH="/usr/local/bin:$PATH"\n' ;; esac
+    if is_wsl; then
+        printf '\nWSL: configuring Windows boot startup through Windows interoperability.\n'
+        printf 'Accept the local Windows elevation prompt and enter your Windows account password (not a PIN).\n'
+        /bin/bash "$root/bin/wsl.sh" setup || { printf 'Linux runner installed, but Windows boot startup is incomplete. Run ghr wsl setup to retry.\n' >&2; return 1; }
+    fi
 }
 if [ -t 0 ]; then install_main "$@";
 elif ( : < /dev/tty ) 2>/dev/null; then install_main "$@" < /dev/tty;

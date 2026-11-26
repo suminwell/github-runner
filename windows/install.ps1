@@ -40,6 +40,24 @@ function Move-PreviousLayout([string]$InstallRoot, [string]$Arch) {
         }
     }
 }
+function Grant-ServiceWrite([string]$Directory) {
+    $item = Get-Item -LiteralPath $Directory
+    $acl = $item.GetAccessControl('Access')
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-5-19')), 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+    $item.SetAccessControl($acl)
+}
+function Protect-AdminFile([string]$Path) {
+    # Keep the inherited owners, but LocalService may only read this file.
+    $item = Get-Item -LiteralPath $Path
+    $acl = $item.GetAccessControl('Access')
+    $acl.SetAccessRuleProtection($true, $true)
+    $item.SetAccessControl($acl)
+    $acl = $item.GetAccessControl('Access')
+    $service = New-Object Security.Principal.SecurityIdentifier('S-1-5-19')
+    $acl.PurgeAccessRules($service)
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($service, 'ReadAndExecute', 'Allow')))
+    $item.SetAccessControl($acl)
+}
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
@@ -86,13 +104,15 @@ if (-not $knownInstallation) {
 }
 $bin = Join-Path $installRoot 'bin'; $state = Join-Path $installRoot 'conf'; $legacy = Join-Path $installRoot $arch
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+# Jobs run as LocalService, while Administrator commands execute bin\ and trust conf\ settings.
+# LocalService may read the whole tree but writes only runtime state (granted below).
 $acl = New-Object Security.AccessControl.DirectorySecurity
 $acl.SetAccessRuleProtection($true, $false)
 foreach ($sid in @('S-1-5-18','S-1-5-32-544',$identity.User.Value)) {
     $rule = New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($sid)), 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
     $acl.AddAccessRule($rule)
 }
-$rule = New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-5-19')), 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
+$rule = New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier('S-1-5-19')), 'ReadAndExecute', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
 $acl.AddAccessRule($rule)
 Set-Acl -LiteralPath $installRoot -AclObject $acl
 $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -114,18 +134,27 @@ if ($oldService) {
     & sc.exe delete $taskName | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Could not remove the previous service host.' }
 }
-$previousScript = if ($migrate) { Join-Path $legacy 'bin\service.ps1' } elseif (Test-Path (Join-Path $bin 'service.ps1')) { Join-Path $bin 'service.ps1' } else { Join-Path $installRoot 'service.ps1' }
-if (Test-Path -LiteralPath $previousScript) {
-    & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $previousScript -Mode Stop
-    if ($LASTEXITCODE -ne 0) { throw 'Could not stop existing runner processes; installation left unchanged.' }
-}
-Move-PreviousLayout $installRoot $arch
-New-Item -ItemType Directory -Force -Path $bin, $state, (Join-Path $bin 'tools'), (Join-Path $bin '.cache'), (Join-Path $installRoot 'runner') | Out-Null
 function Get-SourceFile([string]$Source, [string]$Destination) {
     if ($env:LOCAL_RUNNER_SOURCE_DIR) { Copy-Item -LiteralPath (Join-Path $env:LOCAL_RUNNER_SOURCE_DIR $Source) -Destination "$Destination.new" -Force }
     else { Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 "$base/$Source" -OutFile "$Destination.new" }
     Move-Item -LiteralPath "$Destination.new" -Destination $Destination -Force
 }
+# Earlier releases let LocalService modify bin\, so never execute the installed copy as
+# Administrator: stop existing processes with the new script from an admin-only location.
+$stateDirectories = @((Join-Path $installRoot 'conf'), (Join-Path $installRoot '.state'), (Join-Path $legacy 'conf'), (Join-Path $legacy '.state')) | Where-Object { Test-Path -LiteralPath $_ }
+if (@($stateDirectories).Count) {
+    $stopScript = Join-Path ([IO.Path]::GetTempPath()) ('local-github-runner-stop-' + [Guid]::NewGuid().ToString('N') + '.ps1')
+    try {
+        Get-SourceFile 'windows/service.ps1' $stopScript
+        foreach ($stateDirectory in $stateDirectories) {
+            & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $stopScript -Mode Stop -Root $installRoot -StateDir $stateDirectory
+            if ($LASTEXITCODE -ne 0) { throw 'Could not stop existing runner processes; installation left unchanged.' }
+        }
+    } finally { Remove-Item -LiteralPath $stopScript -Force -ErrorAction SilentlyContinue }
+}
+Move-PreviousLayout $installRoot $arch
+New-Item -ItemType Directory -Force -Path $bin, $state, (Join-Path $bin 'tools'), (Join-Path $bin '.cache'), (Join-Path $installRoot 'runner') | Out-Null
+foreach ($writable in @($state, (Join-Path $bin '.cache'), (Join-Path $installRoot 'runner'))) { Grant-ServiceWrite $writable }
 $ghPath = Join-Path $bin 'tools\gh.exe'
 $existing = Get-Command gh -ErrorAction SilentlyContinue
 $usable = $false
@@ -160,7 +189,8 @@ if ($LASTEXITCODE -ne 0) {
 $token = if ($env:GH_TOKEN) { $env:GH_TOKEN } elseif ($env:GITHUB_TOKEN) { $env:GITHUB_TOKEN } else { & $ghPath auth token --hostname github.com }
 if (-not $token) { throw 'No GitHub credential available.' }
 [IO.File]::WriteAllText((Join-Path $state 'github-token'), $token.Trim(), (New-Object Text.UTF8Encoding($false)))
-[IO.File]::WriteAllText((Join-Path $state 'gh-path'), $ghPath, (New-Object Text.UTF8Encoding($false)))
+# The service always runs bin\tools\gh.exe; a path stored in writable state is no longer trusted.
+Remove-Item (Join-Path $state 'gh-path') -Force -ErrorAction SilentlyContinue
 $settingsPath = Join-Path $state 'settings.json'
 $settings = @{}
 $defaultWork = (Get-Location).ProviderPath
@@ -175,6 +205,7 @@ if (-not $settings.ContainsKey('poll_seconds')) { $settings.poll_seconds = 300 }
 if (-not $settings.ContainsKey('restart_seconds')) { $settings.restart_seconds = 30 }
 if (-not $settings.ContainsKey('organizations')) { $settings.organizations = @() }
 [IO.File]::WriteAllText($settingsPath, ($settings | ConvertTo-Json -Depth 20), (New-Object Text.UTF8Encoding($false)))
+foreach ($trusted in @('github-token','settings.json')) { Protect-AdminFile (Join-Path $state $trusted) }
 Get-SourceFile 'windows/install.ps1' (Join-Path $bin 'install.ps1')
 Get-SourceFile 'windows/service.ps1' (Join-Path $bin 'service.ps1')
 Get-SourceFile 'windows/ghr.ps1' (Join-Path $bin 'ghr.ps1')

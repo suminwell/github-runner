@@ -4,6 +4,47 @@ set -eu
 sha256_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 xml() { printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 unit_quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; }
+# systemd unquotes Environment= and ExecStart=, but rejects a quoted WorkingDirectory=.
+systemd_unit() {
+    exec_path=$(unit_quote "$4/bin/service.sh" | sed 's/\$/$$/g')
+    cat <<UNIT
+[Unit]
+Description=GitHub organization runner supervisor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+[Service]
+Type=simple
+User=$1
+WorkingDirectory=$(printf '%s' "$4" | sed 's/%/%%/g')
+Environment="HOME=$(unit_quote "$2")"
+Environment="PATH=$(unit_quote "$3")"
+ExecStart=/bin/bash "$exec_path"
+Restart=always
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=90
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+launchd_plist() {
+    cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$(xml "$1")</string>
+<key>UserName</key><string>$(xml "$2")</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>$(xml "$5/bin/service.sh")</string></array>
+<key>WorkingDirectory</key><string>$(xml "$5")</string>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><false/>
+<key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>90</integer>
+<key>EnvironmentVariables</key><dict><key>HOME</key><string>$(xml "$3")</string><key>PATH</key><string>$(xml "$4")</string></dict>
+<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string>
+</dict></plist>
+PLIST
+}
 fetch() {
     if [ -n "${LOCAL_RUNNER_SOURCE_DIR:-}" ]; then cp "$LOCAL_RUNNER_SOURCE_DIR/$1" "$2.new";
     else curl -fsSL --connect-timeout 15 --max-time 120 "$base/$1" -o "$2.new"; fi
@@ -182,28 +223,7 @@ install_main() {
     if [ "$platform" = linux ]; then
         [ -d /run/systemd/system ] || { echo 'Linux must be booted with systemd.' >&2; rm -f "$definition"; exit 1; }
         service_name=local-github-runner-$user_id-$arch.service
-        exec_path=$(unit_quote "$root/bin/service.sh" | sed 's/\$/$$/g')
-        cat > "$definition" <<UNIT
-[Unit]
-Description=GitHub organization runner supervisor
-Wants=network-online.target
-After=network-online.target
-StartLimitIntervalSec=0
-[Service]
-Type=simple
-User=$user
-WorkingDirectory="$(unit_quote "$root")"
-Environment="HOME=$(unit_quote "$HOME")"
-Environment="PATH=$(unit_quote "$PATH")"
-ExecStart=/bin/bash "$exec_path"
-Restart=always
-RestartSec=10
-KillMode=control-group
-TimeoutStopSec=90
-UMask=0077
-[Install]
-WantedBy=multi-user.target
-UNIT
+        systemd_unit "$user" "$HOME" "$PATH" "$root" > "$definition"
         sudo install -m 644 "$definition" "/etc/systemd/system/$service_name"
         sudo systemctl daemon-reload
         sudo systemctl enable "$service_name"
@@ -211,20 +231,7 @@ UNIT
         sudo systemctl is-active --quiet "$service_name"
     else
         service_name=com.suminwell.github-runner.$user_id.$arch
-        cat > "$definition" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>$service_name</string>
-<key>UserName</key><string>$(xml "$user")</string>
-<key>ProgramArguments</key><array><string>/bin/bash</string><string>$(xml "$root/bin/service.sh")</string></array>
-<key>WorkingDirectory</key><string>$(xml "$root")</string>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><false/>
-<key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>90</integer>
-<key>EnvironmentVariables</key><dict><key>HOME</key><string>$(xml "$HOME")</string><key>PATH</key><string>$(xml "$PATH")</string></dict>
-<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string>
-</dict></plist>
-PLIST
+        launchd_plist "$service_name" "$user" "$HOME" "$PATH" "$root" > "$definition"
         sudo launchctl bootout "system/$service_name" 2>/dev/null || :
         sudo install -o root -g wheel -m 644 "$definition" "/Library/LaunchDaemons/$service_name.plist"
         sudo launchctl enable "system/$service_name"

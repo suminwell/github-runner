@@ -6,6 +6,12 @@ OS=linux
 SERVICE_FILE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 ROOT=${LOCAL_RUNNER_ROOT:-$(cd "$(dirname "$SERVICE_FILE")/.." && pwd)}
 atomic() { local target=$1; cat > "$target.tmp.$$" && chmod 600 "$target.tmp.$$" && mv -f "$target.tmp.$$" "$target"; }
+# Rewrite JSON in place only when jq succeeds; a failed or truncated run keeps the original.
+jq_update() {
+    local target=$1; shift
+    if "$JQ" "$@" "$target" > "$target.tmp.$$" && [ -s "$target.tmp.$$" ] && chmod 600 "$target.tmp.$$" && mv -f "$target.tmp.$$" "$target"; then return 0; fi
+    rm -f "$target.tmp.$$"; return 1
+}
 log() {
     if [ -f "$LOG_DIR/service.log" ] && [ "$(wc -c < "$LOG_DIR/service.log")" -gt 5242880 ]; then
         mv -f "$LOG_DIR/service.log.2" "$LOG_DIR/service.log.3" 2>/dev/null || :
@@ -24,11 +30,92 @@ init() {
     DATA_DIR=$WORK_DIR/data; LOG_DIR=$WORK_DIR/logs
     POLL=$("$JQ" -r '.poll_seconds // 300 | if . < 10 then 10 else . end | floor' "$ROOT/conf/settings.json")
     RESTART=$("$JQ" -r '.restart_seconds // 30 | if . < 1 then 1 else . end | floor' "$ROOT/conf/settings.json")
-    mkdir -p "$ROOT/bin/.cache" "$ROOT/conf/workers" "$ROOT/conf/children" "$ROOT/conf/paused" "$ROOT/conf/retry"
+    # Below the 90 s systemd/launchd stop timeout, so a graceful stop is never cut short.
+    STOP_GRACE=$("$JQ" -r '.stop_seconds // 30 | if . < 1 then 1 elif . > 60 then 60 else . end | floor' "$ROOT/conf/settings.json")
+    mkdir -p "$ROOT/bin/.cache" "$ROOT/conf/workers" "$ROOT/conf/children" "$ROOT/conf/paused" "$ROOT/conf/retry" "$ROOT/conf/backoff" "$ROOT/conf/timeouts"
     [ "${1:-runtime}" = control ] || mkdir -p "$LOG_DIR"
     [ -f "$ROOT/conf/organizations.json" ] || printf '{}\n' | atomic "$ROOT/conf/organizations.json"
 }
-api() { GH_TOKEN=$(cat "$ROOT/conf/github-token") GH_HOST=github.com GH_PROMPT_DISABLED=1 "$GH" api --hostname github.com "$@" 2>/dev/null; }
+# Run "$@" bounded by $1 seconds; returns its status, or 124 when the deadline fired.
+# The command runs under a leader in its own process group, so the deadline (TERM, then
+# KILL after a grace period) reaches every descendant, including reparented ones; only a
+# process that creates its own session or group escapes. After the leader is reaped, any
+# remaining group members (a timed-out tree, or a finished command's background
+# stragglers) are terminated the same way, so nothing keeps the caller's output pipe or
+# inherits the manager lock (fd 9). A live group keeps its ID from being reused as a PID,
+# and the deadline signals the group only while the leader's PID and start time match.
+with_timeout() {
+    local seconds=$1 leader mark watchdog status fired waited monitor= record=
+    shift
+    case $- in *m*) monitor=1 ;; esac
+    set -m
+    (
+        set +m
+        exec 9>&-
+        trap ':' TERM
+        "$@" &
+        child=$!
+        while :; do
+            wait "$child"; status=$?
+            kill -0 "$child" 2>/dev/null || break
+        done
+        # A wait interrupted by TERM reports the signal, not the result; ask again.
+        [ "$status" -le 128 ] || { wait "$child"; status=$?; }
+        exit "$status"
+    ) &
+    leader=$!
+    [ -n "$monitor" ] || set +m
+    mark=$(stamp "$leader")
+    # The manager's shutdown and ghr stop find in-flight commands through these records.
+    if [ -n "$mark" ] && [ -d "$ROOT/conf/timeouts" ]; then
+        record=$ROOT/conf/timeouts/$leader.pid
+        printf '%s\n%s\n' "$leader" "$mark" > "$record" 2>/dev/null || record=
+    fi
+    (
+        exec 9>&-
+        sleeper= fired=0
+        # Cancelled during the grace period still reports that the deadline fired.
+        trap '[ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null; exit "$fired"' TERM
+        sleep "$seconds" & sleeper=$!; wait "$sleeper"; sleeper=
+        [ -n "$mark" ] && process_alive "$leader" "$mark" || exit 0
+        fired=124
+        kill -TERM -- "-$leader" 2>/dev/null
+        sleep 2 & sleeper=$!; wait "$sleeper"; sleeper=
+        ! process_alive "$leader" "$mark" || kill -KILL -- "-$leader" 2>/dev/null
+        exit 124
+    ) </dev/null >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$leader"; status=$?
+    if kill -0 -- "-$leader" 2>/dev/null; then
+        kill -TERM -- "-$leader" 2>/dev/null
+        waited=0
+        while [ "$waited" -lt 20 ] && kill -0 -- "-$leader" 2>/dev/null; do sleep 0.1; waited=$((waited + 1)); done
+        kill -KILL -- "-$leader" 2>/dev/null
+    fi
+    kill -TERM "$watchdog" 2>/dev/null; wait "$watchdog"; fired=$?
+    [ -z "$record" ] || rm -f "$record"
+    [ "$fired" != 124 ] || status=124
+    return "$status"
+}
+# Last non-blank line of $1, with every occurrence of $2 masked before truncation, so a
+# secret straddling the cut can never leave a partial prefix behind.
+redacted_last_line() {
+    local text=$1 secret=${2:-}
+    [ -z "$secret" ] || text=${text//"$secret"/***}
+    printf '%s\n' "$text" | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c 1-300
+}
+api() {
+    local error status token
+    token=$(cat "$ROOT/conf/github-token") || return 1
+    error=$(mktemp "$ROOT/conf/api-error.XXXXXX") || return 1
+    # The token reaches gh through the environment only, never through argv.
+    GH_TOKEN=$token GH_HOST=github.com GH_PROMPT_DISABLED=1 with_timeout 120 "$GH" api --hostname github.com "$@" 2> "$error"
+    status=$?
+    # The manager's stderr is the service log.
+    [ "$status" -eq 0 ] || printf '%s gh api %s failed (exit %s): %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${1%%\?*}" "$status" "$(redacted_last_line "$(cat "$error")" "$token")" >&2
+    rm -f "$error"
+    return "$status"
+}
 clean_exec() { env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u GH_CONFIG_DIR -u RUNNER_MANUALLY_TRAP_SIG "$@"; }
 safe_org() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]; }
 safe_id() { [[ $1 =~ ^[0-9]+$ ]]; }
@@ -49,22 +136,42 @@ tree_records() {
     mark=$(stamp "$process_id")
     [ -z "$mark" ] || printf '%s|%s\n' "$process_id" "$mark"
 }
-stop_record() {
-    local records process_id expected actual signal
-    if record_alive "$1"; then
-        records=$(tree_records "$(head -n 1 "$1")")
-        for signal in TERM KILL; do
-            while IFS='|' read -r process_id expected; do
-                safe_id "$process_id" && [ "$process_id" -gt 1 ] && [ "$process_id" != "$$" ] || continue
-                actual=$(stamp "$process_id")
-                [ -z "$actual" ] || [ "$actual" != "$expected" ] || kill -"$signal" "$process_id" 2>/dev/null || :
-            done <<< "$records"
-            [ "$signal" != TERM ] || sleep 1
-        done
-    fi
-    rm -f "$1"
+process_alive() {
+    local actual
+    actual=$(stamp "$1"); [ -n "$actual" ] && [ "$actual" = "$2" ] || return 1
+    case "$(ps -p "$1" -o stat= 2>/dev/null)" in *Z*) return 1 ;; esac
 }
-stop_worker() { stop_record "$ROOT/conf/workers/$1.pid"; stop_record "$ROOT/conf/children/$1.pid"; }
+signal_tree() {
+    local process_id expected
+    while IFS='|' read -r process_id expected; do
+        safe_id "$process_id" && [ "$process_id" -gt 1 ] && [ "$process_id" != "$$" ] || continue
+        ! process_alive "$process_id" "$expected" || kill -"$1" "$process_id" 2>/dev/null || :
+    done <<< "$2"
+}
+tree_alive() {
+    local process_id expected
+    while IFS='|' read -r process_id expected; do
+        safe_id "$process_id" && [ "$process_id" -gt 1 ] && [ "$process_id" != "$$" ] || continue
+        ! process_alive "$process_id" "$expected" || return 0
+    done <<< "$1"
+    return 1
+}
+# Signal all recorded trees together, give the official runner STOP_GRACE seconds to
+# cancel its job and report back, then force whatever is left.
+stop_records() {
+    local record records= waited=0
+    for record in "$@"; do
+        if record_alive "$record"; then records=$records$(tree_records "$(head -n 1 "$record")")$'\n'; fi
+    done
+    if [ -n "$records" ]; then
+        signal_tree TERM "$records"
+        while [ "$waited" -lt "$((STOP_GRACE * 2))" ] && tree_alive "$records"; do sleep 0.5; waited=$((waited + 1)); done
+        signal_tree KILL "$records"
+    fi
+    for record in "$@"; do rm -f "$record"; done
+}
+stop_record() { stop_records "$1"; }
+stop_worker() { stop_records "$ROOT/conf/workers/$1.pid" "$ROOT/conf/children/$1.pid"; }
 wrapper() {
     local directory=$ROOT/runner/$2
     mkdir -p "$directory"
@@ -82,7 +189,7 @@ ensure_worker() {
     stop_worker "$id"
     prepare_workspace "$login" || return 1
     wrapper "$id" "$login"
-    (exec 9>&-; clean_exec /bin/bash "$ROOT/runner/$login/runner.sh" "$ROOT" "$id") >> "$LOG_DIR/service.log" 2>&1 &
+    (exec 9>&-; clean_exec /bin/bash "$ROOT/runner/$login/runner.sh" "$ROOT" "$id" "$LOG_DIR/service.log") >> "$LOG_DIR/service.log" 2>&1 &
     process_id=$!
     record_pid "$ROOT/conf/workers/$id.pid" "$process_id" || :
     printf '%s\n' "$((now + RESTART))" > "$ROOT/conf/retry/$id"
@@ -127,10 +234,10 @@ prepare_workspace() {
     local login=$1 config=$ROOT/runner/$1/app/.runner
     safe_org "$login" || return 1
     mkdir -p "$DATA_DIR/$login" || return 1
-    "$JQ" --arg work "$DATA_DIR/$login" '.workFolder=$work' "$config" | atomic "$config"
+    jq_update "$config" --arg work "$DATA_DIR/$login" '.workFolder=$work'
 }
 configure_runner() {
-    local login=$1 name=$2 directory=$ROOT/runner/$1/app token
+    local login=$1 name=$2 directory=$ROOT/runner/$1/app token output status
     ensure_package || return 1
     if [ ! -f "$directory/run.sh" ]; then
         rm -rf "$directory.staging"
@@ -141,10 +248,15 @@ configure_runner() {
     fi
     mkdir -p "$DATA_DIR/$login"
     token=$(api "orgs/$login/actions/runners/registration-token" --method POST | "$JQ" -er .token) || return 1
-    (cd "$directory" && clean_exec /bin/bash ./config.sh --unattended --url "https://github.com/$login" --token "$token" --name "$name" --labels "$PREFIX,$name" --work "$DATA_DIR/$login") >/dev/null 2>&1 || return 1
+    output=$(cd "$directory" && with_timeout "${RUNNER_CONFIG_TIMEOUT:-180}" clean_exec /bin/bash ./config.sh --unattended --url "https://github.com/$login" --token "$token" --name "$name" --labels "$PREFIX,$name" --work "$DATA_DIR/$login" 2>&1)
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        log "Organization $login: runner configuration as $name failed (exit $status): $(redacted_last_line "$output" "$token")"
+        return 1
+    fi
     "$JQ" -er '.agentId' "$directory/.runner"
 }
-save_entry() { "$JQ" --arg id "$1" --arg login "$2" --argjson runner_id "$3" --arg name "$4" '.[$id]={login:$login,runner_id:$runner_id,runner_name:$name}' "$ROOT/conf/organizations.json" | atomic "$ROOT/conf/organizations.json"; }
+save_entry() { jq_update "$ROOT/conf/organizations.json" --arg id "$1" --arg login "$2" --argjson runner_id "$3" --arg name "$4" '.[$id]={login:$login,runner_id:$runner_id,runner_name:$name}'; }
 list_runners() { api "orgs/$1/actions/runners?per_page=100" --paginate --slurp | "$JQ" -ce '[.[].runners[]]'; }
 indexed_name() { [[ $1 =~ ^$PREFIX-[1-9][0-9]*$ ]]; }
 next_name() {
@@ -180,6 +292,11 @@ reconcile_one() {
             api "orgs/$login/actions/runners/$runner_id" --method DELETE >/dev/null || return 1
             remote=$(printf '%s' "$remote" | "$JQ" -c --argjson id "$runner_id" '[.[]|select(.id!=$id)]')
         fi
+        # A renamed organization keeps its program directory; old work data stays in place.
+        if [ "$old_login" != "$login" ] && safe_org "$old_login" && [ -d "$ROOT/runner/$old_login" ] && [ ! -e "$ROOT/runner/$login" ]; then
+            mv "$ROOT/runner/$old_login" "$ROOT/runner/$login" || return 1
+            log "Moved runner directory of $old_login to $login"
+        fi
         registered=null
     fi
     if [ "$registered" != null ]; then
@@ -206,16 +323,41 @@ reconcile_one() {
     log "Registered $name for $login"
     rm -f "$ROOT/conf/paused/$id"
 }
+# Organizations without runner permission (or with persistent errors) are retried with
+# exponential backoff, from poll_seconds up to one hour, instead of failing every poll.
+backoff_due() {
+    local due
+    due=$(head -n 1 "$ROOT/conf/backoff/$1" 2>/dev/null || :)
+    ! safe_id "${due:-x}" || [ "$(date +%s)" -ge "$due" ]
+}
+backoff_failure() {
+    local id=$1 login=$2 count delay step=1
+    count=$(sed -n 2p "$ROOT/conf/backoff/$id" 2>/dev/null || :)
+    safe_id "${count:-x}" || count=0
+    count=$((count + 1)); delay=$POLL
+    while [ "$step" -lt "$count" ] && [ "$delay" -lt 3600 ]; do delay=$((delay * 2)); step=$((step + 1)); done
+    [ "$delay" -le 3600 ] || delay=3600
+    printf '%s\n%s\n' "$(( $(date +%s) + delay ))" "$count" | atomic "$ROOT/conf/backoff/$id"
+    log "Organization $login: reconciliation failed (attempt $count); next retry in ${delay}s"
+}
 reconcile() {
     local memberships desired id login
     memberships=$(api 'user/memberships/orgs?state=active&per_page=100' --paginate --slurp) || { log 'Discovery failed; retaining current runners'; return 1; }
     desired=$(printf '%s' "$memberships" | "$JQ" -ce --slurpfile cfg "$ROOT/conf/settings.json" '($cfg[0].organizations // [] | map(ascii_downcase)) as $allow | [ .[][] | select(.state=="active") | .organization | .login as $name | select(($allow|length)==0 or ($allow|index($name|ascii_downcase))!=null) | {id:(.id|tostring),login} ]') || return 1
-    while IFS=$'\t' read -r id login; do reconcile_one "$id" "$login" || log "Organization $login: reconciliation failed; will retry"; done < <(printf '%s' "$desired" | "$JQ" -r '.[] | [.id,.login] | @tsv')
+    while IFS=$'\t' read -r id login; do
+        backoff_due "$id" || continue
+        if reconcile_one "$id" "$login"; then
+            if [ -f "$ROOT/conf/backoff/$id" ]; then rm -f "$ROOT/conf/backoff/$id"; log "Organization $login: reconciliation recovered"; fi
+        else backoff_failure "$id" "$login"; fi
+    done < <(printf '%s' "$desired" | "$JQ" -r '.[] | [.id,.login] | @tsv')
     while IFS=$'\t' read -r id login; do
         if ! printf '%s' "$desired" | "$JQ" -e --arg id "$id" 'any(.[]; .id==$id)' >/dev/null; then
+            # Already deactivated: nothing to stop and nothing new to log.
+            ! "$JQ" -e --arg id "$id" '.[$id].active == false' "$ROOT/conf/organizations.json" >/dev/null || continue
+            rm -f "$ROOT/conf/backoff/$id"
             : > "$ROOT/conf/paused/$id"
             stop_worker "$id"
-            "$JQ" --arg id "$id" '.[$id].active=false' "$ROOT/conf/organizations.json" | atomic "$ROOT/conf/organizations.json"
+            jq_update "$ROOT/conf/organizations.json" --arg id "$id" '.[$id].active=false'
             log "Stopped $login; local data retained"
         fi
     done < <("$JQ" -r 'to_entries[] | [.key,.value.login] | @tsv' "$ROOT/conf/organizations.json")
@@ -224,15 +366,21 @@ acquire_lock() {
     if [ "$(uname -s)" = Darwin ]; then /usr/bin/shlock -p $$ -f "$ROOT/conf/service.lock" || return 1
     else exec 9> "$ROOT/conf/service.lock"; flock -n 9 || return 1; fi
 }
+# A stopping manager's last children can hold the lock briefly after it exits.
+wait_for_lock() {
+    local attempt=0
+    while [ "$attempt" -lt 30 ]; do acquire_lock && return 0; sleep 0.5; attempt=$((attempt + 1)); done
+    return 1
+}
 shutdown() {
     local record
     trap - EXIT TERM INT
-    for record in "$ROOT"/conf/workers/*.pid "$ROOT"/conf/children/*.pid; do [ ! -f "$record" ] || stop_record "$record"; done
+    stop_records "$ROOT"/conf/workers/*.pid "$ROOT"/conf/children/*.pid "$ROOT"/conf/timeouts/*.pid
     rm -f "$ROOT/conf/manager.pid"
     if [ "$(uname -s)" = Darwin ]; then rm -f "$ROOT/conf/service.lock"; fi
 }
 serve() {
-    local next=0 now record
+    local next=0 now
     [ ! -f "$ROOT/conf/stopped" ] || return 0
     exec 2>> "$LOG_DIR/service.log"
     acquire_lock || { printf 'Another manager is running.\n' >&2; return 1; }
@@ -240,9 +388,11 @@ serve() {
     trap 'exit 0' TERM INT
     record_pid "$ROOT/conf/manager.pid" "$$" || return 1
     printf '%s\n' "$WORK_DIR" | atomic "$ROOT/conf/active-work-dir" || return 1
-    for record in "$ROOT"/conf/workers/*.pid "$ROOT"/conf/children/*.pid; do [ ! -f "$record" ] || stop_record "$record"; done
+    stop_records "$ROOT"/conf/workers/*.pid "$ROOT"/conf/children/*.pid "$ROOT"/conf/timeouts/*.pid
     log "Started Shell supervisor $PREFIX"
     while [ ! -f "$ROOT/conf/stopped" ]; do
+        # Reopen after log rotation so diagnostics land in the current file.
+        exec 2>> "$LOG_DIR/service.log"
         ensure_workers
         now=$(date +%s)
         if [ "$now" -ge "$next" ]; then reconcile || :; next=$(( $(date +%s) + POLL )); fi
@@ -255,14 +405,16 @@ status() {
     if record_alive "$ROOT/conf/manager.pid"; then printf 'Manager: running\n'; else printf 'Manager: stopped\n'; fi
     printf 'Configured work directory: %s\n' "$WORK_DIR"
     if [ -f "$ROOT/conf/active-work-dir" ]; then printf 'Last started work directory: %s\n' "$(cat "$ROOT/conf/active-work-dir")"; fi
-    printf '%-24s %-30s %-10s %-6s %s\n' ORGANIZATION RUNNER GITHUB BUSY LOCAL
+    local row_format='%-24s %-30s %-10s %-6s %s\n' remote_name remote_status busy
+    printf "$row_format" ORGANIZATION RUNNER GITHUB BUSY LOCAL
     while IFS=$'\t' read -r id login runner_id name; do
         count=$((count+1)); local_status=stopped
         record_alive "$ROOT/conf/workers/$id.pid" && local_status=running
         if remote=$(list_runners "$login"); then
-            printf '%s' "$remote" | "$JQ" -r --argjson id "$runner_id" --arg login "$login" --arg name "$name" --arg local "$local_status" \
-                '([.[]|select(.id==$id)][0] // {name:$name,status:"missing",busy:false}) | [$login,.name,.status,(.busy|tostring),$local] | @tsv'
-        else printf '%s\t%s\tunknown\t?\t%s\n' "$login" "$name" "$local_status"; failed=1; fi
+            IFS=$'\t' read -r remote_name remote_status busy < <(printf '%s' "$remote" | "$JQ" -r --argjson id "$runner_id" --arg name "$name" \
+                '([.[]|select(.id==$id)][0] // {name:$name,status:"missing",busy:false}) | [.name,.status,(.busy|tostring)] | @tsv')
+            printf "$row_format" "$login" "$remote_name" "$remote_status" "$busy" "$local_status"
+        else printf "$row_format" "$login" "$name" unknown '?' "$local_status"; failed=1; fi
     done < <("$JQ" -r 'to_entries[]|[.key,.value.login,.value.runner_id,(.value.runner_name // "unknown")]|@tsv' "$ROOT/conf/organizations.json")
     [ "$count" -ne 0 ] || printf 'No runners registered yet.\n'
     return "$failed"

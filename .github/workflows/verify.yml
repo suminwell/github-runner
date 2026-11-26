@@ -27,11 +27,15 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: bash .test/shell.sh
+      - name: Exercise WSL preflight and keepalive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash .test/wsl.sh
       - name: Check PowerShell syntax
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          Get-ChildItem install.ps1,windows,.test -Recurse -Filter *.ps1 | ForEach-Object {
+          Get-ChildItem install.ps1,windows,linux,.test -Recurse -Filter *.ps1 | ForEach-Object {
             $tokens=$null; $errors=$null
             [System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors) | Out-Null
             if ($errors.Count) { throw ($errors | Out-String) }
@@ -40,3 +44,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: ./.test/powershell.ps1
+      - name: Exercise WSL Windows host task management
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./.test/wsl.ps1

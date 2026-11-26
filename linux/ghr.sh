@@ -11,9 +11,11 @@ ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
 ghr config --dir [<PATH>]: 设置data和logs的父目录，默认为当前目录，重启后生效（--dir 可简写为 -d）
 ghr uninstall: 卸载runner
+ghr wsl setup: 在WSL内配置或修复Windows未登录时的自动启动
 HELP
 }
 privileged() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
+wsl_host() { [ ! -f "$ROOT/bin/wsl.sh" ] || /bin/bash "$ROOT/bin/wsl.sh" "$1"; }
 cli_contents() {
     printf '#!/bin/bash\n# ghr: %s\nunset LOCAL_RUNNER_ROOT\n' "$ROOT"
     printf 'exec /bin/bash %q "$@"\n' "$ROOT/bin/ghr.sh"
@@ -27,7 +29,7 @@ install_cli() {
     cli_contents > "$temporary"
     privileged mkdir -p "$(dirname "$destination")" && privileged install -m 755 "$temporary" "$destination" || { rm -f "$temporary"; return 1; }
     rm -f "$temporary"
-    "$JQ" --arg path "$destination" '.command_path=$path' "$ROOT/conf/settings.json" | atomic "$ROOT/conf/settings.json"
+    jq_update "$ROOT/conf/settings.json" --arg path "$destination" '.command_path=$path'
 }
 service_identity() {
     OWNER_UID=$("$JQ" -er '.owner_uid' "$ROOT/conf/settings.json") || return 1
@@ -64,16 +66,16 @@ native_service() {
     fi
 }
 stop_processes() {
-    local record
     stop_record "$ROOT/conf/manager.pid"
-    acquire_lock || { printf 'Manager is still running.\n' >&2; return 1; }
+    wait_for_lock || { printf 'Manager is still running.\n' >&2; return 1; }
     trap 'if [ "$OS" = macos ]; then rm -f "$ROOT/conf/service.lock"; fi' EXIT
-    for record in "$ROOT"/conf/workers/*.pid "$ROOT"/conf/children/*.pid; do [ ! -f "$record" ] || stop_record "$record"; done
+    stop_records "$ROOT"/conf/workers/*.pid "$ROOT"/conf/children/*.pid "$ROOT"/conf/timeouts/*.pid
 }
 stop_installation() {
     native_service stop || return 1
     printf 'stopped\n' | atomic "$ROOT/conf/stopped" || return 1
     stop_processes || return 1
+    wsl_host stop || return 1
     printf 'Runner stopped; automatic startup disabled. Run ghr start to resume.\n'
 }
 release_control_lock() {
@@ -82,9 +84,10 @@ release_control_lock() {
 }
 start_installation() {
     # A start on an already-running manager must not activate pending configuration.
-    if record_alive "$ROOT/conf/manager.pid"; then printf 'Runner already running. Use ghr restart to apply configuration.\n'; return 0; fi
+    if record_alive "$ROOT/conf/manager.pid"; then wsl_host start || return 1; printf 'Runner already running. Use ghr restart to apply configuration.\n'; return 0; fi
     rm -f "$ROOT/conf/stopped" || return 1
     native_service start || { printf 'stopped\n' | atomic "$ROOT/conf/stopped"; return 1; }
+    wsl_host start || return 1
     printf 'Runner started; automatic startup enabled.\n'
 }
 configure_directory() {
@@ -95,7 +98,7 @@ configure_directory() {
     absolute=$(cd "$requested" && pwd -P) || return 1
     case "$absolute" in "$ROOT/bin"|"$ROOT/bin/"*|"$ROOT/conf"|"$ROOT/conf/"*|"$ROOT/runner"|"$ROOT/runner/"*) printf 'Data must be outside the program and state directories.\n' >&2; return 1 ;; esac
     mkdir -p "$absolute/data" "$absolute/logs" || return 1
-    "$JQ" --arg directory "$absolute" '.work_dir=$directory' "$ROOT/conf/settings.json" | atomic "$ROOT/conf/settings.json" || return 1
+    jq_update "$ROOT/conf/settings.json" --arg directory "$absolute" '.work_dir=$directory' || return 1
     printf 'Work directory saved: %s\nRun ghr restart (or stop then start) to apply. Existing data and logs are not moved.\n' "$absolute"
 }
 show_logs() {
@@ -120,7 +123,7 @@ unregister_runners() {
         if printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" 'any(.[]; .id==$id)' >/dev/null; then
             if ! api "orgs/$login/actions/runners/$runner_id" --method DELETE >/dev/null; then printf 'Cannot unregister %s/%s; retry uninstall.\n' "$login" "$runner_id" >&2; failed=1; continue; fi
         fi
-        "$JQ" --arg id "$id" 'del(.[$id])' "$ROOT/conf/organizations.json" | atomic "$ROOT/conf/organizations.json" || return 1
+        jq_update "$ROOT/conf/organizations.json" --arg id "$id" 'del(.[$id])' || return 1
     done < <("$JQ" -r 'to_entries[]|[.key,.value.login,.value.runner_id]|@tsv' "$ROOT/conf/organizations.json")
     return "$failed"
 }
@@ -129,18 +132,19 @@ uninstall() {
     stop_installation || return 1
     unregister_runners || { printf 'Uninstall incomplete. State and credentials retained; run ghr uninstall again.\n' >&2; return 1; }
     native_service remove || return 1
+    wsl_host remove || return 1
     command_path=$("$JQ" -r '.command_path // empty' "$ROOT/conf/settings.json")
     if [ -n "$command_path" ] && [ -e "$command_path" ]; then
         [ ! -L "$command_path" ] && grep -Fqx "# ghr: $ROOT" "$command_path" || { printf 'Command ownership changed; refusing removal.\n' >&2; return 1; }
         privileged rm -f "$command_path" || return 1
     fi
     rm -rf "$ROOT/runner" "$ROOT/bin" "$ROOT/conf" || return 1
-    rm -f "$ROOT/bin/install.sh" "$ROOT/bin/service.sh" "$ROOT/bin/ghr.sh" || return 1
     printf 'Runner uninstalled. Data and logs retained in their original directories. Configured directory: %s\n' "$WORK_DIR"
 }
 command_main() {
     local command=${1:-help}; [ "$#" -eq 0 ] || shift
     case "$command" in
+        wsl) [ "$#" -eq 1 ] && [ "$1" = setup ] || { usage >&2; return 2; }; wsl_host setup ;;
         --install-command) [ "$#" -eq 0 ] || return 2; install_cli ;;
         config)
             if [ "$#" -eq 0 ]; then configure_directory .;
@@ -149,7 +153,7 @@ command_main() {
         logs) [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = -f ]; } || { usage >&2; return 2; }; show_logs "${1:-}" ;;
         status|start|stop|restart|uninstall|help|--help|-h)
             [ "$#" -eq 0 ] || { usage >&2; return 2; }
-            case "$command" in status) status ;; start) start_installation ;; stop) stop_installation ;; restart) stop_installation && release_control_lock && start_installation ;; uninstall) uninstall ;; *) usage ;; esac ;;
+            case "$command" in status) local result=0; status || result=$?; wsl_host status || result=1; return "$result" ;; start) start_installation ;; stop) stop_installation ;; restart) stop_installation && release_control_lock && start_installation ;; uninstall) uninstall ;; *) usage ;; esac ;;
         *) usage >&2; return 2 ;;
     esac
 }

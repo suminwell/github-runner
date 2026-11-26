@@ -103,6 +103,19 @@ INSTALL
     printf '{}\n' > "$root/$arch/conf/settings.json"
     if (migrate_layout) 2>/dev/null; then echo 'Merged conflicting layouts' >&2; exit 1; fi
     assert test -f "$root/$arch/conf/settings.json"
+    # Validate generated service definitions with the real host tools when present.
+    root="$FIXTURE/unit root %h \$HOME"
+    mkdir -p "$root/bin"
+    systemd_unit "$(id -un)" "$HOME" "$PATH" "$root" > "$FIXTURE/unit-check.service"
+    assert grep -Fqx "WorkingDirectory=$FIXTURE/unit root %%h \$HOME" "$FIXTURE/unit-check.service"
+    if command -v systemd-analyze >/dev/null 2>&1; then
+        systemd-analyze verify "$FIXTURE/unit-check.service" || { echo 'systemd rejected the generated unit' >&2; exit 1; }
+    fi
+    launchd_plist com.example.check "$(id -un)" "$HOME" "$PATH" "$root" > "$FIXTURE/unit-check.plist"
+    if command -v plutil >/dev/null 2>&1; then
+        assert plutil -lint "$FIXTURE/unit-check.plist"
+        assert test "$(plutil -extract WorkingDirectory raw -o - "$FIXTURE/unit-check.plist")" = "$root"
+    fi
 )
 for arch in x64 arm64; do
     export LOCAL_RUNNER_ROOT=$FIXTURE/$arch
@@ -123,9 +136,13 @@ for arch in x64 arm64; do
 #!/bin/bash
 set -eu
 while [ "$#" -gt 0 ]; do
-    case "$1" in --url) login=${2##*/}; shift 2 ;; --name) name=$2; shift 2 ;; --labels) labels=$2; shift 2 ;; --work) work=$2; shift 2 ;; *) shift ;; esac
+    case "$1" in --url) login=${2##*/}; shift 2 ;; --name) name=$2; shift 2 ;; --labels) labels=$2; shift 2 ;; --work) work=$2; shift 2 ;; --token) token=$2; shift 2 ;; *) shift ;; esac
 done
 [ -z "${GH_TOKEN:-}" ] || exit 90
+case "$login" in
+    leaky) printf '%s%s\n' "$(printf '%0290d' 0 | tr 0 x)" "$token"; exit 1 ;;
+    hang) trap '' TERM; (trap '' TERM; sleep 60; echo leaked) & printf '%s\n' "$!" > "$FAKE_FIXTURE/hang-child"; sleep 60; exit 0 ;;
+esac
 [ "$labels" = "${name%-*},$name" ] || exit 91
 if [ "$login" = race ] && [ ! -f "$FAKE_FIXTURE/raced" ]; then
     touch "$FAKE_FIXTURE/raced"
@@ -149,12 +166,66 @@ sleep 0.2
 RUN
     . "$ROOT/bin/ghr.sh"
     init
+    printf '{"keep":1}\n' > "$FIXTURE/jq-update.json"
+    if jq_update "$FIXTURE/jq-update.json" '.keep |= error("boom")' 2>/dev/null; then echo 'jq_update accepted a failed filter' >&2; exit 1; fi
+    if jq_update "$FIXTURE/jq-update.json" 'empty'; then echo 'jq_update accepted empty output' >&2; exit 1; fi
+    assert jq -e '.keep==1' "$FIXTURE/jq-update.json"
+    jq_update "$FIXTURE/jq-update.json" '.keep=2'
+    assert jq -e '.keep==2' "$FIXTURE/jq-update.json"
+    # External calls are bounded, and gh failures are reported without the token.
+    started=$(date +%s)
+    if with_timeout 1 sleep 30; then echo 'with_timeout did not stop a hung command' >&2; exit 1; fi
+    assert test "$(( $(date +%s) - started ))" -lt 10
+    # The deadline covers the whole process tree of a wrapped function, and the output pipe closes.
+    started=$(date +%s)
+    if output=$(with_timeout 1 clean_exec /bin/bash -c 'sleep 5; printf "child_completed\n"' 2>&1); then echo 'Timed-out command reported success' >&2; exit 1; else status=$?; fi
+    assert test "$status" = 124
+    assert test "$(( $(date +%s) - started ))" -lt 4
+    case "$output" in *child_completed*) echo 'A timed-out child kept running' >&2; exit 1 ;; esac
+    # Descendants that ignore TERM are forced after the grace period.
+    started=$(date +%s)
+    if output=$(with_timeout 1 /bin/bash -c 'trap "" TERM; (trap "" TERM; sleep 30; echo leaked) & echo "$!" > "$1"; wait' _ "$FIXTURE/stubborn-child" 2>&1); then echo 'Timed-out command reported success' >&2; exit 1; fi
+    assert test "$(( $(date +%s) - started ))" -lt 7
+    case "$output" in *leaked*) echo 'A TERM-ignoring descendant survived' >&2; exit 1 ;; esac
+    for attempt in $(seq 1 20); do kill -0 "$(cat "$FIXTURE/stubborn-child")" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$(cat "$FIXTURE/stubborn-child")" 2>/dev/null; then echo 'A TERM-ignoring descendant is still alive' >&2; exit 1; fi
+    # A finished command's background stragglers are removed, so the caller's pipe closes at once.
+    started=$(date +%s)
+    output=$(with_timeout 10 /bin/bash -c '(sleep 30) & echo "$!" > "$1"; echo finished' _ "$FIXTURE/straggler")
+    assert test "$output" = finished
+    assert test "$(( $(date +%s) - started ))" -lt 4
+    for attempt in $(seq 1 20); do kill -0 "$(cat "$FIXTURE/straggler")" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$(cat "$FIXTURE/straggler")" 2>/dev/null; then echo 'A straggler outlived its finished command' >&2; exit 1; fi
+    # No watchdog is left behind, and the manager lock descriptor is never inherited.
+    exec 9> "$FIXTURE/fd9.lock"
+    assert with_timeout 30 /bin/bash -c '[ ! -e /dev/fd/9 ]'
+    exec 9>&-
+    started=$(date +%s); wait
+    assert test "$(( $(date +%s) - started ))" -lt 3
+    assert test -z "$(ls "$ROOT/conf/timeouts")"
+    printf '#!/bin/sh\necho "HTTP 403: Must have admin rights (https://api.github.com/x)" >&2\nexit 1\n' > "$FIXTURE/failing-gh"
+    chmod +x "$FIXTURE/failing-gh"
+    real_gh=$GH; GH=$FIXTURE/failing-gh
+    if api 'orgs/denied/actions/runners?per_page=1' 2> "$FIXTURE/api-error" >/dev/null; then echo 'api ignored a gh failure' >&2; exit 1; fi
+    GH=$real_gh
+    assert grep -q 'gh api orgs/denied/actions/runners failed (exit 1): HTTP 403: Must have admin rights' "$FIXTURE/api-error"
+    if grep -q secret-test-token "$FIXTURE/api-error"; then echo 'api leaked the token' >&2; exit 1; fi
+    # Stopping waits for a graceful exit, and forces processes that ignore TERM.
+    bash -c 'trap "sleep 1; echo graceful > \"$1\"; exit 0" TERM; while :; do sleep 0.1; done' _ "$FIXTURE/graceful" &
+    record_pid "$FIXTURE/graceful.pid" "$!"
+    stop_record "$FIXTURE/graceful.pid"
+    assert test "$(cat "$FIXTURE/graceful")" = graceful
+    bash -c 'trap "" TERM; while :; do sleep 0.1; done' &
+    stubborn=$!; record_pid "$FIXTURE/stubborn.pid" "$stubborn"; cp "$FIXTURE/stubborn.pid" "$FIXTURE/stubborn.check"
+    previous_grace=$STOP_GRACE; STOP_GRACE=1; stop_record "$FIXTURE/stubborn.pid"; STOP_GRACE=$previous_grace
+    if record_alive "$FIXTURE/stubborn.check"; then echo 'A process ignoring TERM survived stop' >&2; exit 1; fi
     api() {
         local endpoint=$1 login runner_id
         case "$endpoint" in
+            orgs/denied/*) return 1 ;;
             organizations/*) runner_id=${endpoint##*/}; jq -c --arg id "$runner_id" '{id:($id|tonumber),login:.[$id].login}' "$ROOT/conf/organizations.json" ;;
             user/memberships/*) [ ! -f "$FIXTURE/fail-discovery" ] || return 1; cat "$FIXTURE/memberships.json" ;;
-            */registration-token) printf '{"token":"temporary"}\n' ;;
+            */registration-token) printf '{"token":"%s"}\n' "$(cat "$FIXTURE/registration-token" 2>/dev/null || printf temporary)" ;;
             *'/runners?'*) login=${endpoint#orgs/}; login=${login%%/*}; jq -c --arg login "$login" '(.[$login] // []) as $r | [{runners:$r[:1]},{runners:$r[1:]}]' "$FIXTURE/remote.json" ;;
             */actions/runners/*)
                 [ ! -f "$FIXTURE/fail-delete" ] || return 1
@@ -165,6 +236,23 @@ RUN
         esac
     }
     export GH_TOKEN=should-not-reach-runner
+    # Registration output is redacted before truncation: a token straddling the cut never leaks.
+    fake_token=FAKEtokenABCDEFGHIJKLMNOPQRSTUVWXYZa
+    assert test "${#fake_token}" = 36
+    printf '%s\n' "$fake_token" > "$FIXTURE/registration-token"
+    if configure_runner leaky "$PREFIX-1" >/dev/null; then echo 'Failed registration reported success' >&2; exit 1; fi
+    rm -f "$FIXTURE/registration-token"
+    assert grep -F "Organization leaky: runner configuration as $PREFIX-1 failed" "$ROOT/logs/service.log"
+    assert grep -F 'xxx***' "$ROOT/logs/service.log"
+    if grep -F "${fake_token:0:10}" "$ROOT/logs/service.log"; then echo 'A partial token reached the log' >&2; exit 1; fi
+    # A hung registration is bounded through the real wrapper, including TERM-ignoring children.
+    started=$(date +%s)
+    if RUNNER_CONFIG_TIMEOUT=1 configure_runner hang "$PREFIX-1" >/dev/null; then echo 'Hung registration reported success' >&2; exit 1; fi
+    assert test "$(( $(date +%s) - started ))" -lt 8
+    assert grep -F "Organization hang: runner configuration as $PREFIX-1 failed (exit 124)" "$ROOT/logs/service.log"
+    for attempt in $(seq 1 20); do kill -0 "$(cat "$FIXTURE/hang-child")" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$(cat "$FIXTURE/hang-child")" 2>/dev/null; then echo 'A hung registration child survived' >&2; exit 1; fi
+    rm -rf "$ROOT/runner/leaky" "$ROOT/runner/hang"
     reconcile
     assert jq -e '."1".login=="alpha" and ."1".runner_id==100' "$ROOT/conf/organizations.json"
     assert jq -e --arg name "$PREFIX-1" '.alpha[0].name==$name' "$FIXTURE/remote.json"
@@ -192,6 +280,8 @@ RUN
     assert jq -e '."1".login=="renamed"' "$ROOT/conf/organizations.json"
     assert test -f "$ROOT/data/alpha/repo/keep"
     assert test -d "$ROOT/data/renamed"
+    assert test ! -e "$ROOT/runner/alpha"
+    assert test -f "$ROOT/runner/renamed/app/run.sh"
     # Lost state after successful registration recovers the existing identity.
     printf '{}\n' > "$ROOT/conf/organizations.json"; previous=$(cat "$FIXTURE/next-id"); reconcile
     assert test "$(cat "$FIXTURE/next-id")" = "$previous"
@@ -245,8 +335,20 @@ RUN
     assert record_alive "$ROOT/conf/workers/1.pid"
     stop_worker 1
     assert test ! -f "$ROOT/conf/workers/1.pid"
+    # An organization without runner permission backs off instead of failing every poll.
+    printf '[[{"state":"active","organization":{"id":1,"login":"renamed"}},{"state":"active","organization":{"id":8,"login":"denied"}}]]\n' > "$FIXTURE/memberships.json"
+    reconcile
+    assert test "$(sed -n 2p "$ROOT/conf/backoff/8")" = 1
+    reconcile
+    assert test "$(sed -n 2p "$ROOT/conf/backoff/8")" = 1
+    printf '0\n1\n' > "$ROOT/conf/backoff/8"; reconcile
+    assert test "$(sed -n 2p "$ROOT/conf/backoff/8")" = 2
+    assert test "$(( $(head -n 1 "$ROOT/conf/backoff/8") - $(date +%s) ))" -ge 15
     printf '[[]]\n' > "$FIXTURE/memberships.json"; reconcile
     assert jq -e 'all(.[]; .active==false)' "$ROOT/conf/organizations.json"
+    assert test ! -e "$ROOT/conf/backoff/1"
+    # Deactivation is logged once, not on every poll.
+    assert test "$(grep -c 'Stopped collision;' "$ROOT/logs/service.log")" = 1
     assert test -f "$ROOT/data/alpha/repo/keep"
     if grep -q 'secret-test-token\|should-not-reach-runner' "$ROOT/logs/service.log"; then echo 'Credential leaked to log' >&2; exit 1; fi
     # Real CLI, processes and file switching; only the OS service manager is faked.
@@ -286,7 +388,12 @@ RUN
     done
     assert test "$(cat "$ROOT/conf/active-work-dir")" = "$new_work"
     assert jq -e --arg work "$new_work/data/renamed" '.workFolder==$work' "$ROOT/runner/renamed/app/.runner"
+    # An in-flight timeout may outlive the manager; stop must also sweep its saved record.
+    sleep 60 & timeout_orphan=$!
+    record_pid "$ROOT/conf/timeouts/orphan.pid" "$timeout_orphan"
     (command_main stop)
+    if kill -0 "$timeout_orphan" 2>/dev/null; then echo 'Stop left a recorded timeout process running' >&2; exit 1; fi
+    assert test ! -e "$ROOT/conf/timeouts/orphan.pid"
     assert test -f "$ROOT/conf/stopped"
     if record_alive "$ROOT/conf/manager.pid"; then echo 'Stop left the manager running' >&2; exit 1; fi
     assert test -f "$ROOT/data/alpha/repo/keep"

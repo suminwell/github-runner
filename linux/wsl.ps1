@@ -1,0 +1,165 @@
+param(
+    [ValidateSet('Install','Start','Stop','Remove','Status','Library')][string]$Action = 'Install',
+    [string]$Distribution,
+    [string]$LinuxUser,
+    [string]$InstallRoot,
+    [string]$ExpectedWindowsSid
+)
+$ErrorActionPreference = 'Stop'
+function Get-WindowsOwner {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return @{Name=$identity.Name; Sid=$identity.User.Value}
+}
+function Test-HostAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+function Resolve-WindowsSid([string]$Account) {
+    if ($Account -match '^S-1-') { return (New-Object Security.Principal.SecurityIdentifier($Account)).Value }
+    return (New-Object Security.Principal.NTAccount($Account)).Translate([Security.Principal.SecurityIdentifier]).Value
+}
+function Quote-WslArgument([string]$Value) {
+    return '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
+}
+function Initialize-WslHost {
+    foreach ($value in @($Distribution,$LinuxUser,$InstallRoot)) {
+        if ([string]::IsNullOrWhiteSpace($value) -or $value -match '[\x00-\x1f]') { throw 'Distribution, LinuxUser and InstallRoot are required and must not contain control characters.' }
+    }
+    if (-not $InstallRoot.StartsWith('/') -or $InstallRoot -eq '/') { throw 'InstallRoot must be the absolute Linux installation directory.' }
+    $script:InstallRoot = $InstallRoot.TrimEnd('/')
+    $script:Owner = Get-WindowsOwner
+    if ($ExpectedWindowsSid -and $script:Owner.Sid -ne $ExpectedWindowsSid) { throw 'Elevation switched Windows accounts. Use the Windows account that owns this distribution.' }
+    $script:WslExe = Join-Path $env:SystemRoot 'System32\wsl.exe'
+    $script:HostPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $hash = [Security.Cryptography.SHA256]::Create()
+    try {
+        $identity = $script:Owner.Sid + "`n" + $Distribution.ToLowerInvariant() + "`n" + $LinuxUser + "`n" + $script:InstallRoot
+        $key = [BitConverter]::ToString($hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity))).Replace('-','').Substring(0,20)
+    } finally { $hash.Dispose() }
+    $script:TaskName = "LocalGitHubRunner-WSL-$key"
+    $script:TaskDescription = "github-runner WSL host: $key"
+    $script:WslArguments = @('--distribution',$Distribution,'--user',$LinuxUser,'--exec','/bin/bash',"$script:InstallRoot/bin/wsl.sh")
+    $script:HoldArguments = (($script:WslArguments + @('hold') | ForEach-Object { Quote-WslArgument $_ }) -join ' ')
+}
+function Invoke-WslHelper([string[]]$Arguments) {
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $script:WslExe
+    $info.Arguments = (($script:WslArguments + $Arguments | ForEach-Object { Quote-WslArgument $_ }) -join ' ')
+    $info.UseShellExecute = $false; $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+    $info.StandardOutputEncoding = [Text.Encoding]::UTF8; $info.StandardErrorEncoding = [Text.Encoding]::UTF8
+    $process = [Diagnostics.Process]::Start($info)
+    try {
+        $output = $process.StandardOutput.ReadToEndAsync(); $errors = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'WSL did not respond within 120 seconds. Check the distribution and retry.' }
+        $text = $output.GetAwaiter().GetResult(); $detail = $errors.GetAwaiter().GetResult()
+        if ($process.ExitCode -ne 0) { throw "WSL helper failed: $detail" }
+        return $text
+    } finally { $process.Dispose() }
+}
+function Get-OwnedWslTask {
+    $task = Get-ScheduledTask -TaskName $script:TaskName -ErrorAction SilentlyContinue
+    if ($task) {
+        $actions = @($task.Actions)
+        if ($task.Description -cne $script:TaskDescription -or $actions.Count -ne 1 -or
+            $actions[0].Execute -ine $script:WslExe -or $actions[0].Arguments -cne $script:HoldArguments) {
+            throw 'Another task owns this name or its action was changed; refusing to modify it.'
+        }
+        $principalSid = Resolve-WindowsSid $task.Principal.UserId
+        if ($principalSid -ne $script:Owner.Sid -or "$($task.Principal.LogonType)" -ne 'Password' -or "$($task.Principal.RunLevel)" -ne 'Limited') {
+            throw 'The WSL task account or privilege level changed; refusing to modify it.'
+        }
+    }
+    return $task
+}
+function Connect-WslScheduler {
+    $scheduler = New-Object -ComObject 'Schedule.Service'
+    $scheduler.Connect()
+    return $scheduler
+}
+function Get-WslTaskSddl {
+    # The owning Windows account can manage this task from a normal WSL terminal.
+    return 'D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;' + $script:Owner.Sid + ')'
+}
+function New-WslTaskDefinition($Scheduler) {
+    $definition = $Scheduler.NewTask(0)
+    $definition.RegistrationInfo.Description = $script:TaskDescription
+    $definition.Principal.UserId = $script:Owner.Name
+    $definition.Principal.LogonType = 1 # TASK_LOGON_PASSWORD
+    $definition.Principal.RunLevel = 0 # TASK_RUNLEVEL_LUA (ordinary user)
+    $action = $definition.Actions.Create(0)
+    $action.Path = $script:WslExe; $action.Arguments = $script:HoldArguments
+    $boot = $definition.Triggers.Create(8); $boot.Enabled = $true
+    $watchdog = $definition.Triggers.Create(1)
+    $watchdog.StartBoundary = (Get-Date).AddMinutes(1).ToString('yyyy-MM-ddTHH:mm:ss')
+    $watchdog.Repetition.Interval = 'PT1M'; $watchdog.Enabled = $true
+    $settings = $definition.Settings
+    $settings.MultipleInstances = 2 # TASK_INSTANCES_IGNORE_NEW
+    $settings.ExecutionTimeLimit = 'PT0S'
+    $settings.RestartCount = 999; $settings.RestartInterval = 'PT1M'
+    $settings.StartWhenAvailable = $true
+    $settings.DisallowStartIfOnBatteries = $false; $settings.StopIfGoingOnBatteries = $false
+    return $definition
+}
+function Register-WslTask([pscredential]$Credential, [bool]$Stopped) {
+    $scheduler = Connect-WslScheduler
+    $definition = New-WslTaskDefinition $scheduler
+    $definition.Settings.Enabled = -not $Stopped
+    # COM avoids binding a plaintext -Password parameter to a PowerShell cmdlet,
+    # where an enabled module-logging policy could record it in event 4103.
+    $null = $scheduler.GetFolder('\').RegisterTaskDefinition($script:TaskName, $definition, 6, $Credential.UserName, $Credential.GetNetworkCredential().Password, 1, (Get-WslTaskSddl))
+}
+function Install-WslHost {
+    if (-not (Test-HostAdministrator)) {
+        # Enter from WSL; Windows UAC and account-password prompts stay on this machine.
+        $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,'-Action','Install','-Distribution',$Distribution,'-LinuxUser',$LinuxUser,'-InstallRoot',$script:InstallRoot,'-ExpectedWindowsSid',$script:Owner.Sid)
+        $process = Start-Process -FilePath $script:HostPowerShell -Verb RunAs -ArgumentList (($arguments | ForEach-Object { Quote-WslArgument $_ }) -join ' ') -Wait -PassThru
+        if ($process.ExitCode -ne 0) { throw 'Windows host setup failed or was cancelled. Run ghr wsl setup to retry.' }
+        Write-Host 'Windows host setup finished. Run ghr status in WSL to check the task.'
+        return
+    }
+    $description = Invoke-WslHelper @('describe') | ConvertFrom-Json
+    if ($description.root -cne $script:InstallRoot -or $description.user -cne $LinuxUser -or $description.uid -eq 0 -or $description.arch -notin @('x64','arm64')) {
+        throw 'InstallRoot must belong to the specified non-root Linux user and contain an installed Linux ghr.'
+    }
+    $existing = Get-OwnedWslTask
+    $credential = Get-Credential -UserName $script:Owner.Name -Message 'Windows account password (not PIN). Task Scheduler uses it to start WSL before login. ghr does not store this password.'
+    if ($null -eq $credential) { throw 'Setup cancelled; no Windows task was changed.' }
+    $credentialSid = Resolve-WindowsSid $credential.UserName
+    if ($credentialSid -ne $script:Owner.Sid) { throw 'Use the same Windows account that owns this WSL distribution.' }
+    $registered = $false
+    try {
+        Register-WslTask $credential ([bool]$description.stopped)
+        $registered = $true
+        $null = Invoke-WslHelper @('link',$Distribution,$LinuxUser,$script:HostPowerShell,$script:TaskName)
+        if ($description.stopped) { Disable-ScheduledTask -TaskName $script:TaskName | Out-Null }
+        else { Start-ScheduledTask -TaskName $script:TaskName }
+    } catch {
+        if ($registered -and -not $existing) { Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false }
+        throw
+    } finally { $credential = $null }
+    Write-Host "WSL boot task installed: $script:TaskName"
+    Write-Host 'Runs as the distribution owner before Windows login. Use ghr status/start/stop/restart/uninstall inside WSL.'
+    Write-Host 'If the Windows password changes, run this setup again. Passwordless/PIN-only accounts need a usable account password.'
+}
+function Invoke-WslHostAction([string]$RequestedAction) {
+    $task = Get-OwnedWslTask
+    if (-not $task) {
+        if ($RequestedAction -in @('Stop','Remove')) { return }
+        throw 'WSL host task is missing. Run ghr wsl setup inside the owning distribution.'
+    }
+    switch ($RequestedAction) {
+        'Status' { Write-Host "WSL host task: $($task.State) ($script:TaskName)" }
+        'Start' { Enable-ScheduledTask -TaskName $script:TaskName | Out-Null; Start-ScheduledTask -TaskName $script:TaskName }
+        # Linux writes conf/stopped before this call. The hold process exits on its own,
+        # without terminating the distribution or other WSL sessions.
+        'Stop' { Disable-ScheduledTask -TaskName $script:TaskName | Out-Null }
+        'Remove' { Disable-ScheduledTask -TaskName $script:TaskName | Out-Null; Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false }
+        default { throw 'Unsupported host task action.' }
+    }
+}
+if ($Action -ne 'Library') {
+    if ($env:OS -ne 'Windows_NT') { throw 'Run this helper in Windows PowerShell.' }
+    Initialize-WslHost
+    if ($Action -eq 'Install') { Install-WslHost } else { Invoke-WslHostAction $Action }
+}

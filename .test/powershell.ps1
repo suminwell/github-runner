@@ -118,6 +118,7 @@ try {
                 if ($script:FailDiscovery) { throw 'Simulated network failure' }
                 return ,@($script:Members)
             }
+            if ($Endpoint -like 'orgs/denied/*') { throw 'HTTP 403: Resource not accessible by integration' }
             if ($Endpoint -match '^orgs/([^/]+)/actions/runners\?') {
                 $runners = @($script:Remote[$Matches[1]]) | Where-Object { $null -ne $_ }
                 return ,@([pscustomobject]@{runners=@($runners | Select-Object -First 1)},[pscustomobject]@{runners=@($runners | Select-Object -Skip 1)})
@@ -167,6 +168,7 @@ try {
         $script:Remote.renamed[0].busy = $false; Invoke-Reconcile
         Assert ((Get-State)['1'].login -eq 'renamed') 'organization renamed'
         Assert (Test-Path (Join-Path $testRoot 'data\alpha\keep')) 'old data retained'
+        Assert (-not (Test-Path (Join-Path $testRoot 'runner\alpha')) -and (Test-Path (Join-Path $testRoot 'runner\renamed\app'))) 'rename moves the program directory'
         Save-State @{}; $previous = $script:NextId; Invoke-Reconcile
         Assert ($script:NextId -eq $previous) 'registration recovered after state loss'
         $otherArch = if ($arch -eq 'x64') { 'arm64' } else { 'x64' }
@@ -206,6 +208,15 @@ try {
         Assert ($script:Remote.legacy.Count -eq 1 -and $script:Remote.legacy[0].name -eq "$script:Prefix-1") 'idle legacy name upgraded'
         $failed = $false; try { Reconcile-Organization '4' '../escape' } catch { $failed = $true }
         Assert $failed 'invalid organization rejected'
+        # An organization without runner permission backs off instead of failing every poll.
+        $script:Members = @(@{state='active';organization=@{id=1;login='renamed'}}, @{state='active';organization=@{id=8;login='denied'}})
+        $backoff = Join-Path $testRoot 'conf\backoff\8.json'
+        Invoke-Reconcile
+        Assert ((Read-Json $backoff).count -eq 1) 'failing organization backs off'
+        Invoke-Reconcile
+        Assert ((Read-Json $backoff).count -eq 1) 'backoff skips retries until due'
+        Write-Json $backoff @{ after=0; count=1 }; Invoke-Reconcile
+        Assert ((Read-Json $backoff).count -eq 2 -and [long](Read-Json $backoff).after -gt [DateTime]::UtcNow.AddSeconds(15).Ticks) 'backoff grows after repeated failure'
         # Exercise real native argument quoting and removal of management credentials.
         $probe = Join-Path $testRoot 'argument probe.ps1'
         Write-AtomicText $probe '[pscustomobject]@{values=@($args);token=$env:GH_TOKEN}|ConvertTo-Json -Compress'
@@ -215,6 +226,10 @@ try {
         $parsed = $output | ConvertFrom-Json
         Assert (($parsed.values | ConvertTo-Json -Compress) -eq ($arguments | ConvertTo-Json -Compress)) 'native argument quoting'
         Assert (-not $parsed.token) 'credential environment excluded'
+        $failing = Join-Path $testRoot 'failing probe.ps1'
+        Write-AtomicText $failing '[Console]::Error.WriteLine("bad token super-secret-value"); exit 3'
+        $message = ''; try { $null = Invoke-Native $script:PowerShell @('-NoProfile','-File',$failing) -Redact @('super-secret-value') } catch { $message = $_.Exception.Message }
+        Assert ($message -match 'exit 3' -and $message -match 'bad token \*\*\*' -and $message -notmatch 'super-secret') 'native failure explains itself without secrets'
         # Exercise actual wrapper restart, without real GitHub runners or host services.
         if ($onWindows) {
         Remove-Item Env:LOCAL_RUNNER_ROOT
@@ -230,15 +245,25 @@ try {
         } while ($runs -lt 2 -and [DateTime]::UtcNow -lt $deadline)
         Assert ($runs -ge 2) 'worker restarts exited listener'
         Stop-Worker '1'
+        # The installer stops any state layout with the new script, not the installed copy.
+        $legacyState = Join-Path $fixture "legacy state $arch"
+        New-Item -ItemType Directory -Force -Path (Join-Path $legacyState 'workers') | Out-Null
+        $sleeper = [Diagnostics.Process]::Start((New-ProcessInfo $script:PowerShell @('-NoProfile','-Command','Start-Sleep -Seconds 60')))
+        Record-Process (Join-Path $legacyState 'workers\9.json') $sleeper
+        $null = Invoke-Native $script:PowerShell @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $repo 'windows\service.ps1'),'-Mode','Stop','-Root',$testRoot,'-StateDir',$legacyState)
+        Assert ($sleeper.WaitForExit(10000) -and -not (Test-Path (Join-Path $legacyState 'workers\9.json'))) 'stop mode works from an explicit state directory'
         }
         $script:Members = @(); Invoke-Reconcile
         Assert (@((Get-State).Values | Where-Object active -ne $false).Count -eq 0) 'removed membership stopped and retained for uninstall'
         Assert (Test-Path (Join-Path $testRoot 'data\alpha\keep')) 'data retained after removal'
+        Invoke-Reconcile
+        Assert (@(Select-String -LiteralPath (Join-Path $testRoot 'logs\service.log') -SimpleMatch 'Stopped organization 3;').Count -eq 1) 'deactivation logged once'
         $text = Get-Content -Raw (Join-Path $testRoot 'logs\service.log')
         Assert ($text -notmatch 'secret-test-token|should-not-reach-runner') 'no credential log leak'
         # Exercise management with real child processes and a fake scheduled task.
         function Assert-Administrator {}
         function Grant-DataDirectory([string]$Directory) { New-Item -ItemType Directory -Force -Path $Directory | Out-Null }
+        if (-not $onWindows) { function Protect-AdminFile([string]$Path) {} }
         $script:TaskExists = $true; $script:TaskEnabled = $false; $script:FailDelete = $false
         function Get-ScheduledTask { if ($script:TaskExists) { return [pscustomobject]@{TaskName='fixture';Actions=[pscustomobject]@{Arguments=('-File "' + (Join-Path $script:Root 'bin\service.ps1') + '"')}} } }
         function Disable-ScheduledTask { $script:TaskEnabled = $false }

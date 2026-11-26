@@ -16,6 +16,18 @@ function Assert-Administrator {
     $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Use an Administrator PowerShell window.' }
 }
+function Protect-AdminFile([string]$Path) {
+    # Administrator commands trust settings.json; LocalService (job identity) may only read it.
+    $item = Get-Item -LiteralPath $Path
+    $acl = $item.GetAccessControl('Access')
+    $acl.SetAccessRuleProtection($true, $true)
+    $item.SetAccessControl($acl)
+    $acl = $item.GetAccessControl('Access')
+    $service = New-Object Security.Principal.SecurityIdentifier('S-1-5-19')
+    $acl.PurgeAccessRules($service)
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($service, 'ReadAndExecute', 'Allow')))
+    $item.SetAccessControl($acl)
+}
 function Get-CommandText {
     return "@echo off`r`nsetlocal`r`nset LOCAL_RUNNER_ROOT=`r`n`"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`" -NoProfile -ExecutionPolicy Bypass -File `"%~dp0ghr.ps1`" %* & exit /b`r`n"
 }
@@ -35,6 +47,7 @@ function Install-Command {
     if (-not @($env:Path -split ';' | Where-Object { $_.TrimEnd('\') -eq $bin.TrimEnd('\') }).Count) { $env:Path = "$bin;$env:Path" }
     $script:Settings | Add-Member -NotePropertyName command_path_added -NotePropertyValue $added -Force
     Write-Json (Join-Path $script:Root 'conf\settings.json') $script:Settings
+    Protect-AdminFile (Join-Path $script:Root 'conf\settings.json')
 }
 function Get-OwnedTask {
     $task = Get-ScheduledTask -TaskName "LocalGitHubRunner-$($script:Settings.arch)" -ErrorAction SilentlyContinue
@@ -50,10 +63,7 @@ function Stop-Installation {
     }
     Write-AtomicText (Join-Path $script:Root 'conf\stopped') 'stopped'
     Stop-Record (Join-Path $script:Root 'conf\manager.json')
-    $lock = [IO.File]::Open((Join-Path $script:Root 'conf\service.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
-    try {
-        foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $script:Root "conf\$folder") -Filter *.json | ForEach-Object { Stop-Record $_.FullName } }
-    } finally { $lock.Dispose() }
+    Stop-StateProcesses (Join-Path $script:Root 'conf')
     Write-Host 'Runner stopped; automatic startup disabled. Run ghr start to resume.'
 }
 function Start-Installation {
@@ -135,6 +145,7 @@ function Set-WorkDirectory([string]$Directory) {
     $settings = Read-Json (Join-Path $script:Root 'conf\settings.json')
     $settings | Add-Member -NotePropertyName work_dir -NotePropertyValue $absolute -Force
     Write-Json (Join-Path $script:Root 'conf\settings.json') $settings
+    Protect-AdminFile (Join-Path $script:Root 'conf\settings.json')
     Write-Host "Work directory saved: $absolute"
     Write-Host 'Run ghr restart (or stop then start) to apply. Existing data and logs are not moved.'
 }

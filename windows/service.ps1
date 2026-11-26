@@ -1,6 +1,7 @@
 param(
-    [ValidateSet('Serve','Worker','Prepare','Status','Stop','Once','Library')][string]$Mode = 'Serve',
+    [ValidateSet('Serve','Worker','Prepare','Stop','Once','Library')][string]$Mode = 'Serve',
     [string]$OrgId,
+    [string]$StateDir,
     [string]$Root = $(if ($env:LOCAL_RUNNER_ROOT) { $env:LOCAL_RUNNER_ROOT } else { Split-Path $PSScriptRoot -Parent })
 )
 $ErrorActionPreference = 'Stop'
@@ -43,10 +44,11 @@ function Initialize-Manager([switch]$Control) {
     $script:WorkDir = if ($script:Settings.work_dir) { $script:Settings.work_dir } else { $script:Root }
     $script:DataDir = Join-Path $script:WorkDir 'data'; $script:LogDir = Join-Path $script:WorkDir 'logs'
     if (-not $Control) { New-Item -ItemType Directory -Force -Path $script:LogDir | Out-Null }
-    $script:Gh = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:Root 'conf\gh-path')).Trim()
+    # Administrator commands run this binary, so it must come from read-only bin\, not writable conf\.
+    $script:Gh = Join-Path $script:Root 'bin\tools\gh.exe'
     $script:PollSeconds = [Math]::Max(10, $(if ($script:Settings.poll_seconds) { $script:Settings.poll_seconds } else { 300 }))
     $script:RestartSeconds = [Math]::Max(1, $(if ($script:Settings.restart_seconds) { $script:Settings.restart_seconds } else { 30 }))
-    foreach ($directory in @('bin\.cache','conf\workers','conf\children','conf\paused','conf\retry')) {
+    foreach ($directory in @('bin\.cache','conf\workers','conf\children','conf\paused','conf\retry','conf\backoff')) {
         New-Item -ItemType Directory -Force -Path (Join-Path $script:Root $directory) | Out-Null
     }
     if (-not (Test-Path (Join-Path $script:Root 'conf\organizations.json'))) { Save-State @{} }
@@ -64,10 +66,11 @@ function New-ProcessInfo([string]$Executable, [string[]]$Arguments, [string]$Dir
     foreach ($name in $script:Secrets) { $info.EnvironmentVariables.Remove($name) }
     return $info
 }
-function Invoke-Native([string]$Executable, [string[]]$Arguments, [int]$Timeout = 90, [switch]$Authentication, [string]$Directory = $script:Root) {
+function Invoke-Native([string]$Executable, [string[]]$Arguments, [int]$Timeout = 90, [switch]$Authentication, [string]$Directory = $script:Root, [string[]]$Redact = @()) {
     $info = New-ProcessInfo $Executable $Arguments $Directory
     if ($Authentication) {
         $info.EnvironmentVariables['GH_TOKEN'] = (Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $script:Root 'conf\github-token')).Trim()
+        $Redact += $info.EnvironmentVariables['GH_TOKEN']
         $info.EnvironmentVariables['GH_HOST'] = 'github.com'
         $info.EnvironmentVariables['GH_PROMPT_DISABLED'] = '1'
     }
@@ -79,9 +82,15 @@ function Invoke-Native([string]$Executable, [string[]]$Arguments, [int]$Timeout 
         $process.Dispose(); throw 'Native command timed out.'
     }
     $code = $process.ExitCode
-    $text = $output.GetAwaiter().GetResult(); $null = $errors.GetAwaiter().GetResult()
+    $text = $output.GetAwaiter().GetResult(); $errorText = $errors.GetAwaiter().GetResult()
     $process.Dispose()
-    if ($code -ne 0) { throw "Native command failed (exit $code)." }
+    if ($code -ne 0) {
+        # Keep the last diagnostic line so the log says why; never echo secrets.
+        $detail = @(("$errorText`n$text") -split '\r?\n' | Where-Object { $_.Trim() }) | Select-Object -Last 1
+        foreach ($secret in $Redact) { if ($secret) { $detail = "$detail".Replace($secret, '***') } }
+        if ($detail) { $detail = "$detail".Trim(); if ($detail.Length -gt 300) { $detail = $detail.Substring(0, 300) } }
+        throw "Native command failed (exit $code): $detail"
+    }
     return $text
 }
 function Invoke-GitHubApi([string]$Endpoint, [string]$Method = 'GET', [switch]$Paginate) {
@@ -104,10 +113,34 @@ function Get-RecordedProcess([string]$Path) {
     } catch { }
     return $null
 }
+function Test-StoppableProcess([int]$ProcessId) {
+    # PID records are writable by LocalService (the job identity); an Administrator command
+    # must not be steered into killing another account's process.
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return $true }
+    $process = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+    if ($null -eq $process) { return $false }
+    $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+    if ($null -eq $owner -or -not $owner.Sid) { return $false }
+    return ($owner.Sid -eq 'S-1-5-19' -or $owner.Sid -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+}
 function Stop-Record([string]$Path) {
     $process = Get-RecordedProcess $Path
-    if ($null -ne $process -and $process.Id -ne $PID) { & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null }
+    if ($null -ne $process -and $process.Id -ne $PID -and (Test-StoppableProcess $process.Id)) { & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null }
     Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+}
+function Open-ServiceLock([string]$Path, [int]$Seconds = 15) {
+    # A manager that was just terminated can hold the lock for a moment.
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    while ($true) {
+        try { return [IO.File]::Open($Path, 'OpenOrCreate', 'ReadWrite', 'None') }
+        catch [IO.IOException] { if ([DateTime]::UtcNow -ge $deadline) { throw } ; Start-Sleep -Milliseconds 250 }
+    }
+}
+function Stop-StateProcesses([string]$Directory) {
+    $lock = Open-ServiceLock (Join-Path $Directory 'service.lock')
+    try {
+        foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $Directory $folder) -Filter *.json -ErrorAction SilentlyContinue | ForEach-Object { Stop-Record $_.FullName } }
+    } finally { $lock.Dispose() }
 }
 function Stop-Worker([string]$Id) {
     Stop-Record (Join-Path $script:Root "conf\workers\$Id.json")
@@ -189,7 +222,7 @@ function Register-Runner([string]$Login, [string]$Name) {
     $wrapper = Join-Path $directory 'configure.ps1'
     Write-AtomicText $wrapper "& (Join-Path `$PSScriptRoot 'config.cmd') @args`nexit `$LASTEXITCODE`n"
     $arguments = @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',$wrapper,'--unattended','--url',"https://github.com/$Login",'--token',$token,'--name',$Name,'--labels',"$script:Prefix,$Name",'--work',$work)
-    $null = Invoke-Native $script:PowerShell $arguments -Timeout 180 -Directory $directory
+    $null = Invoke-Native $script:PowerShell $arguments -Timeout 180 -Directory $directory -Redact @($token)
     return (Read-Json (Join-Path $directory '.runner')).agentId
 }
 function Get-RemoteRunners([string]$Login) {
@@ -223,12 +256,19 @@ function Reconcile-Organization([string]$Id, [string]$Login) {
     $preferred = $entry.runner_name
     if ($null -ne $registered -and (Test-IndexedName $registered.name)) { $preferred = $registered.name }
     $pause = Join-Path $script:Root "conf\paused\$Id"
-    if ($null -ne $entry -and ($entry.login -ne $Login -or $null -eq $registered -or $local.agentId -ne $entry.runner_id -or -not (Test-IndexedName $registered.name) -or $entry.relocated)) {
+    if ($null -ne $entry -and ($entry.login -cne $Login -or $null -eq $registered -or $local.agentId -ne $entry.runner_id -or -not (Test-IndexedName $registered.name) -or $entry.relocated)) {
         if ($null -ne $registered -and $registered.busy) { return }
         Write-AtomicText $pause 'paused'; Stop-Worker $Id
         if ($null -ne $registered) {
             $null = Invoke-GitHubApi "orgs/$Login/actions/runners/$($registered.id)" -Method DELETE
             $remote = @($remote | Where-Object id -ne $registered.id)
+        }
+        # A renamed organization keeps its program directory; old work data stays in place.
+        $oldDirectory = Join-Path $script:Root "runner\$($entry.login)"
+        $newDirectory = Join-Path $script:Root "runner\$Login"
+        if ($entry.login -cne $Login -and (Test-Organization $entry.login) -and (Test-Path -LiteralPath $oldDirectory) -and -not (Test-Path -LiteralPath $newDirectory)) {
+            Move-Item -LiteralPath $oldDirectory -Destination $newDirectory
+            Write-Log "Moved runner directory of $($entry.login) to $Login"
         }
         $registered = $null
     }
@@ -268,11 +308,27 @@ function Invoke-Reconcile {
         }
     }
     foreach ($id in @($desired.Keys)) {
-        try { Reconcile-Organization $id $desired[$id] } catch { Write-Log "Organization $($desired[$id]): $($_.Exception.Message)" }
+        $backoff = Join-Path $script:Root "conf\backoff\$id.json"
+        $previous = Read-Json $backoff
+        if ($null -ne $previous -and [DateTime]::UtcNow.Ticks -lt [long]$previous.after) { continue }
+        try {
+            Reconcile-Organization $id $desired[$id]
+            if ($null -ne $previous) { Remove-Item -LiteralPath $backoff -Force; Write-Log "Organization $($desired[$id]): reconciliation recovered" }
+        } catch {
+            # Organizations without runner permission (or with persistent errors) back off
+            # exponentially from poll_seconds to one hour instead of failing every poll.
+            $count = if ($null -ne $previous) { [int]$previous.count + 1 } else { 1 }
+            $delay = [Math]::Min(3600, $script:PollSeconds * [Math]::Pow(2, [Math]::Min($count - 1, 12)))
+            Write-Json $backoff @{ after=[DateTime]::UtcNow.AddSeconds($delay).Ticks; count=$count }
+            Write-Log "Organization $($desired[$id]): $($_.Exception.Message) (attempt $count; next retry in $([int]$delay)s)"
+        }
     }
     $state = Get-State
     foreach ($id in @($state.Keys)) {
         if (-not $desired.ContainsKey($id)) {
+            # Already deactivated: nothing to stop and nothing new to log.
+            if ($state[$id].active -eq $false) { continue }
+            Remove-Item -LiteralPath (Join-Path $script:Root "conf\backoff\$id.json") -Force -ErrorAction SilentlyContinue
             Stop-Worker $id
             $state[$id] | Add-Member -NotePropertyName active -NotePropertyValue $false -Force
             Save-State $state
@@ -304,26 +360,16 @@ function Invoke-Supervisor {
         Remove-Item (Join-Path $script:Root 'conf\manager.json') -Force -ErrorAction SilentlyContinue
     }
 }
-if ($Mode -ne 'Library') {
+if ($Mode -eq 'Stop') {
+    # Needs only the PID records, so the installer can stop any earlier state layout with
+    # this (trusted) script instead of executing the previously installed copy.
+    Stop-StateProcesses $(if ($StateDir) { $StateDir } else { Join-Path $script:Root 'conf' })
+} elseif ($Mode -ne 'Library') {
     Initialize-Manager
     switch ($Mode) {
         'Serve' { Invoke-Supervisor }
         'Worker' { & (Join-Path $script:Root 'bin\runner.ps1') -Root $script:Root -OrgId $OrgId }
         'Prepare' { Ensure-Package }
         'Once' { Invoke-Reconcile }
-        'Stop' {
-            $lock = [IO.File]::Open((Join-Path $script:Root 'conf\service.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
-            try {
-                foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $script:Root "conf\$folder") -Filter *.json | ForEach-Object { Stop-Record $_.FullName } }
-            } finally { $lock.Dispose() }
-        }
-        'Status' {
-            $state = Get-State
-            foreach ($entry in $state.Values) {
-                $pages = Invoke-GitHubApi "orgs/$($entry.login)/actions/runners?per_page=100" -Paginate
-                $runner = @($pages | ForEach-Object { $_.runners } | Where-Object id -eq $entry.runner_id) | Select-Object -First 1
-                "$($entry.login): $($runner | ConvertTo-Json -Compress)"
-            }
-        }
     }
 }
