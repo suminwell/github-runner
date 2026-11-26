@@ -455,6 +455,7 @@ serve() {
 status() {
     local id login runner_id name active remote row local_status local_pid remote_name remote_status busy
     local failed=0 count=0 online=0 offline=0 missing=0 unknown=0 jobs=0 listening=0 restarting=0
+    local others other_name other_status other_busy other_count=0 other_online=0 other_offline=0 other_jobs=0
     local manager=stopped work=$WORK_DIR directory_state='configured; not started yet' work_prefix configured_prefix
     if record_alive "$STATE/manager.pid"; then manager=running; fi
     printf 'GitHub Runner status\nPlatform: %s / %s\n' "$OS" "$ARCH"
@@ -479,8 +480,11 @@ status() {
         printf 'Configuration: pending; next start uses %s/data and %s/logs\n' "$configured_prefix" "$configured_prefix"
         printf 'Run ghr restart (or stop then start) to apply.\n'
     else printf 'Configuration: no pending directory change\n'; fi
-    local row_format='%-24s %-32s %-9s %-5s %-11s %s\n'
-    printf '\n'; printf "$row_format" ORGANIZATION RUNNER GITHUB BUSY LOCAL PID
+    # A tree: each organization, then its runners (this installation's first). The branch
+    # is printed apart from the padded columns, so multibyte line characters keep alignment.
+    local row_format='%s %-32s %-9s %-5s %-11s %s\n' middle='|--' last='`--' other_total branch
+    case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) middle='├──'; last='└──' ;; esac
+    printf '\n%-36s %-9s %-5s %-11s %s\n' 'ORGANIZATION / RUNNER' GITHUB BUSY LOCAL PID
     while IFS=$'\t' read -r id login runner_id name active; do
         count=$((count+1)); local_status=stopped; local_pid=-
         if record_alive "$STATE/children/$id.pid"; then
@@ -488,20 +492,35 @@ status() {
         elif record_alive "$STATE/workers/$id.pid"; then
             local_status=restarting; local_pid=$(head -n 1 "$STATE/workers/$id.pid"); restarting=$((restarting+1))
         elif [ "$active" = false ] || [ -f "$STATE/paused/$id" ]; then local_status=paused; fi
-        remote_name=$name; remote_status=unknown; busy='?'
+        remote_name=$name; remote_status=unknown; busy='?'; others=
         if remote=$(list_runners "$login") && row=$(printf '%s' "$remote" | "$JQ" -er --argjson id "$runner_id" --arg name "$name" \
             '([.[]|select(.id==$id)][0]) as $r | if $r == null then [$name,"missing","-"] else [($r.name // $name),($r.status // "unknown"),(if $r.busy == null then "?" else ($r.busy|tostring) end)] end | @tsv'); then
             IFS=$'\t' read -r remote_name remote_status busy <<< "$row"
+            # Every other runner of the organization: other machines, platforms or manual runners.
+            others=$(printf '%s' "$remote" | "$JQ" -r --argjson id "$runner_id" \
+                '[.[]|select(.id!=$id)] | sort_by(.name|ascii_downcase)[] | [.name,(.status // "unknown"),(if .busy == null then "?" else (.busy|tostring) end)] | @tsv')
         fi
         case "$remote_status" in
             online) online=$((online+1)) ;; offline) offline=$((offline+1)) ;; missing) missing=$((missing+1)) ;;
             *) remote_status=unknown; busy='?'; unknown=$((unknown+1)); failed=1 ;;
         esac
         [ "$busy" != true ] || jobs=$((jobs+1))
-        printf "$row_format" "$login" "$remote_name" "$remote_status" "$busy" "$local_status" "$local_pid"
+        other_total=0; [ -z "$others" ] || other_total=$(printf '%s\n' "$others" | grep -c .)
+        branch=$middle; [ "$other_total" != 0 ] || branch=$last
+        printf '%s\n' "$login"
+        printf "$row_format" "$branch" "$remote_name" "$remote_status" "$busy" "$local_status" "$local_pid"
+        while IFS=$'\t' read -r other_name other_status other_busy; do
+            [ -n "$other_name" ] || continue
+            other_count=$((other_count+1)); other_total=$((other_total-1))
+            branch=$middle; [ "$other_total" != 0 ] || branch=$last
+            case "$other_status" in online) other_online=$((other_online+1)) ;; offline) other_offline=$((other_offline+1)) ;; esac
+            [ "$other_busy" != true ] || other_jobs=$((other_jobs+1))
+            printf "$row_format" "$branch" "$other_name" "$other_status" "$other_busy" other -
+        done <<< "$others"
     done < <("$JQ" -r 'to_entries|sort_by(.value.login)[]|[.key,.value.login,.value.runner_id,(.value.runner_name // "unknown"),(.value.active != false)]|@tsv' "$STATE/organizations.json")
     [ "$count" -ne 0 ] || printf 'No runners registered yet. Use ghr logs to check discovery and registration.\n'
     printf '\nOrganizations: %s\nGitHub: %s online, %s offline, %s missing, %s unknown; %s busy\n' "$count" "$online" "$offline" "$missing" "$unknown" "$jobs"
+    [ "$other_count" = 0 ] || printf 'Other runners in these organizations: %s (%s online, %s offline); %s busy\n' "$other_count" "$other_online" "$other_offline" "$other_jobs"
     printf 'Local: %s running, %s restarting, %s stopped/paused\n' "$listening" "$restarting" "$((count-listening-restarting))"
     [ "$restarting" = 0 ] || printf 'restarting: organization worker is alive; listener is not running yet.\n'
     [ "$failed" = 0 ] || printf 'Some GitHub statuses could not be queried; unknown does not mean offline.\n'

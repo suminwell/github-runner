@@ -4,6 +4,9 @@ repo=$(cd "$(dirname "$0")/.." && pwd)
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/runner-status.XXXXXX")
 trap 'rm -rf "$fixture"' EXIT
 assert() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; }
+# The runners printed under organization $1, one per line, without the branch.
+block() { awk -v org="$1" '$0==org {on=1; next} on && /^(\|--|`--) / {print; next} {on=0}' "$fixture/report"; }
+export LC_ALL=C
 for platform in linux macos; do
     export LOCAL_RUNNER_ROOT=$fixture/$platform
     ROOT=$LOCAL_RUNNER_ROOT
@@ -22,7 +25,7 @@ for platform in linux macos; do
     deny=true
     list_runners() {
         case "$1" in
-            alpha) jq -n --arg name "$PREFIX-1" '[{id:101,name:$name,status:"online",busy:true}]' ;;
+            alpha) jq -n --arg name "$PREFIX-1" '[{id:203,name:"zeta-manual",status:"online",busy:false},{id:101,name:$name,status:"online",busy:true},{id:201,name:"Build-box",status:"online",busy:true},{id:202,name:"local-macos-arm64-1",status:"offline",busy:null}]' ;;
             beta) jq -n --arg name "$PREFIX-1" '[{id:102,name:$name,status:"offline",busy:false}]' ;;
             gamma) jq -n --arg name "$PREFIX-1" '[{id:999,name:$name,status:"online",busy:false}]' ;;
             denied) if $deny; then return 1; else printf '[]\n'; fi ;;
@@ -37,13 +40,27 @@ for platform in linux macos; do
     assert grep -Fxq "Data directory: $old_work/data" "$fixture/report"
     assert grep -Fxq "Logs directory: $old_work/logs" "$fixture/report"
     assert grep -Fq "Configuration: pending; next start uses $new_work/data" "$fixture/report"
-    assert grep -Eq '^alpha +[^ ]+ +online +true +running +[0-9]+$' "$fixture/report"
-    assert grep -Eq '^beta +[^ ]+ +offline +false +restarting +[0-9]+$' "$fixture/report"
-    assert grep -Eq '^gamma +[^ ]+ +missing +- +paused +-$' "$fixture/report"
-    assert grep -Eq '^denied +[^ ]+ +unknown +\? +stopped +-$' "$fixture/report"
+    assert grep -Eq '^ORGANIZATION / RUNNER +GITHUB +BUSY +LOCAL +PID$' "$fixture/report"
+    block alpha | head -n 1 | grep -Eq "^\|-- $PREFIX-1 +online +true +running +[0-9]+$"
+    assert test "$(block beta)" = "$(block beta | grep -E '^`-- [^ ]+ +offline +false +restarting +[0-9]+$')"
+    assert test "$(block beta | wc -l | tr -d ' ')" = 1
+    block gamma | head -n 1 | grep -Eq '^\|-- [^ ]+ +missing +- +paused +-$'
+    block gamma | tail -n 1 | grep -Eq '^`-- [^ ]+ +online +false +other +-$'
+    block denied | grep -Eq '^`-- [^ ]+ +unknown +\? +stopped +-$'
+    # Columns line up with the header whatever the runner name.
+    assert test "$(awk '/^ORGANIZATION/ {print index($0,"GITHUB")}' "$fixture/report")" = "$(block alpha | head -n 1 | awk '{print index($0,"online")}')"
     assert grep -Fxq 'GitHub: 1 online, 1 offline, 1 missing, 1 unknown; 1 busy' "$fixture/report"
+    # All other runners of an organization follow this installation's row, sorted by name.
+    assert test "$(block alpha | awk '{print $2}' | paste -sd, -)" = "$PREFIX-1,Build-box,local-macos-arm64-1,zeta-manual"
+    block alpha | grep -Eq '^\|-- Build-box +online +true +other +-$'
+    block alpha | grep -Eq '^\|-- local-macos-arm64-1 +offline +\? +other +-$'
+    block alpha | tail -n 1 | grep -Eq '^`-- zeta-manual +online +false +other +-$'
+    assert grep -Fxq 'Other runners in these organizations: 4 (3 online, 1 offline); 1 busy' "$fixture/report"
     assert grep -Fxq 'Local: 1 running, 1 restarting, 2 stopped/paused' "$fixture/report"
     assert test "$(cat "$ROOT/conf/organizations.json")" = "$before"
+    LC_ALL=en_US.UTF-8 status > "$fixture/report" 2>/dev/null || :
+    assert grep -Fq "├── $PREFIX-1" "$fixture/report"
+    assert grep -Fq '└── zeta-manual' "$fixture/report"
     deny=false
     rm "$ROOT/conf/manager.pid"
     touch "$ROOT/conf/stopped"

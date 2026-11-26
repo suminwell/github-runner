@@ -101,9 +101,14 @@ function Show-Status {
     } else { Write-Host 'Configuration: no pending directory change' }
     $state = Get-State; $failed = $false
     $online = 0; $offline = 0; $missing = 0; $unknown = 0; $jobs = 0; $listening = 0; $restarting = 0
+    $otherCount = 0; $otherOnline = 0; $otherOffline = 0; $otherJobs = 0
     # Explicit columns preserve full runner names even when PowerShell's host is narrow.
-    $rowFormat = '{0,-24} {1,-32} {2,-9} {3,-5} {4,-11} {5}'
-    Write-Host ''; Write-Host ($rowFormat -f 'ORGANIZATION','RUNNER','GITHUB','BUSY','LOCAL','PID')
+    # A tree: each organization, then its runners (this installation's first). Line characters
+    # are built from code points, since Windows PowerShell reads BOM-less scripts as ANSI.
+    $rowFormat = '{0} {1,-32} {2,-9} {3,-5} {4,-11} {5}'
+    $line = [string][char]0x2500 * 2
+    $middle = [string][char]0x251C + $line; $last = [string][char]0x2514 + $line
+    Write-Host ''; Write-Host ('{0,-36} {1,-9} {2,-5} {3,-11} {4}' -f 'ORGANIZATION / RUNNER','GITHUB','BUSY','LOCAL','PID')
     foreach ($id in @($state.Keys | Sort-Object { $state[$_].login })) {
         $entry = $state[$id]; $runner = $null; $remoteStatus = 'missing'; $busy = '-'; $name = $entry.runner_name
         $listener = Get-RecordedProcess (Join-Path $script:Root "conf\children\$id.json")
@@ -112,8 +117,12 @@ function Show-Status {
         if ($listener) { $localStatus = 'running'; $localPid = $listener.Id; $listening++ }
         elseif ($worker) { $localStatus = 'restarting'; $localPid = $worker.Id; $restarting++ }
         elseif ($entry.active -eq $false -or (Test-Path (Join-Path $script:Root "conf\paused\$id"))) { $localStatus = 'paused' }
+        $others = @()
         try {
-            $runner = @(Get-RemoteRunners $entry.login | Where-Object id -eq $entry.runner_id) | Select-Object -First 1
+            $remote = @(Get-RemoteRunners $entry.login)
+            $runner = @($remote | Where-Object id -eq $entry.runner_id) | Select-Object -First 1
+            # Every other runner of the organization: other machines, platforms or manual runners.
+            $others = @($remote | Where-Object { $_.id -ne $entry.runner_id } | Sort-Object { "$($_.name)".ToLowerInvariant() })
             if ($runner) {
                 if ($runner.name) { $name = $runner.name }
                 $remoteStatus = $runner.status
@@ -125,11 +134,25 @@ function Show-Status {
             default { $remoteStatus = 'unknown'; $busy = '?'; $unknown++; $failed = $true }
         }
         if ($busy -eq 'true') { $jobs++ }
-        Write-Host ($rowFormat -f $entry.login,$name,$remoteStatus,$busy,$localStatus,$localPid)
+        Write-Host $entry.login
+        $branch = if ($others.Count) { $middle } else { $last }
+        Write-Host ($rowFormat -f $branch,$name,$remoteStatus,$busy,$localStatus,$localPid)
+        $remaining = $others.Count
+        foreach ($other in $others) {
+            $remaining--
+            $branch = if ($remaining) { $middle } else { $last }
+            $otherStatus = if ($other.status) { $other.status } else { 'unknown' }
+            $otherBusy = if ($null -eq $other.busy) { '?' } else { "$($other.busy)".ToLowerInvariant() }
+            $otherCount++
+            if ($otherStatus -eq 'online') { $otherOnline++ } elseif ($otherStatus -eq 'offline') { $otherOffline++ }
+            if ($otherBusy -eq 'true') { $otherJobs++ }
+            Write-Host ($rowFormat -f $branch,$other.name,$otherStatus,$otherBusy,'other','-')
+        }
     }
     if (-not $state.Count) { Write-Host 'No runners registered yet. Use ghr logs to check discovery and registration.' }
     Write-Host "`nOrganizations: $($state.Count)"
     Write-Host "GitHub: $online online, $offline offline, $missing missing, $unknown unknown; $jobs busy"
+    if ($otherCount) { Write-Host "Other runners in these organizations: $otherCount ($otherOnline online, $otherOffline offline); $otherJobs busy" }
     Write-Host "Local: $listening running, $restarting restarting, $($state.Count - $listening - $restarting) stopped/paused"
     if ($restarting) { Write-Host 'restarting: organization worker is alive; listener is not running yet.' }
     if ($failed) { throw 'Some GitHub statuses could not be queried; unknown does not mean offline.' }

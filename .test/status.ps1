@@ -24,13 +24,28 @@ try {
     $script:Deny = $true
     function Get-RemoteRunners([string]$Login) {
         switch ($Login) {
-            alpha { return [pscustomobject]@{id=101;name="$script:Prefix-1";status='online';busy=$true} }
+            alpha { return @(
+                [pscustomobject]@{id=203;name='zeta-manual';status='online';busy=$false},
+                [pscustomobject]@{id=101;name="$script:Prefix-1";status='online';busy=$true},
+                [pscustomobject]@{id=201;name='Build-box';status='online';busy=$true},
+                [pscustomobject]@{id=202;name='local-linux-x64-1';status='offline';busy=$null}) }
             beta { return [pscustomobject]@{id=102;name="$script:Prefix-1";status='offline';busy=$false} }
             gamma { return [pscustomobject]@{id=999;name="$script:Prefix-1";status='online';busy=$false} }
             denied { if ($script:Deny) { throw 'Simulated HTTP 403' }; return @() }
             default { throw 'Unexpected organization' }
         }
     }
+    # The runner lines printed under an organization, without the branch characters.
+    function Get-Block([string]$Report, [string]$Organization) {
+        $lines = @($Report -split "`r?`n"); $result = @(); $on = $false
+        foreach ($text in $lines) {
+            if ($text -ceq $Organization) { $on = $true; continue }
+            if ($on -and $text -match ('^[' + [char]0x251C + [char]0x2514 + ']' + [char]0x2500 + '{2} ')) { $result += $text; continue }
+            $on = $false
+        }
+        return ,$result
+    }
+    $mid = [string][char]0x251C + [char]0x2500 + [char]0x2500; $end = [string][char]0x2514 + [char]0x2500 + [char]0x2500
     function Capture-Status {
         $script:StatusFailed = $false
         return (& { try { Show-Status } catch { $script:StatusFailed = $true; Write-Host $_.Exception.Message } } 6>&1 | Out-String -Width 240)
@@ -42,11 +57,21 @@ try {
     Assert ($report.Contains("Install directory: $fixture")) 'installation directory'
     Assert ($report.Contains("Data directory: $(Join-Path $oldWork 'data')") -and $report.Contains("Logs directory: $(Join-Path $oldWork 'logs')")) 'current data and log paths'
     Assert ($report.Contains("Configuration: pending; next start uses $(Join-Path $newWork 'data')")) 'pending data directory explicit'
-    Assert ($report -match '(?m)^alpha +\S+ +online +true +running +\d+\s*$') 'online busy listener'
-    Assert ($report -match '(?m)^beta +\S+ +offline +false +restarting +\d+\s*$') 'worker without listener is restarting'
-    Assert ($report -match '(?m)^gamma +\S+ +missing +- +paused +-\s*$') 'missing ID is not confused with matching name'
-    Assert ($report -match '(?m)^denied +\S+ +unknown +\? +stopped +-\s*$') 'API error is unknown'
+    $alpha = Get-Block $report 'alpha'; $beta = Get-Block $report 'beta'; $gamma = Get-Block $report 'gamma'; $denied = Get-Block $report 'denied'
+    Assert ($report -match '(?m)^ORGANIZATION / RUNNER +GITHUB +BUSY +LOCAL +PID\s*$') 'tree header'
+    Assert ($alpha[0].StartsWith("$mid $script:Prefix-1 ") -and $alpha[0] -match ' online +true +running +\d+\s*$') 'online busy listener'
+    Assert ($beta.Count -eq 1 -and $beta[0].StartsWith("$end ") -and $beta[0] -match ' offline +false +restarting +\d+\s*$') 'worker without listener is restarting'
+    Assert ($gamma[0] -match ' missing +- +paused +-\s*$' -and $gamma[1].StartsWith("$end ") -and $gamma[1] -match ' online +false +other +-\s*$') 'missing ID is not confused with matching name'
+    Assert ($denied.Count -eq 1 -and $denied[0] -match ' unknown +\? +stopped +-\s*$') 'API error is unknown'
+    $header = @($report -split "`r?`n" | Where-Object { $_ -like 'ORGANIZATION*' })[0]
+    Assert ($header.IndexOf('GITHUB') -eq $alpha[0].IndexOf('online')) 'columns align with the header'
     Assert ($report.Contains('GitHub: 1 online, 1 offline, 1 missing, 1 unknown; 1 busy') -and $report.Contains('Local: 1 running, 1 restarting, 2 stopped/paused')) 'remote and local counts'
+    $alphaRows = @($alpha | ForEach-Object { ($_ -split ' +')[1] })
+    Assert (($alphaRows -join ',') -ceq "$script:Prefix-1,Build-box,local-linux-x64-1,zeta-manual") 'other runners follow this installation, sorted by name'
+    Assert ($alpha[1] -match ' Build-box +online +true +other +-\s*$') 'busy runner of another machine'
+    Assert ($alpha[2] -match ' local-linux-x64-1 +offline +\? +other +-\s*$') 'other platform runner'
+    Assert ($alpha[3].StartsWith("$end zeta-manual ")) 'last runner closes the branch'
+    Assert ($report.Contains('Other runners in these organizations: 4 (3 online, 1 offline); 1 busy')) 'other runner counts'
     Assert ((Get-Content -Raw -LiteralPath (Join-Path $fixture 'conf/organizations.json')) -ceq $before) 'status leaves registrations unchanged'
     $script:Deny = $false
     Remove-Item -LiteralPath (Join-Path $fixture 'conf/manager.json')
