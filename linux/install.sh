@@ -1,6 +1,7 @@
 #!/bin/sh
 # Complete POSIX entry point; safe for curl ... | sh.
 set -eu
+privileged() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
 sha256_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
 xml() { printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 unit_quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; }
@@ -80,14 +81,14 @@ WSL
     fi
 }
 stop_installed_service() {
-    user_id=$(id -u)
+    user_id=${runtime_uid:-$(id -u)}
     if [ "$platform" = linux ]; then
         service_name=local-github-runner-$user_id-$arch.service
-        definition_path=$(sudo systemctl show "$service_name" -p FragmentPath --value 2>/dev/null || :)
+        definition_path=$(privileged systemctl show "$service_name" -p FragmentPath --value 2>/dev/null || :)
         if [ -n "$definition_path" ]; then
-            installed_root=$(sudo systemctl show "$service_name" -p WorkingDirectory --value)
+            installed_root=$(privileged systemctl show "$service_name" -p WorkingDirectory --value)
             case "$installed_root" in "$root"|"$root/$arch") ;; *) echo 'Another installation owns this service name.' >&2; exit 1 ;; esac
-            sudo systemctl disable --now "$service_name"
+            privileged systemctl disable --now "$service_name"
         fi
     else
         service_name=com.suminwell.github-runner.$user_id.$arch
@@ -95,8 +96,8 @@ stop_installed_service() {
         if [ -f "$definition_path" ]; then
             command_path=$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$definition_path")
             case "$command_path" in "$root/bin/service.sh"|"$root/service.sh"|"$root/$arch/bin/service.sh") ;; *) echo 'Another installation owns this service name.' >&2; exit 1 ;; esac
-            sudo launchctl bootout "system/$service_name" 2>/dev/null || :
-            sudo launchctl disable "system/$service_name"
+            privileged launchctl bootout "system/$service_name" 2>/dev/null || :
+            privileged launchctl disable "system/$service_name"
         fi
     fi
 }
@@ -130,7 +131,7 @@ initialize_install_settings() {
     mkdir -p "$root/conf"
     # Claim this fresh installation before downloads or login can fail. Keep the first
     # invocation's data directory when a retry is launched from a different directory.
-    jq -n --arg platform "$platform" --arg arch "$arch" --arg work_dir "$(pwd -P)" --argjson owner_uid "$(id -u)" \
+    jq -n --arg platform "$platform" --arg arch "$arch" --arg work_dir "$(pwd -P)" --argjson owner_uid "${runtime_uid:-$(id -u)}" \
         '{platform:$platform,arch:$arch,owner_uid:$owner_uid,work_dir:$work_dir}' > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
 }
@@ -141,8 +142,8 @@ install_main() {
     detect_architecture
     if [ "${1:-auto}" != auto ] && [ "$1" != "$arch" ]; then echo "Architecture mismatch: requested $1, host $arch" >&2; exit 1; fi
     check_linux_host
-    [ "$(id -u)" -ne 0 ] || { echo 'Use a normal user; sudo is used for system setup.' >&2; exit 1; }
-    sudo -v
+    root_install=false
+    if [ "$(id -u)" = 0 ]; then root_install=true; else sudo -v; fi
     if ! command -v jq >/dev/null 2>&1; then
         if [ "$platform" = macos ]; then
             if ! command -v brew >/dev/null 2>&1; then
@@ -152,15 +153,29 @@ install_main() {
                 if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"; else eval "$(/usr/local/bin/brew shellenv)"; fi
             fi
             brew install jq
-        elif command -v apt-get >/dev/null; then sudo apt-get update; sudo apt-get install -y jq ca-certificates;
-        elif command -v dnf >/dev/null; then sudo dnf install -y jq ca-certificates;
-        elif command -v zypper >/dev/null; then sudo zypper --non-interactive install jq ca-certificates;
-        elif command -v pacman >/dev/null; then sudo pacman -S --needed --noconfirm jq ca-certificates;
+        elif command -v apt-get >/dev/null; then privileged apt-get update; privileged apt-get install -y jq ca-certificates;
+        elif command -v dnf >/dev/null; then privileged dnf install -y jq ca-certificates;
+        elif command -v zypper >/dev/null; then privileged zypper --non-interactive install jq ca-certificates;
+        elif command -v pacman >/dev/null; then privileged pacman -S --needed --noconfirm jq ca-certificates;
         else echo 'Install jq before running this installer.' >&2; exit 1; fi
     fi
     if [ "$platform" = linux ]; then command -v flock >/dev/null || { echo 'Install util-linux (flock) first.' >&2; exit 1; }; fi
     base=${LOCAL_RUNNER_BASE_URL:-https://raw.githubusercontent.com/suminwell/github-runner/main}
-    default_root=${LOCAL_RUNNER_HOME:-"$HOME/.local/share/github-runner"}/$platform
+    if $root_install; then
+        if ! command -v setfacl >/dev/null; then
+            if command -v apt-get >/dev/null; then apt-get update; apt-get install -y acl;
+            elif command -v dnf >/dev/null; then dnf install -y acl;
+            elif command -v zypper >/dev/null; then zypper --non-interactive install acl;
+            elif command -v pacman >/dev/null; then pacman -S --needed --noconfirm acl;
+            else echo 'Install acl (setfacl) before running this installer as root.' >&2; exit 1; fi
+        fi
+        command -v runuser >/dev/null && command -v useradd >/dev/null || { echo 'Install util-linux (runuser) and shadow/passwd (useradd) first.' >&2; exit 1; }
+        account_helper=$(mktemp -d)
+        fetch linux/account.sh "$account_helper/account.sh"
+        . "$account_helper/account.sh"
+        rm -f "$account_helper/account.sh"; rmdir "$account_helper"
+        default_root=${LOCAL_RUNNER_HOME:-/opt/github-runner}/$platform
+    else default_root=${LOCAL_RUNNER_HOME:-"$HOME/.local/share/github-runner"}/$platform; fi
     previous_root=$HOME/.local/share/github-runner/$platform
     if [ -z "${LOCAL_RUNNER_HOME:-}" ] && { [ -d "$previous_root/.state" ] || [ -d "$previous_root/$arch/.state" ]; }; then default_root=$previous_root; fi
     installed_command=$(command -v ghr || :)
@@ -178,6 +193,7 @@ install_main() {
 '*) echo 'Newlines are not supported in installation paths.' >&2; exit 1 ;; esac
     mkdir -p "$root"
     root=$(cd "$root" && pwd)
+    if $root_install; then account_validate_path "$root"; fi
     known_installation=false
     for settings_file in "$root/conf/settings.json" "$root/.state/settings.json" "$root/$arch/.state/settings.json" "$root/$arch/conf/settings.json"; do
         if [ -f "$settings_file" ]; then
@@ -195,9 +211,15 @@ install_main() {
             [ ! -e "$root/$part" ] || { echo "Both layouts exist at $root; resolve them before upgrading." >&2; exit 1; }
         done
     fi
+    if $root_install; then
+        ROOT=$root
+        account_setup
+        runtime_uid=$account_uid
+    fi
     stop_installed_service
     migrate_layout
     initialize_install_settings
+    if $root_install; then account_protect_config; fi
     mkdir -p "$root/bin/.cache" "$root/bin/tools" "$root/conf"
     jq_path=$(command -v jq)
     gh_path=$(command -v gh || :)
@@ -208,7 +230,9 @@ install_main() {
         if [ "${gh_major:-0}" -lt 2 ] || { [ "${gh_major:-0}" -eq 2 ] && [ "${gh_minor:-0}" -lt 62 ]; }; then gh_path=; fi
     fi
     if [ -z "$gh_path" ]; then
-        temporary=$(mktemp -d "$root/bin/.cache/gh.XXXXXX")
+        download_cache=$root/bin/.cache
+        if $root_install; then download_cache=$root/conf; fi
+        temporary=$(mktemp -d "$download_cache/gh.XXXXXX")
         curl -fsSL --max-time 120 https://api.github.com/repos/cli/cli/releases/latest -o "$temporary/release.json"
         version=$("$jq_path" -r '.tag_name|ltrimstr("v")' "$temporary/release.json")
         cli_arch=$arch; [ "$arch" != x64 ] || cli_arch=amd64
@@ -228,6 +252,10 @@ install_main() {
         gh_path=$root/bin/tools/gh
         rm -rf "$temporary"
     fi
+    if $root_install && [ "$gh_path" != "$root/bin/tools/gh" ]; then
+        cp "$gh_path" "$root/bin/tools/gh"
+        gh_path=$root/bin/tools/gh
+    fi
     "$gh_path" auth status --hostname github.com >/dev/null 2>&1 || "$gh_path" auth login --hostname github.com --web --scopes admin:org,repo
     if [ -n "${GH_TOKEN:-}" ]; then printf '%s\n' "$GH_TOKEN" > "$root/conf/github-token";
     elif [ -n "${GITHUB_TOKEN:-}" ]; then printf '%s\n' "$GITHUB_TOKEN" > "$root/conf/github-token";
@@ -238,10 +266,11 @@ install_main() {
     default_work=$(pwd -P)
     [ ! -f "$root/conf/settings.json" ] || default_work=$root
     [ -f "$root/conf/settings.json" ] || printf '{}\n' > "$root/conf/settings.json"
-    "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" --argjson owner_uid "$(id -u)" --arg default_work "$default_work" \
+    "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" --argjson owner_uid "${runtime_uid:-$(id -u)}" --arg default_work "$default_work" \
         '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
         "$root/conf/settings.json" > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
+    if $root_install; then fetch linux/account.sh "$root/bin/account.sh"; fi
     fetch "$platform/install.sh" "$root/bin/install.sh"
     fetch "$platform/service.sh" "$root/bin/service.sh"
     fetch "$platform/ghr.sh" "$root/bin/ghr.sh"
@@ -249,36 +278,51 @@ install_main() {
     fetch 'linux/wsl.sh' "$root/bin/wsl.sh"
     fetch 'linux/wsl.ps1' "$root/bin/wsl.ps1"
     chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh"
-    /bin/bash "$root/bin/service.sh" prepare
-    if [ "$platform" = linux ]; then sudo /bin/bash "$root/bin/.cache/package/bin/installdependencies.sh"; fi
+    if $root_install; then
+        chgrp "$account_gid" "$root/bin/"*.sh "$root/bin/"*.ps1 "$root/bin/tools" "$root/bin/tools/gh"
+        chmod 755 "$root/bin/"*.sh "$root/bin/tools" "$root/bin/tools/gh"
+        chmod 644 "$root/bin/"*.ps1
+        account_protect_config
+        work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
+        account_work_directory "$work_dir"
+        account_prepare_package
+    else
+        /bin/bash "$root/bin/service.sh" prepare
+        privileged /bin/bash "$root/bin/.cache/package/bin/installdependencies.sh"
+    fi
     /bin/bash "$root/bin/ghr.sh" --install-command
     work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
     mkdir -p "$work_dir/data" "$work_dir/logs"
     printf 'Data/logs directory: %s\n' "$work_dir"
-    user=$(id -un); user_id=$(id -u)
+    user=$(id -un); user_id=$(id -u); service_home=$HOME; service_path=$PATH
+    if $root_install; then
+        user=$account_user; user_id=$account_uid; service_home=$account_home
+        service_path=/usr/local/bin:/usr/bin:/bin
+        printf 'Runner account: %s (UID %s); workflows do not run as root.\n' "$user" "$user_id"
+    fi
     definition=$(mktemp)
     if [ "$platform" = linux ]; then
         [ -d /run/systemd/system ] || { echo 'Linux must be booted with systemd.' >&2; rm -f "$definition"; exit 1; }
         service_name=local-github-runner-$user_id-$arch.service
-        systemd_unit "$user" "$HOME" "$PATH" "$root" > "$definition"
-        sudo install -m 644 "$definition" "/etc/systemd/system/$service_name"
-        sudo systemctl daemon-reload
-        if [ -f "$root/conf/stopped" ]; then sudo systemctl disable "$service_name";
+        systemd_unit "$user" "$service_home" "$service_path" "$root" > "$definition"
+        privileged install -m 644 "$definition" "/etc/systemd/system/$service_name"
+        privileged systemctl daemon-reload
+        if [ -f "$root/conf/stopped" ]; then privileged systemctl disable "$service_name";
         else
-            sudo systemctl enable "$service_name"
-            sudo systemctl restart "$service_name"
-            sudo systemctl is-active --quiet "$service_name"
+            privileged systemctl enable "$service_name"
+            privileged systemctl restart "$service_name"
+            privileged systemctl is-active --quiet "$service_name"
         fi
     else
         service_name=com.suminwell.github-runner.$user_id.$arch
         launchd_plist "$service_name" "$user" "$HOME" "$PATH" "$root" > "$definition"
-        sudo launchctl bootout "system/$service_name" 2>/dev/null || :
-        sudo install -o root -g wheel -m 644 "$definition" "/Library/LaunchDaemons/$service_name.plist"
-        if [ -f "$root/conf/stopped" ]; then sudo launchctl disable "system/$service_name";
+        privileged launchctl bootout "system/$service_name" 2>/dev/null || :
+        privileged install -o root -g wheel -m 644 "$definition" "/Library/LaunchDaemons/$service_name.plist"
+        if [ -f "$root/conf/stopped" ]; then privileged launchctl disable "system/$service_name";
         else
-            sudo launchctl enable "system/$service_name"
-            sudo launchctl bootstrap system "/Library/LaunchDaemons/$service_name.plist"
-            sudo launchctl print "system/$service_name" >/dev/null
+            privileged launchctl enable "system/$service_name"
+            privileged launchctl bootstrap system "/Library/LaunchDaemons/$service_name.plist"
+            privileged launchctl print "system/$service_name" >/dev/null
         fi
     fi
     rm -f "$definition" "$root/install.sh" "$root/service.sh" "$root/ghr.sh"

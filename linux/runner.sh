@@ -4,10 +4,10 @@
 worker_loop() {
     local id=$1 log_file=${2:-} login process_id
     safe_id "$id" || return 1
-    login=$("$JQ" -r --arg id "$id" '.[$id].login // empty' "$ROOT/conf/organizations.json")
+    login=$("$JQ" -r --arg id "$id" '.[$id].login // empty' "$STATE/organizations.json")
     safe_org "$login" || return 1
-    stop_record "$ROOT/conf/children/$id.pid"
-    trap 'stop_record "$ROOT/conf/children/$id.pid"' EXIT
+    stop_record "$STATE/children/$id.pid"
+    trap 'stop_record "$STATE/children/$id.pid"' EXIT
     trap 'exit 0' TERM INT
     cd "$ROOT/runner/$login/app" || return 1
     while [ ! -f "$ROOT/conf/stopped" ]; do
@@ -15,9 +15,9 @@ worker_loop() {
         [ -z "$log_file" ] || exec >> "$log_file" 2>&1
         clean_exec /bin/bash ./run.sh >/dev/null 2>&1 &
         process_id=$!
-        record_pid "$ROOT/conf/children/$id.pid" "$process_id" || :
+        record_pid "$STATE/children/$id.pid" "$process_id" || :
         wait "$process_id" || :
-        rm -f "$ROOT/conf/children/$id.pid"
+        rm -f "$STATE/children/$id.pid"
         sleep "$RESTART" & wait $! || :
     done
 }

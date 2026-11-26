@@ -4,7 +4,7 @@
 
 ## 一行安装
 
-Linux / macOS，在普通用户终端执行：
+Linux（普通用户或 root）/ macOS（普通用户），执行：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/suminwell/github-runner/main/install.sh | sh
@@ -20,13 +20,20 @@ irm https://raw.githubusercontent.com/suminwell/github-runner/main/install.ps1 |
 
 | 平台 | 默认程序安装目录 | 开机托管 |
 | --- | --- | --- |
-| Linux | `~/.local/share/github-runner/linux` | systemd 系统服务，以安装用户运行 |
+| Linux 普通用户 | `~/.local/share/github-runner/linux` | systemd 系统服务，以安装用户运行 |
+| Linux root | `/opt/github-runner/linux` | systemd 系统服务，以专用普通账户 `ghrunner` 运行 |
 | macOS | `~/.local/share/github-runner/macos` | LaunchDaemon，以安装用户运行 |
 | Windows | `C:\ProgramData\local-github-runner\windows` | 计划任务，以 LocalService 运行 |
 
 安装器自动安装或更新 GitHub CLI `gh`（最低 2.62），缺少登录时引导授权，然后下载官方 Actions Runner、校验 SHA-256、配置开机启动。下载失败或取消登录后可直接重试，保留首次安装时的数据目录选择。Linux/macOS 缺少 `jq` 时通过系统包管理器或 Homebrew 安装；Linux 同时安装官方 Runner 所需系统依赖。
 
-首次安装需要 GitHub 授权、Unix 的 sudo 权限或 Windows 管理员权限。无交互输入时使用默认安装目录；也可设置 `LOCAL_RUNNER_HOME` 跳过目录询问，安装器会追加平台名。重复安装会保留已有配置、编号和数据。
+首次安装需要 GitHub 授权、Unix 普通用户的 sudo 权限或 Windows 管理员权限；Linux root 安装无需 sudo。无交互输入时使用默认安装目录；也可设置 `LOCAL_RUNNER_HOME` 跳过目录询问，安装器会追加平台名。重复安装会保留已有配置、编号和数据。
+
+Linux root 安装自动创建锁定登录的系统账户 `ghrunner`，HOME 为 `/var/lib/github-runner/home`，工作流以该普通账户运行，不授予 sudo 权限。安装、登录 GitHub 和 `ghr` 管理命令仍由 root 执行；普通管理用户使用 `sudo ghr ...`。已有普通用户安装应继续以原用户升级，不会自动转换账户。若机器已有同名的非本项目账户，安装器拒绝复用。
+
+root 安装目录及其父目录必须由 root 拥有，且其他用户不能写入。`bin/` 和 `conf/` 中的脚本、配置和凭据由 root 管理；专用账户只读配置，可写 `runner/`、`bin/.cache/`、`conf/runtime/` 和数据、日志。root 安装额外需要 `runuser`、`useradd` 和 POSIX ACL，缺少 `acl` 时会自动安装。即使从 `/root/...` 执行，数据和日志仍默认放在当前目录；安装器给专用账户添加必要的父目录穿越权限和 `data/logs` 写权限，不开放父目录的列表权限，不递归更改已有文件权限。父目录中本来允许读取的文件，在知道路径后可能变得可访问；建议在 `/srv/builds` 等专用构建目录执行安装。需要 root 自动授权的目录及其父目录也须由 root 管理，防止任务替换路径；专用账户本来就能读写的目录可直接使用。已有数据内部若使用其他账户的私有权限，需自行授权。`ghr config --dir` 同样处理新目录权限，重启后切换。
+
+卸载 root 安装时保留专用账户及 HOME，避免遗留数据和日志变成无主文件；重新安装复用原 UID。账户记录保存在 root 管理的 `/var/lib/github-runner/account.json`，不随 `config --dir` 改变。
 
 Linux 需要 systemd、glibc、Bash、curl、tar、util-linux 的 `flock`，不支持 Alpine；macOS 使用系统 Bash 3.2、launchd、`shlock`；Windows 使用 Windows PowerShell 5.1 和任务计划程序。无需 Python 或 C# 服务宿主。
 
@@ -43,7 +50,7 @@ systemd=true
 
 保存正在进行的工作后，在 Windows 执行 `wsl --terminate <发行版名称>`，重新打开该发行版，并使用上面的 Linux 一行安装命令。建议把安装目录、`data` 和 `logs` 放在 Linux 文件系统，例如 `/home/你的用户/`；`/mnt/c` 等 Windows 挂载目录的权限语义和构建性能不同。
 
-**systemd 仅负责发行版启动后的 runner 自启，不能保证 Windows 开机启动发行版，也不能单独保持 WSL 存活。**因此安装器会直接从 WSL 调用 Windows PowerShell，自动带入发行版、Linux 用户和安装目录，并在 Windows 本机弹出 UAC 提权及账户密码提示。所有 WSL 支持代码都放在 `linux/`；无需进入 `windows/`，也无需另开 PowerShell 手动执行安装命令。
+**systemd 仅负责发行版启动后的 runner 自启，不能保证 Windows 开机启动发行版，也不能单独保持 WSL 存活。**因此安装器会直接从 WSL 调用 Windows PowerShell，自动带入发行版、Linux 用户和安装目录，并在 Windows 本机弹出 UAC 提权及账户密码提示。root 安装时 Windows 任务使用专用 Linux 账户 `ghrunner` 保活，Windows 账户仍是发行版所属的账户；推荐使用默认 `/opt/github-runner/linux`，确保 Windows 可读取桥接脚本。所有 WSL 支持代码都放在 `linux/`；无需进入 `windows/`，也无需另开 PowerShell 手动执行安装命令。
 
 若取消了提示或需要更新任务凭据，在同一个 WSL 发行版内重试：
 
@@ -145,7 +152,7 @@ ghr restart
 
 ## 源码与运行目录
 
-每个平台维护四个职责独立的脚本，没有架构子目录或公共代码目录：
+每个平台维护职责独立的脚本，没有架构子目录或公共代码目录：
 
 ```text
 install.sh                      # Linux/macOS 统一入口
@@ -182,7 +189,7 @@ linux/                          # macos 同结构；windows 对应 .ps1
 
 Windows 使用 `.ps1`，并包含 `bin/ghr.cmd` 和组织目录下的 `listener.ps1`。服务持续维护每个组织的 Runner：进程异常退出会恢复，系统重启后重新上线。Windows 使用开机触发、失败重启和每分钟检查的计划任务，文件锁与 `IgnoreNew` 避免重复启动。系统重启不会恢复已经中断的 job 进度；macOS FileVault 仍需先解锁启动磁盘。
 
-Linux 安装还包含 `bin/wsl.sh`（来自 `linux/wsl.sh`，保活与命令桥接）和 `bin/wsl.ps1`（来自 `linux/wsl.ps1`，由 WSL 调用以管理 Windows 宿主任务）。普通 Linux 不配置宿主任务时不会调用 Windows 程序。WSL 完成宿主设置后在 `conf/wsl-host.json` 保存非敏感任务信息，切换 `data/logs` 不改变此任务。`windows/` 始终只用于原生 Windows Runner 安装。
+Linux root 安装另有 `bin/account.sh`（来自 `linux/account.sh`），负责专用账户、目录授权和管理命令的权限切换；可写运行状态位于 `conf/runtime/`。普通用户安装保留原有 `conf/` 布局。Linux 安装还包含 `bin/wsl.sh`（来自 `linux/wsl.sh`，保活与命令桥接）和 `bin/wsl.ps1`（来自 `linux/wsl.ps1`，由 WSL 调用以管理 Windows 宿主任务）。普通 Linux 不配置宿主任务时不会调用 Windows 程序。WSL 完成宿主设置后在 `conf/wsl-host.json`（root 安装为 `conf/runtime/wsl-host.json`）保存非敏感任务信息，切换 `data/logs` 不改变此任务。`windows/` 始终只用于原生 Windows Runner 安装。
 
 ## Runner 编号与派活
 
@@ -233,6 +240,8 @@ bash .test/wsl.sh
 bash .test/install-retry.sh
 bash .test/uninstall-recovery.sh
 bash .test/status.sh
+# 需要 Docker；只在一次性 Linux 容器内创建账户并验证 root 安装
+bash .test/root-install.sh
 ```
 
 ```powershell
@@ -243,4 +252,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .test/uninstall-recovery.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .test/status.ps1
 ```
 
-测试使用临时目录、假 GitHub API 和系统服务接口，验证注册编号、目录升级、真实子进程恢复、启停、配置生效、日志跟踪和卸载；不安装本机服务，不注册真实 Runner。CI 在 Linux、macOS、Windows 上运行，分别模拟 x64/arm64 配置。真实组织接单、两种原生硬件及系统重启恢复仍需集成验收。
+测试使用临时目录、假 GitHub API 和系统服务接口，验证注册编号、目录升级、真实子进程恢复、启停、配置生效、日志跟踪和卸载；不安装本机服务，不注册真实 Runner。CI 在 Linux、macOS、Windows 上运行，分别模拟 x64/arm64 配置。root 安装测试在一次性 Debian 容器内使用真实 UID、ACL 和进程，模拟 GitHub、官方 Runner 下载内容及 systemd 接口，覆盖中断重试、普通账户接活、配置保护、启停、重装和卸载。真实组织接单、两种原生硬件及系统重启恢复仍需集成验收。

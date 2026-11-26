@@ -66,10 +66,10 @@ native_service() {
     fi
 }
 stop_processes() {
-    stop_record "$ROOT/conf/manager.pid"
+    stop_record "$STATE/manager.pid"
     wait_for_lock || { printf 'Manager is still running.\n' >&2; return 1; }
-    trap 'if [ "$OS" = macos ]; then rm -f "$ROOT/conf/service.lock"; fi' EXIT
-    stop_records "$ROOT"/conf/workers/*.pid "$ROOT"/conf/children/*.pid "$ROOT"/conf/timeouts/*.pid
+    trap 'if [ "$OS" = macos ]; then rm -f "$STATE/service.lock"; fi' EXIT
+    stop_records "$STATE"/workers/*.pid "$STATE"/children/*.pid "$STATE"/timeouts/*.pid
 }
 stop_installation() {
     native_service stop || return 1
@@ -79,12 +79,12 @@ stop_installation() {
     printf 'Runner stopped; automatic startup disabled. Run ghr start to resume.\n'
 }
 release_control_lock() {
-    if [ "$OS" = macos ]; then rm -f "$ROOT/conf/service.lock"; else exec 9>&-; fi
+    if [ "$OS" = macos ]; then rm -f "$STATE/service.lock"; else exec 9>&-; fi
     trap - EXIT
 }
 start_installation() {
     # A start on an already-running manager must not activate pending configuration.
-    if record_alive "$ROOT/conf/manager.pid"; then wsl_host start || return 1; printf 'Runner already running. Use ghr restart to apply configuration.\n'; return 0; fi
+    if record_alive "$STATE/manager.pid"; then wsl_host start || return 1; printf 'Runner already running. Use ghr restart to apply configuration.\n'; return 0; fi
     rm -f "$ROOT/conf/stopped" || return 1
     native_service start || { printf 'stopped\n' | atomic "$ROOT/conf/stopped"; return 1; }
     wsl_host start || return 1
@@ -104,7 +104,7 @@ configure_directory() {
 }
 show_logs() {
     local active=$WORK_DIR file
-    [ ! -f "$ROOT/conf/active-work-dir" ] || active=$(cat "$ROOT/conf/active-work-dir")
+    [ ! -f "$STATE/active-work-dir" ] || active=$(cat "$STATE/active-work-dir")
     file=$active/logs/service.log
     if [ "${1:-}" = -f ]; then
         [ -f "$file" ] || touch "$file"
@@ -116,8 +116,8 @@ unregister_untracked_runners() {
     # A registration can finish before save_entry. Its official metadata remains the
     # ownership evidence until the entire uninstall succeeds, including retry failures.
     local config directory runner_id name login organization id remote targets failed=0
-    "$JQ" -e 'type=="object" and all(to_entries[]; (.key|test("^[1-9][0-9]*$")) and (.value|type=="object") and (.value.login|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")) and (.value.runner_id|type=="number" and .>0 and floor==.))' "$ROOT/conf/organizations.json" >/dev/null || { printf 'Invalid registration state; retained installation for repair.\n' >&2; return 1; }
-    targets=$(mktemp "$ROOT/conf/unregister.XXXXXX") || return 1
+    "$JQ" -e 'type=="object" and all(to_entries[]; (.key|test("^[1-9][0-9]*$")) and (.value|type=="object") and (.value.login|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")) and (.value.runner_id|type=="number" and .>0 and floor==.))' "$STATE/organizations.json" >/dev/null || { printf 'Invalid registration state; retained installation for repair.\n' >&2; return 1; }
+    targets=$(mktemp "$STATE/unregister.XXXXXX") || return 1
     for config in "$ROOT"/runner/*/app/.runner; do
         [ -e "$config" ] || [ -L "$config" ] || continue
         directory=${config%/app/.runner}
@@ -125,7 +125,7 @@ unregister_untracked_runners() {
         runner_id=$("$JQ" -er '.agentId | select(type=="number" and .>0 and floor==.) | tostring' "$config") || { failed=1; break; }
         # A runner ID is scoped to its organization. The existing directory/state
         # pair supports older metadata; all other directories use the official URL.
-        if "$JQ" -e '.gitHubUrl==null' "$config" >/dev/null && "$JQ" -e --arg login "${directory##*/}" --argjson runner_id "$runner_id" 'any(.[]; .login==$login and .runner_id==$runner_id)' "$ROOT/conf/organizations.json" >/dev/null; then continue; fi
+        if "$JQ" -e '.gitHubUrl==null' "$config" >/dev/null && "$JQ" -e --arg login "${directory##*/}" --argjson runner_id "$runner_id" 'any(.[]; .login==$login and .runner_id==$runner_id)' "$STATE/organizations.json" >/dev/null; then continue; fi
         name=$("$JQ" -er '.agentName | select(type=="string")' "$config") || { failed=1; break; }
         if [ "$name" != "$PREFIX" ] && ! indexed_name "$name"; then failed=1; break; fi
         login=$("$JQ" -er '.gitHubUrl | capture("^https://github\\.com/(?<login>[A-Za-z0-9][A-Za-z0-9-]{0,38})/?$";"i") | .login' "$config") || { failed=1; break; }
@@ -133,7 +133,7 @@ unregister_untracked_runners() {
         id=$(printf '%s' "$organization" | "$JQ" -er '.id | select(type=="number" and .>0 and floor==.) | tostring') || { failed=1; break; }
         login=$(printf '%s' "$organization" | "$JQ" -er '.login') || { failed=1; break; }
         safe_org "$login" || { failed=1; break; }
-        if "$JQ" -e --arg id "$id" --argjson runner_id "$runner_id" '.[$id].runner_id==$runner_id' "$ROOT/conf/organizations.json" >/dev/null; then continue; fi
+        if "$JQ" -e --arg id "$id" --argjson runner_id "$runner_id" '.[$id].runner_id==$runner_id' "$STATE/organizations.json" >/dev/null; then continue; fi
         remote=$(list_runners "$login") || { failed=1; break; }
         if ! printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" 'any(.[]; .id==$id)' >/dev/null; then continue; fi
         printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" --arg name "$name" '[.[]|select(.id==$id)] | length==1 and .[0].name==$name' >/dev/null || { failed=1; break; }
@@ -160,8 +160,8 @@ unregister_runners() {
         if printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" 'any(.[]; .id==$id)' >/dev/null; then
             if ! api "orgs/$login/actions/runners/$runner_id" --method DELETE >/dev/null; then printf 'Cannot unregister %s/%s; retry uninstall.\n' "$login" "$runner_id" >&2; failed=1; continue; fi
         fi
-        jq_update "$ROOT/conf/organizations.json" --arg id "$id" 'del(.[$id])' || return 1
-    done < <("$JQ" -r 'to_entries[]|[.key,.value.login,.value.runner_id]|@tsv' "$ROOT/conf/organizations.json")
+        jq_update "$STATE/organizations.json" --arg id "$id" 'del(.[$id])' || return 1
+    done < <("$JQ" -r 'to_entries[]|[.key,.value.login,.value.runner_id]|@tsv' "$STATE/organizations.json")
     return "$failed"
 }
 uninstall() {
@@ -196,6 +196,11 @@ command_main() {
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     umask 077
+    if [ -f "$ROOT/bin/account.sh" ]; then
+        . "$ROOT/bin/account.sh"
+        account_command "$@"
+        exit $?
+    fi
     init control || exit 1
     command_main "$@"
 fi

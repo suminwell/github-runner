@@ -31,6 +31,10 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: bash .test/wsl.sh
+      - name: Exercise root installation in an isolated Linux container
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash .test/root-install.sh
       - name: Exercise interrupted installs and uninstall recovery
         if: runner.os != 'Windows'
         shell: bash
