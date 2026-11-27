@@ -18,8 +18,9 @@ function Write-Json([string]$Path, $Value) { Write-AtomicText $Path ($Value | Co
 function Read-Json([string]$Path) {
     try {
         if (Test-Path -LiteralPath $Path) { return (Get-Content -Raw -Encoding UTF8 -LiteralPath $Path | ConvertFrom-Json) }
-    } catch [System.Management.Automation.ItemNotFoundException] {
-        # Concurrent replacement/removal can invalidate the existence check.
+    } catch [System.Management.Automation.ItemNotFoundException], [System.IO.FileNotFoundException] {
+        # Concurrent replacement/removal can invalidate the existence check; a file caught
+        # mid-replacement surfaces as FileNotFoundException rather than ItemNotFound.
         # Missing records have always meant absent; retain other read/JSON errors.
         return $null
     }

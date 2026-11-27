@@ -121,6 +121,10 @@ try {
                 Microsoft.PowerShell.Management\Get-Content -Raw -Encoding $Encoding -LiteralPath $LiteralPath
             }
             Assert ($null -eq (Read-Json $vanishing)) 'record removed during read is absent, not a fatal error'
+            # Opened while File.Replace swaps it in: the provider reports a file, not an item.
+            function Get-Content { param([switch]$Raw, [string]$Encoding, [string]$LiteralPath); throw (New-Object IO.FileNotFoundException('Could not find file', $LiteralPath)) }
+            Write-Json $vanishing @{ value=1 }
+            Assert ($null -eq (Read-Json $vanishing)) 'record replaced during read is absent, not a fatal error'
         }
         $invalidJson = Join-Path $testRoot 'conf\invalid.json'
         Write-AtomicText $invalidJson '{invalid'
