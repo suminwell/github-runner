@@ -69,7 +69,7 @@ wait "$manager" 2>/dev/null || :; manager=
 assert test -f "$ROOT/conf/stopped"
 assert test -f "$FIXTURE/disabled"
 command_main status > "$FIXTURE/status"
-assert grep -q 'Manager: stopped' "$FIXTURE/status"
+assert grep -q -E '^Manager +stopped' "$FIXTURE/status"
 # An unreadable native state or a stop that did nothing must be an explicit failure.
 touch "$FIXTURE/bus-error"
 if native_service stop > "$FIXTURE/bus-output" 2>&1; then echo 'Ignored systemd query failure' >&2; exit 1; fi

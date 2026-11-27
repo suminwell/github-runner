@@ -46,6 +46,8 @@ try {
         return ,$result
     }
     $mid = [string][char]0x251C + [char]0x2500 + [char]0x2500; $end = [string][char]0x2514 + [char]0x2500 + [char]0x2500
+    function Field([string]$Item, [string]$Value) { return ('{0,-26} {1}' -f $Item,$Value) }
+    function Has-Line([string]$Report, [string]$Line) { return @($Report -split "`r?`n") -ccontains $Line }
     function Capture-Status {
         $script:StatusFailed = $false
         return (& { try { Show-Status } catch { $script:StatusFailed = $true; Write-Host $_.Exception.Message } } 6>&1 | Out-String -Width 240)
@@ -53,39 +55,42 @@ try {
     $before = Get-Content -Raw -LiteralPath (Join-Path $fixture 'conf/organizations.json')
     $report = Capture-Status
     Assert $script:StatusFailed 'API failure preserved'
-    Assert ($report.Contains("Manager: running (PID $PID)")) 'manager and PID'
-    Assert ($report.Contains("Install directory: $fixture")) 'installation directory'
-    Assert ($report.Contains("Data directory: $(Join-Path $oldWork 'data')") -and $report.Contains("Logs directory: $(Join-Path $oldWork 'logs')")) 'current data and log paths'
-    Assert ($report.Contains("Configuration: pending; next start uses $(Join-Path $newWork 'data')")) 'pending data directory explicit'
+    Assert ((Has-Line $report (Field 'Manager' "running (PID $PID)"))) 'manager and PID'
+    Assert ((Has-Line $report (Field 'Install directory' $fixture))) 'installation directory'
+    Assert ((Has-Line $report (Field 'Data directory' (Join-Path $oldWork 'data'))) -and (Has-Line $report (Field 'Logs directory' (Join-Path $oldWork 'logs')))) 'current data and log paths'
+    Assert ($report.Contains((Field 'Configuration' "pending; next start uses $(Join-Path $newWork 'data')"))) 'pending data directory explicit'
+    Assert ($report -match '(?m)^ITEM +VALUE\s*$') 'overview table header'
+    $tables = @('ITEM ', "`nConfiguration ", 'ORGANIZATION / RUNNER', "`nSUMMARY ", "`nOrganizations ", "`nLocal ") | ForEach-Object { $report.IndexOf($_) }
+    Assert (-not ($tables -contains -1) -and (($tables | Sort-Object) -join ',') -eq ($tables -join ',')) 'overview, runner and summary tables in order'
     $alpha = Get-Block $report 'alpha'; $beta = Get-Block $report 'beta'; $gamma = Get-Block $report 'gamma'; $denied = Get-Block $report 'denied'
     Assert ($report -match '(?m)^ORGANIZATION / RUNNER +GITHUB +BUSY +LOCAL +PID\s*$') 'tree header'
     Assert ($alpha[0].StartsWith("$mid $script:Prefix-1 ") -and $alpha[0] -match ' online +true +running +\d+\s*$') 'online busy listener'
     Assert ($beta.Count -eq 1 -and $beta[0].StartsWith("$end ") -and $beta[0] -match ' offline +false +restarting +\d+\s*$') 'worker without listener is restarting'
     Assert ($gamma[0] -match ' missing +- +paused +-\s*$' -and $gamma[1].StartsWith("$end ") -and $gamma[1] -match ' online +false +other +-\s*$') 'missing ID is not confused with matching name'
     Assert ($denied.Count -eq 1 -and $denied[0] -match ' unknown +\? +stopped +-\s*$') 'API error is unknown'
-    $header = @($report -split "`r?`n" | Where-Object { $_ -like 'ORGANIZATION*' })[0]
+    $header = @($report -split "`r?`n" | Where-Object { $_ -clike 'ORGANIZATION /*' })[0]
     Assert ($header.IndexOf('GITHUB') -eq $alpha[0].IndexOf('online')) 'columns align with the header'
-    Assert ($report.Contains('GitHub: 1 online, 1 offline, 1 missing, 1 unknown; 1 busy') -and $report.Contains('Local: 1 running, 1 restarting, 2 stopped/paused')) 'remote and local counts'
+    Assert ((Has-Line $report (Field 'GitHub' '1 online, 1 offline, 1 missing, 1 unknown; 1 busy')) -and (Has-Line $report (Field 'Local' '1 running, 1 restarting, 2 stopped/paused'))) 'remote and local counts'
     $alphaRows = @($alpha | ForEach-Object { ($_ -split ' +')[1] })
     Assert (($alphaRows -join ',') -ceq "$script:Prefix-1,Build-box,local-linux-x64-1,zeta-manual") 'other runners follow this installation, sorted by name'
     Assert ($alpha[1] -match ' Build-box +online +true +other +-\s*$') 'busy runner of another machine'
     Assert ($alpha[2] -match ' local-linux-x64-1 +offline +\? +other +-\s*$') 'other platform runner'
     Assert ($alpha[3].StartsWith("$end zeta-manual ")) 'last runner closes the branch'
-    Assert ($report.Contains('Other runners in these organizations: 4 (3 online, 1 offline); 1 busy')) 'other runner counts'
+    Assert ((Has-Line $report (Field 'Other runners' '4 (3 online, 1 offline); 1 busy'))) 'other runner counts'
     Assert ((Get-Content -Raw -LiteralPath (Join-Path $fixture 'conf/organizations.json')) -ceq $before) 'status leaves registrations unchanged'
     $script:Deny = $false
     Remove-Item -LiteralPath (Join-Path $fixture 'conf/manager.json')
     Write-AtomicText (Join-Path $fixture 'conf/stopped') 'stopped'
     $report = Capture-Status
-    Assert (-not $script:StatusFailed -and $report.Contains('Manager: stopped (run ghr start to resume)') -and $report.Contains("$oldWork (last run; manager stopped)")) 'stopped manager retains last-run directory'
+    Assert (-not $script:StatusFailed -and (Has-Line $report (Field 'Manager' 'stopped (run ghr start to resume)')) -and $report.Contains("$oldWork (last run; manager stopped)")) 'stopped manager retains last-run directory'
     Record-Process (Join-Path $fixture 'conf/manager.json') $current
     Remove-Item -LiteralPath (Join-Path $fixture 'conf/stopped')
     Write-AtomicText (Join-Path $fixture 'conf/active-work-dir') $newWork
     $report = Capture-Status
-    Assert ($report.Contains("Data directory: $(Join-Path $newWork 'data')") -and $report.Contains('Configuration: no pending directory change')) 'applied directory reflected'
+    Assert ((Has-Line $report (Field 'Data directory' (Join-Path $newWork 'data'))) -and (Has-Line $report (Field 'Configuration' 'no pending directory change'))) 'applied directory reflected'
     Save-State @{}
     Remove-Item -LiteralPath (Join-Path $fixture 'conf/manager.json'),(Join-Path $fixture 'conf/active-work-dir')
     $report = Capture-Status
-    Assert ($report.Contains('configured; not started yet') -and $report.Contains('No runners registered yet.') -and $report.Contains('Organizations: 0')) 'empty installation still shows overview'
+    Assert ($report.Contains('configured; not started yet') -and $report.Contains('No runners registered yet.') -and (Has-Line $report (Field 'Organizations' '0'))) 'empty installation still shows overview'
     Write-Host 'PASS Windows status: directories, pending config, process states and GitHub results'
 } finally { if (Test-Path $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force } }

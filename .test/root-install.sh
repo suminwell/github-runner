@@ -163,7 +163,7 @@ printf 'private\n' > /root/private
 chmod 600 /root/private
 if runuser -u ghrunner -- cat /root/private >/dev/null 2>&1; then echo 'Root private file readable' >&2; exit 1; fi
 ghr status > /fixture/status
-assert grep -q 'Runner account: ghrunner' /fixture/status
+assert grep -q -E '^Runner account +ghrunner' /fixture/status
 assert grep -q 'online' /fixture/status
 ghr config --dir '/root/new work'
 assert test "$(cat "$root/conf/runtime/active-work-dir")" = /root/builds
@@ -185,7 +185,7 @@ assert grep -q 'Started Shell supervisor' /fixture/logs
 ghr stop
 assert test -f "$root/conf/stopped"
 ghr status > /fixture/stopped-status
-assert grep -q 'Manager: stopped' /fixture/stopped-status
+assert grep -q -E '^Manager +stopped' /fixture/stopped-status
 assert test ! -f /fixture/active
 # A forged PID file must never let root management signal an unrelated root process.
 sleep 120 & unrelated=$!

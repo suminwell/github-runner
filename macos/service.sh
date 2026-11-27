@@ -424,12 +424,16 @@ status() {
     local failed=0 count=0 online=0 offline=0 missing=0 unknown=0 jobs=0 listening=0 restarting=0
     local others other_name other_status other_busy other_count=0 other_online=0 other_offline=0 other_jobs=0
     local manager=stopped work=$WORK_DIR directory_state='configured; not started yet' work_prefix configured_prefix
+    local -a items=() notes=()
+    # Three tables: the installation overview, the organizations and their runners, then the counts.
+    item() { items+=("$1" "$2"); }
     if record_alive "$ROOT/conf/manager.pid"; then manager=running; fi
-    printf 'GitHub Runner status\nPlatform: %s / %s\n' "$OS" "$ARCH"
-    if [ "$manager" = running ]; then printf 'Manager: running (PID %s)\n' "$(head -n 1 "$ROOT/conf/manager.pid")";
-    elif [ -f "$ROOT/conf/stopped" ]; then printf 'Manager: stopped (run ghr start to resume)\n';
-    else printf 'Manager: stopped\n'; fi
-    printf 'Install directory: %s\nRunner directory: %s/runner\n' "$ROOT" "$ROOT"
+    item Platform "$OS / $ARCH"
+    if [ "$manager" = running ]; then item Manager "running (PID $(head -n 1 "$ROOT/conf/manager.pid"))"
+    elif [ -f "$ROOT/conf/stopped" ]; then item Manager 'stopped (run ghr start to resume)'
+    else item Manager stopped; fi
+    item 'Install directory' "$ROOT"
+    item 'Runner directory' "$ROOT/runner"
     if [ -s "$ROOT/conf/active-work-dir" ]; then
         work=$(cat "$ROOT/conf/active-work-dir")
         directory_state='last run; manager stopped'
@@ -437,12 +441,17 @@ status() {
     fi
     work_prefix=$work; [ "$work" != / ] || work_prefix=
     configured_prefix=$WORK_DIR; [ "$WORK_DIR" != / ] || configured_prefix=
-    printf 'Work directory: %s (%s)\nData directory: %s/data\nLogs directory: %s/logs\n' "$work" "$directory_state" "$work_prefix" "$work_prefix"
-    printf 'Configured work directory: %s\n' "$WORK_DIR"
+    item 'Work directory' "$work ($directory_state)"
+    item 'Data directory' "$work_prefix/data"
+    item 'Logs directory' "$work_prefix/logs"
+    item 'Configured work directory' "$WORK_DIR"
     if [ "$work" != "$WORK_DIR" ]; then
-        printf 'Configuration: pending; next start uses %s/data and %s/logs\n' "$configured_prefix" "$configured_prefix"
-        printf 'Run ghr restart (or stop then start) to apply.\n'
-    else printf 'Configuration: no pending directory change\n'; fi
+        item Configuration "pending; next start uses $configured_prefix/data and $configured_prefix/logs"
+        notes+=('Run ghr restart (or stop then start) to apply the pending directory change.')
+    else item Configuration 'no pending directory change'; fi
+    printf 'GitHub Runner status\n\n%-26s %s\n' ITEM VALUE
+    printf '%-26s %s\n' "${items[@]}"
+    items=()
     # A tree: each organization, then its runners (this installation's first). The branch
     # is printed apart from the padded columns, so multibyte line characters keep alignment.
     local row_format='%s %-32s %-9s %-5s %-11s %s\n' middle='|--' last='`--' other_total branch
@@ -481,12 +490,17 @@ status() {
             printf "$row_format" "$branch" "$other_name" "$other_status" "$other_busy" other -
         done <<< "$others"
     done < <("$JQ" -r 'to_entries|sort_by(.value.login)[]|[.key,.value.login,.value.runner_id,(.value.runner_name // "unknown"),(.value.active != false)]|@tsv' "$ROOT/conf/organizations.json")
+    item Organizations "$count"
+    item GitHub "$online online, $offline offline, $missing missing, $unknown unknown; $jobs busy"
+    [ "$other_count" = 0 ] || item 'Other runners' "$other_count ($other_online online, $other_offline offline); $other_jobs busy"
+    item Local "$listening running, $restarting restarting, $((count-listening-restarting)) stopped/paused"
+    [ "$restarting" = 0 ] || notes+=('restarting: organization worker is alive; listener is not running yet.')
+    [ "$failed" = 0 ] || notes+=('Some GitHub statuses could not be queried; unknown does not mean offline.')
     [ "$count" -ne 0 ] || printf 'No runners registered yet. Use ghr logs to check discovery and registration.\n'
-    printf '\nOrganizations: %s\nGitHub: %s online, %s offline, %s missing, %s unknown; %s busy\n' "$count" "$online" "$offline" "$missing" "$unknown" "$jobs"
-    [ "$other_count" = 0 ] || printf 'Other runners in these organizations: %s (%s online, %s offline); %s busy\n' "$other_count" "$other_online" "$other_offline" "$other_jobs"
-    printf 'Local: %s running, %s restarting, %s stopped/paused\n' "$listening" "$restarting" "$((count-listening-restarting))"
-    [ "$restarting" = 0 ] || printf 'restarting: organization worker is alive; listener is not running yet.\n'
-    [ "$failed" = 0 ] || printf 'Some GitHub statuses could not be queried; unknown does not mean offline.\n'
+    printf '\n%-26s %s\n' SUMMARY VALUE
+    printf '%-26s %s\n' "${items[@]}"
+    [ "${#notes[@]}" = 0 ] || printf '\n'
+    [ "${#notes[@]}" = 0 ] || printf '%s\n' "${notes[@]}"
     return "$failed"
 }
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then

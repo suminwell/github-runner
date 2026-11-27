@@ -78,27 +78,32 @@ function Start-Installation {
 }
 function Show-Status {
     $manager = Get-RecordedProcess (Join-Path $script:Root 'conf\manager.json')
-    Write-Host 'GitHub Runner status'
-    Write-Host "Platform: windows / $($script:Settings.arch)"
-    if ($manager) { Write-Host "Manager: running (PID $($manager.Id))" }
-    elseif (Test-Path (Join-Path $script:Root 'conf\stopped')) { Write-Host 'Manager: stopped (run ghr start to resume)' }
-    else { Write-Host 'Manager: stopped' }
-    Write-Host "Install directory: $script:Root"
-    Write-Host "Runner directory: $(Join-Path $script:Root 'runner')"
+    # Three tables: the installation overview, the organizations and their runners, then the counts.
+    $items = New-Object Collections.Generic.List[object]; $notes = @()
+    $items.Add(@('Platform', "windows / $($script:Settings.arch)"))
+    if ($manager) { $items.Add(@('Manager', "running (PID $($manager.Id))")) }
+    elseif (Test-Path (Join-Path $script:Root 'conf\stopped')) { $items.Add(@('Manager', 'stopped (run ghr start to resume)')) }
+    else { $items.Add(@('Manager', 'stopped')) }
+    $items.Add(@('Install directory', $script:Root))
+    $items.Add(@('Runner directory', (Join-Path $script:Root 'runner')))
     $work = $script:WorkDir; $directoryState = 'configured; not started yet'
     $active = Join-Path $script:Root 'conf\active-work-dir'
     if ((Test-Path $active) -and (Get-Item -LiteralPath $active).Length -gt 0) {
         $work = (Get-Content -Raw -Encoding UTF8 -LiteralPath $active).TrimEnd("`r","`n")
         $directoryState = if ($manager) { 'active' } else { 'last run; manager stopped' }
     }
-    Write-Host "Work directory: $work ($directoryState)"
-    Write-Host "Data directory: $(Join-Path $work 'data')"
-    Write-Host "Logs directory: $(Join-Path $work 'logs')"
-    Write-Host "Configured work directory: $script:WorkDir"
+    $items.Add(@('Work directory', "$work ($directoryState)"))
+    $items.Add(@('Data directory', (Join-Path $work 'data')))
+    $items.Add(@('Logs directory', (Join-Path $work 'logs')))
+    $items.Add(@('Configured work directory', $script:WorkDir))
     if ($work -ne $script:WorkDir) {
-        Write-Host "Configuration: pending; next start uses $(Join-Path $script:WorkDir 'data') and $(Join-Path $script:WorkDir 'logs')"
-        Write-Host 'Run ghr restart (or stop then start) to apply.'
-    } else { Write-Host 'Configuration: no pending directory change' }
+        $items.Add(@('Configuration', "pending; next start uses $(Join-Path $script:WorkDir 'data') and $(Join-Path $script:WorkDir 'logs')"))
+        $notes += 'Run ghr restart (or stop then start) to apply the pending directory change.'
+    } else { $items.Add(@('Configuration', 'no pending directory change')) }
+    Write-Host 'GitHub Runner status'; Write-Host ''
+    Write-Host ('{0,-26} {1}' -f 'ITEM','VALUE')
+    foreach ($item in $items) { Write-Host ('{0,-26} {1}' -f $item[0],$item[1]) }
+    $items.Clear()
     $state = Get-State; $failed = $false
     $online = 0; $offline = 0; $missing = 0; $unknown = 0; $jobs = 0; $listening = 0; $restarting = 0
     $otherCount = 0; $otherOnline = 0; $otherOffline = 0; $otherJobs = 0
@@ -150,11 +155,15 @@ function Show-Status {
         }
     }
     if (-not $state.Count) { Write-Host 'No runners registered yet. Use ghr logs to check discovery and registration.' }
-    Write-Host "`nOrganizations: $($state.Count)"
-    Write-Host "GitHub: $online online, $offline offline, $missing missing, $unknown unknown; $jobs busy"
-    if ($otherCount) { Write-Host "Other runners in these organizations: $otherCount ($otherOnline online, $otherOffline offline); $otherJobs busy" }
-    Write-Host "Local: $listening running, $restarting restarting, $($state.Count - $listening - $restarting) stopped/paused"
-    if ($restarting) { Write-Host 'restarting: organization worker is alive; listener is not running yet.' }
+    $items.Add(@('Organizations', "$($state.Count)"))
+    $items.Add(@('GitHub', "$online online, $offline offline, $missing missing, $unknown unknown; $jobs busy"))
+    if ($otherCount) { $items.Add(@('Other runners', "$otherCount ($otherOnline online, $otherOffline offline); $otherJobs busy")) }
+    $items.Add(@('Local', "$listening running, $restarting restarting, $($state.Count - $listening - $restarting) stopped/paused"))
+    if ($restarting) { $notes += 'restarting: organization worker is alive; listener is not running yet.' }
+    Write-Host ''; Write-Host ('{0,-26} {1}' -f 'SUMMARY','VALUE')
+    foreach ($item in $items) { Write-Host ('{0,-26} {1}' -f $item[0],$item[1]) }
+    if ($notes.Count -or $failed) { Write-Host '' }
+    foreach ($note in $notes) { Write-Host $note }
     if ($failed) { throw 'Some GitHub statuses could not be queried; unknown does not mean offline.' }
 }
 function Show-Logs([switch]$Track) {

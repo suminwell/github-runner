@@ -5,6 +5,8 @@ fixture=$(mktemp -d "${TMPDIR:-/tmp}/runner-status.XXXXXX")
 trap 'rm -rf "$fixture"' EXIT
 assert() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; }
 # The runners printed under organization $1, one per line, without the branch.
+# The overview table row for item $1 with value $2.
+field() { printf '%-26s %s' "$1" "$2"; }
 block() { awk -v org="$1" '$0==org {on=1; next} on && /^(\|--|`--) / {print; next} {on=0}' "$fixture/report"; }
 export LC_ALL=C
 for platform in linux macos; do
@@ -35,11 +37,18 @@ for platform in linux macos; do
     before=$(cat "$ROOT/conf/organizations.json")
     result=0; status > "$fixture/report" || result=$?
     assert test "$result" = 1
-    assert grep -Fq "Manager: running (PID $$)" "$fixture/report"
-    assert grep -Fxq "Install directory: $ROOT" "$fixture/report"
-    assert grep -Fxq "Data directory: $old_work/data" "$fixture/report"
-    assert grep -Fxq "Logs directory: $old_work/logs" "$fixture/report"
-    assert grep -Fq "Configuration: pending; next start uses $new_work/data" "$fixture/report"
+    assert grep -Fxq "$(field Manager "running (PID $$)")" "$fixture/report"
+    assert grep -Fxq "$(field 'Install directory' "$ROOT")" "$fixture/report"
+    assert grep -Fxq "$(field 'Data directory' "$old_work/data")" "$fixture/report"
+    assert grep -Fxq "$(field 'Logs directory' "$old_work/logs")" "$fixture/report"
+    assert grep -Fq "$(field Configuration "pending; next start uses $new_work/data")" "$fixture/report"
+    assert grep -Eq '^ITEM +VALUE$' "$fixture/report"
+    # Three tables: overview, runners, then counts.
+    assert test "$(grep -n '^ITEM' "$fixture/report" | cut -d: -f1)" -lt "$(grep -n '^ORGANIZATION' "$fixture/report" | cut -d: -f1)"
+    assert test "$(grep -n '^Configuration ' "$fixture/report" | cut -d: -f1)" -lt "$(grep -n '^ORGANIZATION' "$fixture/report" | cut -d: -f1)"
+    assert grep -Eq '^SUMMARY +VALUE$' "$fixture/report"
+    assert test "$(grep -n '^ORGANIZATION' "$fixture/report" | cut -d: -f1)" -lt "$(grep -n '^SUMMARY' "$fixture/report" | cut -d: -f1)"
+    assert test "$(grep -n '^SUMMARY' "$fixture/report" | cut -d: -f1)" -lt "$(grep -n '^Organizations ' "$fixture/report" | cut -d: -f1)"
     assert grep -Eq '^ORGANIZATION / RUNNER +GITHUB +BUSY +LOCAL +PID$' "$fixture/report"
     block alpha | head -n 1 | grep -Eq "^\|-- $PREFIX-1 +online +true +running +[0-9]+$"
     assert test "$(block beta)" = "$(block beta | grep -E '^`-- [^ ]+ +offline +false +restarting +[0-9]+$')"
@@ -49,14 +58,14 @@ for platform in linux macos; do
     block denied | grep -Eq '^`-- [^ ]+ +unknown +\? +stopped +-$'
     # Columns line up with the header whatever the runner name.
     assert test "$(awk '/^ORGANIZATION/ {print index($0,"GITHUB")}' "$fixture/report")" = "$(block alpha | head -n 1 | awk '{print index($0,"online")}')"
-    assert grep -Fxq 'GitHub: 1 online, 1 offline, 1 missing, 1 unknown; 1 busy' "$fixture/report"
+    assert grep -Fxq "$(field GitHub '1 online, 1 offline, 1 missing, 1 unknown; 1 busy')" "$fixture/report"
     # All other runners of an organization follow this installation's row, sorted by name.
     assert test "$(block alpha | awk '{print $2}' | paste -sd, -)" = "$PREFIX-1,Build-box,local-macos-arm64-1,zeta-manual"
     block alpha | grep -Eq '^\|-- Build-box +online +true +other +-$'
     block alpha | grep -Eq '^\|-- local-macos-arm64-1 +offline +\? +other +-$'
     block alpha | tail -n 1 | grep -Eq '^`-- zeta-manual +online +false +other +-$'
-    assert grep -Fxq 'Other runners in these organizations: 4 (3 online, 1 offline); 1 busy' "$fixture/report"
-    assert grep -Fxq 'Local: 1 running, 1 restarting, 2 stopped/paused' "$fixture/report"
+    assert grep -Fxq "$(field 'Other runners' '4 (3 online, 1 offline); 1 busy')" "$fixture/report"
+    assert grep -Fxq "$(field Local '1 running, 1 restarting, 2 stopped/paused')" "$fixture/report"
     assert test "$(cat "$ROOT/conf/organizations.json")" = "$before"
     LC_ALL=en_US.UTF-8 status > "$fixture/report" 2>/dev/null || :
     assert grep -Fq "├── $PREFIX-1" "$fixture/report"
@@ -65,20 +74,20 @@ for platform in linux macos; do
     rm "$ROOT/conf/manager.pid"
     touch "$ROOT/conf/stopped"
     status > "$fixture/report"
-    assert grep -Fxq 'Manager: stopped (run ghr start to resume)' "$fixture/report"
+    assert grep -Fxq "$(field Manager 'stopped (run ghr start to resume)')" "$fixture/report"
     assert grep -Fq "$old_work (last run; manager stopped)" "$fixture/report"
     record_pid "$ROOT/conf/manager.pid" "$$"
     rm "$ROOT/conf/stopped"
     printf '%s\n' "$new_work" > "$ROOT/conf/active-work-dir"
     status > "$fixture/report"
-    assert grep -Fxq "Data directory: $new_work/data" "$fixture/report"
-    assert grep -Fxq 'Configuration: no pending directory change' "$fixture/report"
+    assert grep -Fxq "$(field 'Data directory' "$new_work/data")" "$fixture/report"
+    assert grep -Fxq "$(field Configuration 'no pending directory change')" "$fixture/report"
     printf '{}\n' > "$ROOT/conf/organizations.json"
     rm "$ROOT/conf/manager.pid" "$ROOT/conf/active-work-dir"
     status > "$fixture/report"
     assert grep -Fq 'configured; not started yet' "$fixture/report"
     assert grep -Fq 'No runners registered yet.' "$fixture/report"
-    assert grep -Fxq 'Organizations: 0' "$fixture/report"
+    assert grep -Fxq "$(field Organizations 0)" "$fixture/report"
     # A refused request prints its error body on stdout; it must not reach the runner parser,
     # and a missing admin:org scope points at the installer instead of gh auth refresh.
     printf 'token\n' > "$ROOT/conf/github-token"

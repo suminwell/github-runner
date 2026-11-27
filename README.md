@@ -61,7 +61,7 @@ Docker 需要 20.10.10 或更高版本。安装器在改动任何内容之前完
 
 无交互输入时不会自动同意升级或修改软件源；无人值守安装可设置 `LOCAL_RUNNER_ASSUME_YES=yes`，表示同意上述全部询问。也可以在受支持的系统上设置 `LOCAL_RUNNER_RUNTIME=docker` 主动使用 Docker 模式；之后重复安装会沿用已记录的模式，设置 `LOCAL_RUNNER_RUNTIME=native` 重新安装可切回原生运行（仅限受支持的系统）。WSL 内不支持 Docker 模式。
 
-`ghr status` 会显示 `Runtime: Docker (...)`。`ghr uninstall` 保留 Docker 和镜像，因为同一主机上的其他安装可能还在使用；确认不再需要后自行执行 `docker rmi local-github-runner:<架构>`。
+`ghr status` 的第一个表格会显示 `Runtime  Docker (...)`。`ghr uninstall` 保留 Docker 和镜像，因为同一主机上的其他安装可能还在使用；确认不再需要后自行执行 `docker rmi local-github-runner:<架构>`。
 
 ## WSL2 安装与 Windows 未登录时启动
 
@@ -124,23 +124,33 @@ Unix 的入口为 `/usr/local/bin/ghr`，调用安装目录的 `bin/ghr.sh`。Wi
 
 ```text
 GitHub Runner status
-Platform: linux / x64
-Manager: running (PID 4321)
-Install directory: /home/user/.local/share/github-runner/linux
-Runner directory: /home/user/.local/share/github-runner/linux/runner
-Work directory: /srv/builds (active)
-Data directory: /srv/builds/data
-Logs directory: /srv/builds/logs
-Configured work directory: /srv/builds
-Configuration: no pending directory change
 
-ORGANIZATION             RUNNER                           GITHUB    BUSY  LOCAL       PID
-organization-a           local-linux-x64-1                online    true  running     4350
-organization-b           local-linux-x64-2                offline   false restarting  4360
+ITEM                       VALUE
+Platform                   linux / x64
+Manager                    running (PID 4321)
+Install directory          /home/user/.local/share/github-runner/linux
+Runner directory           /home/user/.local/share/github-runner/linux/runner
+Work directory             /srv/builds (active)
+Data directory             /srv/builds/data
+Logs directory             /srv/builds/logs
+Configured work directory  /srv/builds
+Configuration              no pending directory change
 
-Organizations: 2
-GitHub: 1 online, 1 offline, 0 missing, 0 unknown; 1 busy
-Local: 1 running, 1 restarting, 0 stopped/paused
+ORGANIZATION / RUNNER                GITHUB    BUSY  LOCAL       PID
+organization-a
+├── local-linux-x64-1                online    true  running     4350
+├── local-macos-arm64-1              online    false other       -
+└── local-windows-x64-1              offline   false other       -
+organization-b
+└── local-linux-x64-1                offline   false restarting  4360
+
+SUMMARY                    VALUE
+Organizations              2
+GitHub                     1 online, 1 offline, 0 missing, 0 unknown; 1 busy
+Other runners              2 (1 online, 1 offline); 0 busy
+Local                      1 running, 1 restarting, 0 stopped/paused
+
+restarting: organization worker is alive; listener is not running yet.
 ```
 
 修改目录但尚未重启时，会标记 `Configuration: pending` 并列出下次启动使用的数据和日志目录；停止后则标明上次运行的目录。即使尚未注册任何组织，也会保留完整的安装和目录概览。WSL 还会显示 Windows 宿主任务状态。
