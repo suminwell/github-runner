@@ -284,6 +284,19 @@ PATH=/usr/bin:/bin bash "$root/bin/wsl.sh" status
 assert grep -Fxq status /fixture/wsl-arguments
 ghr status > /fixture/status
 assert grep -Fxq status /fixture/wsl-arguments
+# Docker mode's rule, written under the installer's umask, must stay visible to the account
+# that starts the container, while the rule itself stays root-only.
+(
+    sed '/^if \[ -t 0 \]/,$d' "$REPO/linux/install.sh" > /fixture/install-functions.sh
+    . /fixture/install-functions.sh
+    umask 077; definition=$(mktemp)
+    install_job_sudo docker local-github-runner-fixture '#999' ghrunner
+    rm -f "$definition"
+)
+assert runuser -u ghrunner -- test -f /etc/github-runner/sudoers/local-github-runner-fixture
+assert runuser -u ghrunner -- test -f /etc/github-runner/sudoers/local-github-runner-fixture.shadow
+if runuser -u ghrunner -- cat /etc/github-runner/sudoers/local-github-runner-fixture >/dev/null 2>&1; then echo 'FAIL: account can read the sudo rule' >&2; exit 1; fi
+rm -rf /etc/github-runner/sudoers/local-github-runner-fixture*
 ghr uninstall
 assert test ! -e "$sudoers"
 assert test ! -d "$root/conf"

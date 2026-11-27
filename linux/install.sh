@@ -126,7 +126,11 @@ install_job_sudo() {
     fi
     printf '%s\n%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$JOB_SUDO_MARK" "$3" > "$definition"
     if [ "$1" = native ]; then privileged visudo -cqf "$definition" || { echo 'The generated sudoers rule did not validate; sudo was not granted.' >&2; return 1; }
-    else privileged mkdir -p "${sudo_file%/*}"; fi
+    else
+        # The service account checks the rule before it starts the container; the files
+        # themselves stay root-only. 755 also repairs directories the installer's umask hid.
+        privileged mkdir -p "${sudo_file%/*}" && privileged chmod 755 "${sudo_file%/*/*}" "${sudo_file%/*}"
+    fi
     privileged install -o root -g root -m 0440 "$definition" "$sudo_file"
     if [ "$1" = docker ]; then
         # PAM's account check needs a shadow entry; the container gets a locked one for the
