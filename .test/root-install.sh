@@ -232,7 +232,7 @@ assert grep -Fxq SupplementaryGroups=docker "$unit"
 assert grep -q 'Docker access: on (group docker)' /fixture/docker-output
 ghr status > /fixture/status
 assert grep -Eq '^Docker access +on \(group docker\)' /fixture/status
-assert grep -Eq '^Job sudo +off' /fixture/status
+assert grep -Eq '^Job sudo +on; passwordless sudo, which is root on this host' /fixture/status
 LOCAL_RUNNER_DOCKER_ACCESS=no sh "$REPO/install.sh" </dev/null >/dev/null 2>&1
 if grep -q SupplementaryGroups "$unit"; then echo 'Docker access kept after it was turned off' >&2; exit 1; fi
 sh "$REPO/install.sh" </dev/null >/dev/null 2>&1
@@ -242,20 +242,20 @@ LOCAL_RUNNER_DOCKER_ACCESS=yes sh "$REPO/install.sh" </dev/null > /fixture/docke
 assert grep -q 'belongs to group root, so jobs cannot use Docker' /fixture/docker-output
 if grep -q SupplementaryGroups "$unit"; then echo 'Granted a root-owned socket group' >&2; exit 1; fi
 unset LOCAL_RUNNER_DOCKER_SOCKET
-# Passwordless sudo is opt-in, validated, kept on re-runs and removed when turned off.
+# Passwordless sudo is on by default for a root installation, as on GitHub-hosted runners;
+# the rule is validated, and LOCAL_RUNNER_SUDO=no removes it and is remembered on re-runs.
 sudoers=/etc/sudoers.d/local-github-runner-$uid-$arch
-if runuser -u ghrunner -- sudo -n true 2>/dev/null; then echo 'Runner account had sudo by default' >&2; exit 1; fi
-LOCAL_RUNNER_SUDO=yes sh "$REPO/install.sh" </dev/null > /fixture/sudo-output 2>&1
 assert test "$(stat -c '%a %U' "$sudoers")" = '440 root'
 assert runuser -u ghrunner -- sudo -n true
+sh "$REPO/install.sh" </dev/null > /fixture/sudo-output 2>&1
 assert grep -q 'Job sudo: on' /fixture/sudo-output
-sh "$REPO/install.sh" </dev/null >/dev/null 2>&1
-assert runuser -u ghrunner -- sudo -n true
-ghr status > /fixture/status
-assert grep -Eq '^Job sudo +on; passwordless sudo, which is root on this host' /fixture/status
 LOCAL_RUNNER_SUDO=no sh "$REPO/install.sh" </dev/null >/dev/null 2>&1
 assert test ! -e "$sudoers"
 if runuser -u ghrunner -- sudo -n true 2>/dev/null; then echo 'sudo kept after it was turned off' >&2; exit 1; fi
+sh "$REPO/install.sh" </dev/null >/dev/null 2>&1
+assert test ! -e "$sudoers"
+ghr status > /fixture/status
+assert grep -Eq '^Job sudo +off \(LOCAL_RUNNER_SUDO=no\)' /fixture/status
 # A sudoers file this installer did not write is never replaced.
 printf 'Defaults:ghrunner !lecture\n' > "$sudoers"; chmod 440 "$sudoers"
 if LOCAL_RUNNER_SUDO=yes sh "$REPO/install.sh" </dev/null > /fixture/sudo-output 2>&1; then echo 'Replaced a foreign sudoers file' >&2; exit 1; fi
@@ -288,7 +288,10 @@ ghr uninstall
 assert test ! -e "$sudoers"
 assert test ! -d "$root/conf"
 assert test ! -e /usr/local/bin/ghr
-assert test -f "/root/new work/jobs/fixture-org/local-linux-$arch-1/demo/demo/job-uid"
+for work in /root/builds '/root/new work' '/root/final work'; do
+    for part in jobs runners logs; do assert test ! -e "$work/$part"; done
+done
+assert test ! -e "$root"
 assert jq -e 'length==0' /fixture/runners.json
 assert id ghrunner >/dev/null
 printf 'PASS root install/retry, non-root jobs, protected config, directories, lifecycle, WSL bridge and uninstall\n'

@@ -49,6 +49,11 @@ function Initialize-Manager([switch]$Control) {
     $script:Prefix = 'local-windows-' + $script:Settings.arch
     $script:WorkDir = if ($script:Settings.work_dir) { $script:Settings.work_dir } else { $script:Root }
     $script:JobsDir = Join-Path $script:WorkDir 'jobs'; $script:LogDir = Join-Path $script:WorkDir 'logs'
+    # The runner programs live in the work directory the manager last ran with; a pending
+    # ghr config --data-dir change moves them when the manager next starts.
+    $script:RunnersDir = Join-Path $script:WorkDir 'runners'
+    $activeWork = Join-Path $script:Root 'conf\active-work-dir'
+    if ((Test-Path -LiteralPath $activeWork) -and (Get-Item -LiteralPath $activeWork).Length -gt 0) { $script:RunnersDir = Join-Path (Get-Content -Raw -Encoding UTF8 -LiteralPath $activeWork).Trim() 'runners' }
     if (-not $Control) { New-Item -ItemType Directory -Force -Path $script:LogDir | Out-Null }
     # Administrator commands run this binary, so it must come from read-only bin\, not writable conf\.
     $script:Gh = Join-Path $script:Root 'bin\tools\gh.exe'
@@ -119,9 +124,10 @@ function Invoke-GitHubApi([string]$Endpoint, [string]$Method = 'GET', [switch]$P
 function Test-Organization([string]$Login) { return $Login -cmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$' }
 # Each organization runs runner_count runners. Runner N of an organization is keyed by the
 # organization ID (N = 1) or <ID>.N in the state; its program lives in
-# runner\<login>\<runner name>\app and its jobs in jobs\<login>\<runner name>.
+# runners\<login>\<runner name>\app and its jobs in jobs\<login>\<runner name>, both in the
+# work directory.
 function Test-RunnerKey([string]$Key) { return $Key -cmatch '^\d+(\.([2-9]|[1-9]\d+))?$' }
-function Get-RunnerHome([string]$Login, [string]$Name) { return (Join-Path (Join-Path (Join-Path $script:Root 'runner') $Login) $Name) }
+function Get-RunnerHome([string]$Login, [string]$Name) { return (Join-Path (Join-Path $script:RunnersDir $Login) $Name) }
 function Get-RunnerJobs([string]$Login, [string]$Name) { return (Join-Path (Join-Path $script:JobsDir $Login) $Name) }
 # At most half the logical CPUs (at least 1), so an organization's runners leave room for
 # each other; a count saved on a larger machine is capped here. LOCAL_RUNNER_CPU_COUNT
@@ -289,7 +295,7 @@ function Get-NextName($Remote) {
 # A registration that finished before the state was saved: a local runner directory that
 # no state entry claims and whose ID and name GitHub still reports.
 function Find-UnclaimedRegistration([string]$Login, $Remote, $State) {
-    $parent = Join-Path (Join-Path $script:Root 'runner') $Login
+    $parent = Join-Path $script:RunnersDir $Login
     foreach ($directory in @(Get-ChildItem -Directory -LiteralPath $parent -ErrorAction SilentlyContinue)) {
         if (-not (Test-IndexedName $directory.Name)) { continue }
         if (@($State.Values | Where-Object { $_.login -ceq $Login -and $_.runner_name -ceq $directory.Name }).Count) { continue }
@@ -437,12 +443,28 @@ function Invoke-Reconcile {
         }
     }
 }
+# A ghr config --data-dir change takes the registered runners along. If they cannot move,
+# reconciliation registers them again in the new directory under the same numbers.
+function Move-Runners {
+    $target = Join-Path $script:WorkDir 'runners'
+    # ghr config --data-dir prepares an empty runners directory there.
+    if ($script:RunnersDir -ne $target -and (Test-Path -LiteralPath $script:RunnersDir) -and (Test-Path -LiteralPath $target) -and -not @(Get-ChildItem -Force -LiteralPath $target).Count) { Remove-Item -LiteralPath $target }
+    if ($script:RunnersDir -ne $target -and (Test-Path -LiteralPath $script:RunnersDir) -and -not (Test-Path -LiteralPath $target)) {
+        try { Move-Item -LiteralPath $script:RunnersDir -Destination $target; Write-Log "Moved runners from $script:RunnersDir to $target" }
+        catch { Write-Log "Cannot move $script:RunnersDir to ${target}; the runners register again there: $($_.Exception.Message)" }
+    }
+    $script:RunnersDir = $target
+}
 function Invoke-Supervisor {
     if (Test-Path (Join-Path $script:Root 'conf\stopped')) { return }
     $lock = [IO.File]::Open((Join-Path $script:Root 'conf\service.lock'), 'OpenOrCreate', 'ReadWrite', 'None')
     try {
         Record-Process (Join-Path $script:Root 'conf\manager.json') ([Diagnostics.Process]::GetCurrentProcess())
+        Move-Runners
         Write-AtomicText (Join-Path $script:Root 'conf\active-work-dir') $script:WorkDir
+        # Every work directory used is remembered, so uninstall can clean all of them.
+        $history = Join-Path $script:Root 'conf\work-dirs'
+        if (-not (Test-Path -LiteralPath $history) -or @(Get-Content -Encoding UTF8 -LiteralPath $history) -notcontains $script:WorkDir) { Add-Content -Encoding UTF8 -LiteralPath $history -Value $script:WorkDir }
         foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $script:Root "conf\$folder") -Filter *.json | ForEach-Object { Stop-Record $_.FullName } }
         Write-Log "Started PowerShell supervisor $script:Prefix"
         $script:Supervising = $true

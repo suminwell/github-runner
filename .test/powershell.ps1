@@ -175,7 +175,7 @@ try {
         $script:Remote.renamed[0].busy = $false; Invoke-Reconcile
         Assert ((Get-State)['1'].login -eq 'renamed') 'organization renamed'
         Assert (Test-Path (Join-Path $alphaJobs 'keep')) 'old jobs retained'
-        Assert (-not (Test-Path (Join-Path $testRoot 'runner\alpha')) -and (Test-Path (Join-Path (Get-RunnerHome 'renamed' (Get-FixtureName '1')) 'app'))) 'rename moves the program directory'
+        Assert (-not (Test-Path (Join-Path $script:RunnersDir 'alpha')) -and (Test-Path (Join-Path (Get-RunnerHome 'renamed' (Get-FixtureName '1')) 'app'))) 'rename moves the program directory'
         Save-State @{}; $previous = $script:NextId; Invoke-Reconcile
         Assert ($script:NextId -eq $previous) 'registration recovered after state loss'
         # runner_count: each organization gets that many runners, each with its own number,
@@ -405,9 +405,12 @@ exit 0
             $deadline = [DateTime]::UtcNow.AddSeconds(15)
             do {
                 Start-Sleep -Milliseconds 100
-                $current = Read-Json (Join-Path (Get-RunnerHome 'renamed' (Get-FixtureName '1')) 'app\.runner')
+                $current = Read-Json (Join-Path $newWork "runners\renamed\$(Get-FixtureName '1')\app\.runner")
             } while ($current.workFolder -ne (Join-Path $newWork "jobs\renamed\$(Get-FixtureName '1')") -and [DateTime]::UtcNow -lt $deadline)
             Assert ($current.workFolder -eq (Join-Path $newWork "jobs\renamed\$(Get-FixtureName '1')")) 'restart applies work folder'
+            Assert (-not (Test-Path (Join-Path $testRoot 'runners'))) 'restart moves the runners to the new work directory'
+            # Like every new ghr command, the rest of this test sees the applied directory.
+            Initialize-Manager -Control
             Stop-Installation
             Assert (-not $script:TaskEnabled -and $null -eq (Get-RecordedProcess (Join-Path $testRoot 'conf\manager.json'))) 'stop disables watchdog and kills manager'
             $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $testRoot 'bin\ghr.ps1'),'logs','-f')
@@ -435,8 +438,8 @@ exit 0
         try { Uninstall-Runner } catch { $failed = $true }
         Assert ($failed -and (Test-Path (Join-Path $testRoot 'conf\github-token'))) 'failed unregister retains credentials'
         $script:FailDelete = $false; Uninstall-Runner
-        Assert (-not (Test-Path (Join-Path $testRoot 'conf')) -and -not (Test-Path (Join-Path $testRoot 'runner')) -and -not (Test-Path $launcher)) 'uninstall removes runtime and command'
-        Assert (Test-Path (Join-Path $alphaJobs 'keep')) 'uninstall preserves jobs'
+        Assert (-not (Test-Path (Join-Path $testRoot 'conf')) -and -not (Test-Path $script:RunnersDir) -and -not (Test-Path $launcher)) 'uninstall removes runtime, runners and command'
+        Assert (-not (Test-Path (Join-Path $testRoot 'jobs')) -and -not (Test-Path (Join-Path $testRoot 'logs')) -and -not (Test-Path (Join-Path $newWork 'runners'))) 'uninstall removes jobs, runners and logs of every work directory'
         Assert (@($script:Remote.beta | Where-Object id -eq 999).Count -eq 1) 'uninstall preserves other machines'
         if ($onWindows) { Write-Host "PASS windows/${arch}: core logic, quoting, native worker restart and cleanup" }
         else { Write-Host "PASS windows/${arch}: core logic and quoting; native Windows worker test is deferred to CI" }

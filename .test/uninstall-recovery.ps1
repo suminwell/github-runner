@@ -8,11 +8,12 @@ try {
     . (Join-Path $repo 'windows/ghr.ps1') -Command library
     function New-Case([string]$Name) {
         $script:Root = Join-Path $fixture $Name
-        foreach ($directory in @('conf','runner/directory-is-not-identity/runner/app')) { New-Item -ItemType Directory -Path (Join-Path $script:Root $directory) -Force | Out-Null }
+        $script:RunnersDir = Join-Path $script:Root 'runners'
+        foreach ($directory in @('conf','runners/directory-is-not-identity/runner/app')) { New-Item -ItemType Directory -Path (Join-Path $script:Root $directory) -Force | Out-Null }
         $script:Prefix = 'local-windows-x64'
         Save-State @{}
         Write-AtomicText (Join-Path $script:Root 'conf/github-token') 'fixture-credential'
-        $script:Metadata = Join-Path $script:Root 'runner/directory-is-not-identity/runner/app/.runner'
+        $script:Metadata = Join-Path $script:Root 'runners/directory-is-not-identity/runner/app/.runner'
         Write-Json $script:Metadata @{agentId=42;agentName="$script:Prefix-1";gitHubUrl='https://github.com/alpha'}
         $script:Remote = @(@{id=42;name="$script:Prefix-1"},@{id=43;name='unrelated-runner'})
         $script:Deleted = @(); $script:FailDelete = $false
@@ -33,7 +34,7 @@ try {
         throw "Unexpected API endpoint: $Endpoint"
     }
     New-Case fresh
-    $duplicate = Join-Path $script:Root 'runner/duplicate-local-copy/runner/app'
+    $duplicate = Join-Path $script:Root 'runners/duplicate-local-copy/runner/app'
     New-Item -ItemType Directory -Path $duplicate -Force | Out-Null
     Copy-Item -LiteralPath $script:Metadata -Destination (Join-Path $duplicate '.runner')
     Unregister-Runners
@@ -42,7 +43,7 @@ try {
     Assert ($script:Deleted.Count -eq 1) 'retry is idempotent after remote removal'
     New-Case same-id-other-organization
     Save-State @{'200'=@{login='beta';runner_id=42;runner_name='tracked-beta'}}
-    Move-Item -LiteralPath (Join-Path $script:Root 'runner/directory-is-not-identity') -Destination (Join-Path $script:Root 'runner/beta')
+    Move-Item -LiteralPath (Join-Path $script:Root 'runners/directory-is-not-identity') -Destination (Join-Path $script:Root 'runners/beta')
     Unregister-Runners
     Assert ($script:Deleted.Count -eq 2 -and $script:Deleted -contains 42 -and $script:Deleted -contains 'beta/42' -and $script:Remote.Count -eq 1 -and $script:Remote[0].id -eq 43) 'tracked ID in beta does not suppress orphan recovery in alpha'
     New-Case repaired

@@ -9,8 +9,8 @@ ghr start: 启动runner
 ghr stop: 停止runner
 ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
-ghr config [--data-dir]: 显示jobs和logs的父目录
-ghr config --data-dir <PATH>: 设置jobs和logs的父目录，路径必须是已存在的空目录，重启后生效
+ghr config [--data-dir]: 显示jobs、runners和logs的父目录
+ghr config --data-dir <PATH>: 设置jobs、runners和logs的父目录，路径必须是已存在的空目录，重启后生效
 ghr runner: 显示每个组织的runner个数及本机上限（CPU核数的一半）
 ghr runner -a|--add: 每个组织增加一个runner，无需重启，超过上限时报错
 ghr runner -s|--sub: 每个组织减少一个runner，最少保留1个，多出的runner空闲后移除
@@ -107,15 +107,15 @@ config_directory() {
     entries=$(ls -A -- "$CONFIG_DIRECTORY") || return 1
     [ -z "$entries" ] || { printf 'Data directory is not empty: %s\nChoose an empty directory.\n' "$CONFIG_DIRECTORY" >&2; return 1; }
 }
-config_saved() { printf 'Data directory saved: %s\nRun ghr restart (or stop then start) to apply. Existing data and logs are not moved.\n' "$CONFIG_DIRECTORY"; }
+config_saved() { printf 'Data directory saved: %s\nRun ghr restart (or stop then start) to apply. Runners move along; existing jobs and logs stay.\n' "$CONFIG_DIRECTORY"; }
 configure() {
     local program_root
     config_arguments "$@" || return $?
     if [ -z "$CONFIG_VALUE" ]; then show_config "$@"; return 0; fi
     config_directory "$CONFIG_VALUE" || return 1
     program_root=$(cd "$ROOT" && pwd -P) || return 1
-    case "$CONFIG_DIRECTORY" in "$program_root/bin"|"$program_root/bin/"*|"$program_root/conf"|"$program_root/conf/"*|"$program_root/runner"|"$program_root/runner/"*) printf 'Data must be outside the program and state directories.\n' >&2; return 1 ;; esac
-    mkdir -p "$CONFIG_DIRECTORY/jobs" "$CONFIG_DIRECTORY/logs" || return 1
+    case "$CONFIG_DIRECTORY" in "$program_root/bin"|"$program_root/bin/"*|"$program_root/conf"|"$program_root/conf/"*) printf 'Data must be outside the program and state directories.\n' >&2; return 1 ;; esac
+    mkdir -p "$CONFIG_DIRECTORY/jobs" "$CONFIG_DIRECTORY/runners" "$CONFIG_DIRECTORY/logs" || return 1
     jq_update "$ROOT/conf/settings.json" --arg directory "$CONFIG_DIRECTORY" '.work_dir=$directory' || return 1
     config_saved
 }
@@ -168,10 +168,10 @@ unregister_untracked_runners() {
     local config directory runner_id name login organization id remote targets failed=0
     "$JQ" -e 'type=="object" and all(to_entries[]; (.key|test("^[1-9][0-9]*([.]([2-9]|[1-9][0-9]+))?$")) and (.value|type=="object") and (.value.login|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")) and (.value.runner_id|type=="number" and .>0 and floor==.))' "$ROOT/conf/organizations.json" >/dev/null || { printf 'Invalid registration state; retained installation for repair.\n' >&2; return 1; }
     targets=$(mktemp "$ROOT/conf/unregister.XXXXXX") || return 1
-    for config in "$ROOT"/runner/*/*/app/.runner; do
+    for config in "$RUNNERS_DIR"/*/*/app/.runner; do
         [ -e "$config" ] || [ -L "$config" ] || continue
         directory=${config%/app/.runner}
-        if [ -L "$ROOT/runner" ] || [ -L "${directory%/*}" ] || [ -L "$directory" ] || [ -L "$directory/app" ] || [ -L "$config" ]; then failed=1; break; fi
+        if [ -L "$RUNNERS_DIR" ] || [ -L "${directory%/*}" ] || [ -L "$directory" ] || [ -L "$directory/app" ] || [ -L "$config" ]; then failed=1; break; fi
         runner_id=$("$JQ" -er '.agentId | select(type=="number" and .>0 and floor==.) | tostring' "$config") || { failed=1; break; }
         # A runner ID is scoped to its organization, which the official URL identifies.
         name=$("$JQ" -er '.agentName | select(type=="string")' "$config") || { failed=1; break; }
@@ -212,6 +212,20 @@ unregister_runners() {
     done < <("$JQ" -r 'to_entries[]|[.key,.value.login,.value.runner_id]|@tsv' "$ROOT/conf/organizations.json")
     return "$failed"
 }
+# Uninstall removes everything the installation created: jobs, runners and logs in every
+# work directory it used (and a pending one), then the program and configuration
+# directories. A directory left empty is removed as well; one holding anything else stays.
+remove_installation_files() {
+    local state=$1 work works
+    works=$({ cat "$state/work-dirs" "$state/active-work-dir" 2>/dev/null; printf '%s\n' "$WORK_DIR"; } | awk 'NF && !seen[$0]++')
+    while IFS= read -r work; do
+        [ -n "$work" ] && [ "$work" != / ] || continue
+        rm -rf "$work/jobs" "$work/runners" "$work/logs" || return 1
+    done <<< "$works"
+    rm -rf "${ROOT:?}/bin" "${ROOT:?}/conf" || return 1
+    while IFS= read -r work; do [ -z "$work" ] || rmdir "$work" 2>/dev/null || :; done <<< "$works"
+    rmdir "$ROOT" 2>/dev/null || :
+}
 uninstall() {
     local command_path
     stop_installation || return 1
@@ -222,8 +236,8 @@ uninstall() {
         [ ! -L "$command_path" ] && grep -Fqx "# ghr: $ROOT" "$command_path" || { printf 'Command ownership changed; refusing removal.\n' >&2; return 1; }
         privileged rm -f "$command_path" || return 1
     fi
-    rm -rf "${ROOT:?}/runner" "${ROOT:?}/bin" "${ROOT:?}/conf" || return 1
-    printf 'Runner uninstalled. Data and logs retained in their original directories. Configured directory: %s\n' "$WORK_DIR"
+    remove_installation_files "$ROOT/conf" || return 1
+    printf 'Runner uninstalled; its jobs, runners, logs and installation directory were removed.\n'
 }
 command_main() {
     local command=${1:-help}; [ "$#" -eq 0 ] || shift

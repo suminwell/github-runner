@@ -96,11 +96,18 @@ check_job_permissions() {
         $root_install || {
             echo 'LOCAL_RUNNER_SUDO=yes needs a root installation: a normal-user installation runs jobs as your own login account, which would then have passwordless sudo everywhere.' >&2; exit 1;
         }
-        command -v visudo >/dev/null 2>&1 || { echo 'LOCAL_RUNNER_SUDO=yes needs sudo; install it and run the installer again.' >&2; exit 1; }
-        grep -Eq '^[#@]includedir[[:space:]]+/etc/sudoers\.d' /etc/sudoers 2>/dev/null || {
-            echo '/etc/sudoers does not include /etc/sudoers.d; LOCAL_RUNNER_SUDO=yes cannot grant sudo.' >&2; exit 1;
-        }
+        sudoers_included || { echo '/etc/sudoers does not include /etc/sudoers.d; LOCAL_RUNNER_SUDO=yes cannot grant sudo.' >&2; exit 1; }
     fi
+}
+# A missing /etc/sudoers is fine: the sudo package installed later brings the include.
+sudoers_included() { [ ! -f /etc/sudoers ] || grep -Eq '^[#@]includedir[[:space:]]+/etc/sudoers\.d' /etc/sudoers; }
+install_sudo_package() {
+    if command -v apt-get >/dev/null; then apt-get update && apt-get install -y sudo;
+    elif command -v dnf >/dev/null; then dnf install -y sudo;
+    elif command -v zypper >/dev/null; then zypper --non-interactive install sudo;
+    elif command -v pacman >/dev/null; then pacman -S --needed --noconfirm sudo;
+    elif command -v yum >/dev/null; then yum install -y sudo;
+    else return 1; fi
 }
 # Passwordless sudo for the runner account: a validated sudoers.d file in native mode, or a
 # file that only the Docker mode container mounts (the host sudoers stays unchanged).
@@ -328,7 +335,7 @@ install_main() {
     if [ -f "$root/conf/settings.json" ]; then
         jq -e --arg platform "$platform" '.platform==$platform' "$root/conf/settings.json" >/dev/null || { echo 'Installation configuration belongs to a different platform.' >&2; exit 1; }
     else
-        for part in bin conf runner; do [ ! -e "$root/$part" ] || { echo "Refusing to reuse unrelated directory $root/$part; choose another installation directory." >&2; exit 1; }; done
+        for part in bin conf; do [ ! -e "$root/$part" ] || { echo "Refusing to reuse unrelated directory $root/$part; choose another installation directory." >&2; exit 1; }; done
     fi
     # A reinstall keeps Docker mode unless LOCAL_RUNNER_RUNTIME=native switches back.
     if [ "${LOCAL_RUNNER_RUNTIME:-}" != native ] && [ -f "$root/conf/settings.json" ] && jq -e '.runtime=="docker"' "$root/conf/settings.json" >/dev/null 2>&1; then
@@ -410,13 +417,25 @@ install_main() {
         '') prevent_sleep=$("$jq_path" -r 'if .prevent_sleep == false then "false" else "true" end' "$root/conf/settings.json" 2>/dev/null || echo true) ;;
         *) echo 'LOCAL_RUNNER_PREVENT_SLEEP must be yes or no.' >&2; exit 1 ;;
     esac
-    # Native jobs may use the host Docker daemon by default; passwordless sudo is opt-in.
+    # Native jobs may use the host Docker daemon by default.
     docker_access=${requested_docker_access:-$("$jq_path" -r 'if .docker_access == false then "false" else "true" end' "$root/conf/settings.json" 2>/dev/null || echo true)}
-    job_sudo=${requested_sudo:-$("$jq_path" -r 'if .job_sudo == true then "true" else "false" end' "$root/conf/settings.json" 2>/dev/null || echo false)}
     [ "$runtime" != docker ] || docker_access=true
-    # A recorded choice is checked again, for a normal-user installation it was never allowed.
-    if [ "$runtime" = native ] && [ "$job_sudo" = true ] && ! $root_install; then
-        echo 'Passwordless sudo for jobs needs a root installation; run with LOCAL_RUNNER_SUDO=no or as root.' >&2; exit 1
+    # Passwordless sudo for jobs is on by default, as on GitHub-hosted runners, wherever it
+    # cannot reach a login account: root installations and Docker mode. Only an explicit
+    # LOCAL_RUNNER_SUDO is remembered, so a default never sticks as a choice.
+    sudo_choice=${requested_sudo:-$("$jq_path" -r 'if has("job_sudo_choice") then (.job_sudo_choice|tostring) else empty end' "$root/conf/settings.json" 2>/dev/null || :)}
+    if [ -n "$sudo_choice" ]; then job_sudo=$sudo_choice
+    elif [ "$runtime" = docker ] || $root_install; then job_sudo=true
+    else job_sudo=false; fi
+    if [ "$runtime" = native ] && [ "$job_sudo" = true ]; then
+        # A remembered choice is checked again; a normal-user installation never allows it.
+        $root_install || { echo 'Passwordless sudo for jobs needs a root installation; run with LOCAL_RUNNER_SUDO=no or as root.' >&2; exit 1; }
+        command -v visudo >/dev/null 2>&1 || install_sudo_package || :
+        if ! command -v visudo >/dev/null 2>&1 || ! sudoers_included; then
+            [ -z "$sudo_choice" ] || { echo 'LOCAL_RUNNER_SUDO=yes cannot grant sudo: install sudo and include /etc/sudoers.d, then run the installer again.' >&2; exit 1; }
+            printf 'Job sudo: off; sudo is unavailable or /etc/sudoers does not include /etc/sudoers.d.\n' >&2
+            job_sudo=false
+        fi
     fi
     printf '%s\n' "$gh_path" > "$root/conf/gh-path"
     printf '%s\n' "$jq_path" > "$root/conf/jq-path"
@@ -424,8 +443,8 @@ install_main() {
     [ ! -f "$root/conf/settings.json" ] || default_work=$root
     [ -f "$root/conf/settings.json" ] || printf '{}\n' > "$root/conf/settings.json"
     "$jq_path" --arg platform "$platform" --arg arch "$arch" --argjson owner_uid "${runtime_uid:-$(id -u)}" --arg default_work "$default_work" --arg runtime "$runtime" --argjson prevent_sleep "$prevent_sleep" \
-        --argjson docker_access "$docker_access" --argjson job_sudo "$job_sudo" \
-        '.platform=$platform|.arch=$arch|.owner_uid=$owner_uid|.runtime=$runtime|.prevent_sleep=$prevent_sleep|.docker_access=$docker_access|.job_sudo=$job_sudo|.work_dir //= $default_work|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
+        --argjson docker_access "$docker_access" --argjson job_sudo "$job_sudo" --arg sudo_choice "${requested_sudo:-}" \
+        '.platform=$platform|.arch=$arch|.owner_uid=$owner_uid|.runtime=$runtime|.prevent_sleep=$prevent_sleep|.docker_access=$docker_access|.job_sudo=$job_sudo|(if $sudo_choice == "" then . else .job_sudo_choice=($sudo_choice == "true") end)|.work_dir //= $default_work|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
         "$root/conf/settings.json" > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
     if $root_install; then fetch linux/account.sh "$root/bin/account.sh"; fi
@@ -486,8 +505,8 @@ install_main() {
     fi
     /bin/bash "$root/bin/ghr.sh" --install-command
     work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
-    mkdir -p "$work_dir/jobs" "$work_dir/logs"
-    printf 'Data/logs directory: %s\n' "$work_dir"
+    mkdir -p "$work_dir/jobs" "$work_dir/runners" "$work_dir/logs"
+    printf 'Work directory (jobs, runners, logs): %s\n' "$work_dir"
     user=$(id -un); user_id=$(id -u); service_home=$HOME; service_path=$(linux_service_path)
     if $root_install; then
         user=$account_user; user_id=$account_uid; service_home=$account_home
@@ -517,7 +536,10 @@ install_main() {
         install_job_sudo "$runtime" "$sudo_name" "$sudo_principal" "$user" || { echo 'Passwordless sudo was not granted; run the installer again after fixing the error above.' >&2; rm -f "$definition"; exit 1; }
         if [ "$runtime" = docker ]; then printf 'Job sudo: on; jobs can use sudo without a password inside the container.\n'
         else printf 'Job sudo: on; jobs can use sudo without a password, which is root on this host.\n'; fi
-    else remove_job_sudo "$sudo_name"; fi
+    else
+        remove_job_sudo "$sudo_name"
+        [ "$runtime" = docker ] || $root_install || printf 'Job sudo: off; jobs run as your own login account here. Install as root for passwordless sudo.\n'
+    fi
     # WSL is kept awake by its Windows host task instead (ghr wsl setup).
     awake_name=${service_name%.service}-awake.service
     inhibit_path=$(command -v systemd-inhibit || :); sleep_path=$(command -v sleep || :)

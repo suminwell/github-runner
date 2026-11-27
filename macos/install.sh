@@ -135,7 +135,7 @@ install_main() {
     if [ -f "$root/conf/settings.json" ]; then
         jq -e --arg platform "$platform" '.platform==$platform' "$root/conf/settings.json" >/dev/null || { echo 'Installation configuration belongs to a different platform.' >&2; exit 1; }
     else
-        for part in bin conf runner; do [ ! -e "$root/$part" ] || { echo "Refusing to reuse unrelated directory $root/$part; choose another installation directory." >&2; exit 1; }; done
+        for part in bin conf; do [ ! -e "$root/$part" ] || { echo "Refusing to reuse unrelated directory $root/$part; choose another installation directory." >&2; exit 1; }; done
     fi
     stop_installed_service
     initialize_install_settings
@@ -209,8 +209,8 @@ install_main() {
     /bin/bash "$root/bin/service.sh" prepare || { echo 'Preparing the official Runner failed (see the error above). Run the same install command again to retry.' >&2; exit 1; }
     /bin/bash "$root/bin/ghr.sh" --install-command
     work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
-    mkdir -p "$work_dir/jobs" "$work_dir/logs"
-    printf 'Data/logs directory: %s\n' "$work_dir"
+    mkdir -p "$work_dir/jobs" "$work_dir/runners" "$work_dir/logs"
+    printf 'Work directory (jobs, runners, logs): %s\n' "$work_dir"
     user=$(id -un); user_id=$(id -u)
     definition=$(mktemp)
     service_name=com.suminwell.github-runner.$user_id.$arch

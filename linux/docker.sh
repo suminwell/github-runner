@@ -208,8 +208,11 @@ docker_load() {
     DOCKER_ARCH=$("$DOCKER_JQ" -er .arch "$DOCKER_ROOT/conf/settings.json") || return 1
     DOCKER_WORK=$("$DOCKER_JQ" -r --arg root "$DOCKER_ROOT" '.work_dir // $root' "$DOCKER_ROOT/conf/settings.json") || return 1
     DOCKER_IMAGE=$("$DOCKER_JQ" -r '.docker_image // empty' "$DOCKER_ROOT/conf/settings.json") || return 1
-    # The installer writes this root-owned rule only when LOCAL_RUNNER_SUDO=yes; it is
-    # mounted into the container and never into the host sudoers.
+    # The work directory of the last run holds the runners until a pending
+    # ghr config --data-dir change moves them, so the container sees both.
+    DOCKER_PREVIOUS_WORK=$(cat "$DOCKER_ROOT/conf/runtime/active-work-dir" "$DOCKER_ROOT/conf/active-work-dir" 2>/dev/null | head -n 1)
+    # The installer writes this root-owned rule unless LOCAL_RUNNER_SUDO=no; it is mounted
+    # into the container and never into the host sudoers.
     DOCKER_SUDOERS=
     if [ "$("$DOCKER_JQ" -r '.job_sudo == true' "$DOCKER_ROOT/conf/settings.json")" = true ]; then
         DOCKER_SUDOERS=${LOCAL_RUNNER_DOCKER_SUDOERS_DIR:-/etc/github-runner/sudoers}/local-github-runner-$("$DOCKER_JQ" -r .owner_uid "$DOCKER_ROOT/conf/settings.json")-$DOCKER_ARCH
@@ -258,7 +261,7 @@ docker_arguments() {
         DOCKER_ARGS+=(-v "$DOCKER_SUDOERS:/etc/sudoers.d/github-runner:ro" -v "$DOCKER_SUDOERS.shadow:/etc/shadow:ro")
     fi
     # Identical paths inside and outside; a path already covered by an exact mount is skipped.
-    for path in "$DOCKER_ROOT" "$DOCKER_WORK" "$home"; do
+    for path in "$DOCKER_ROOT" "$DOCKER_WORK" ${DOCKER_PREVIOUS_WORK:+"$DOCKER_PREVIOUS_WORK"} "$home"; do
         [ -d "$path" ] || continue
         case "|$mounted|" in *"|$path|"*) continue ;; esac
         mounted=$mounted\|$path

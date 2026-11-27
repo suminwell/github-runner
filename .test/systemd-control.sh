@@ -13,7 +13,7 @@ trap cleanup EXIT
 assert() { "$@" || { printf 'FAIL: %s\n' "$*" >&2; exit 1; }; }
 export LOCAL_RUNNER_ROOT="$FIXTURE/program with = sign"
 ROOT=$LOCAL_RUNNER_ROOT
-mkdir -p "$ROOT/bin" "$ROOT/conf" "$ROOT/runner/failed-registration/runner/app" "$FIXTURE/work/jobs" "$FIXTURE/work/logs" "$FIXTURE/commands"
+mkdir -p "$ROOT/bin" "$ROOT/conf" "$FIXTURE/work/runners/failed-registration/runner/app" "$FIXTURE/work/jobs" "$FIXTURE/work/logs" "$FIXTURE/commands"
 cp "$REPO/linux/ghr.sh" "$REPO/linux/service.sh" "$ROOT/bin/"
 command -v jq > "$ROOT/conf/jq-path"
 printf '/bin/false\n' > "$ROOT/conf/gh-path"
@@ -94,7 +94,6 @@ trap cleanup EXIT
 assert test ! -e "$FIXTURE/commands/ghr"
 assert test ! -d "$ROOT/conf"
 assert test ! -e "$FIXTURE/unit.service"
-assert test -d "$FIXTURE/work/jobs"
-assert test -d "$FIXTURE/work/logs"
+assert test ! -e "$FIXTURE/work"
 success=true
 printf 'PASS legacy systemd stop/status/uninstall and explicit native failures\n'

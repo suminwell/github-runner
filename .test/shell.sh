@@ -265,12 +265,12 @@ SLEEP
     assert grep -F "Organization hang: runner configuration as $PREFIX-1 failed (exit 124)" "$ROOT/logs/service.log"
     for attempt in $(seq 1 20); do kill -0 "$(cat "$FIXTURE/hang-child")" 2>/dev/null || break; sleep 0.1; done
     if kill -0 "$(cat "$FIXTURE/hang-child")" 2>/dev/null; then echo 'A hung registration child survived' >&2; exit 1; fi
-    rm -rf "$ROOT/runner/leaky" "$ROOT/runner/hang"
+    rm -rf "$ROOT/runners/leaky" "$ROOT/runners/hang"
     reconcile
     assert jq -e '."1".login=="alpha" and ."1".runner_id==100' "$ROOT/conf/organizations.json"
     assert jq -e --arg name "$PREFIX-1" '.alpha[0].name==$name' "$FIXTURE/remote.json"
     assert jq -e --arg name "$PREFIX-1" '."1".runner_name==$name' "$ROOT/conf/organizations.json"
-    assert jq -e --arg work "$ROOT/jobs/alpha/$PREFIX-1" '.work==$work' "$ROOT/runner/alpha/$PREFIX-1/app/.runner"
+    assert jq -e --arg work "$ROOT/jobs/alpha/$PREFIX-1" '.work==$work' "$ROOT/runners/alpha/$PREFIX-1/app/.runner"
     reconcile
     assert test "$(cat "$FIXTURE/next-id")" = 101
     touch "$FIXTURE/fail-discovery"
@@ -280,7 +280,7 @@ SLEEP
     # Remote deletion and lost local configuration each recover the owned runner.
     printf '{}\n' > "$FIXTURE/remote.json"; reconcile
     assert test "$(cat "$FIXTURE/next-id")" = 102
-    rm "$ROOT/runner/alpha/$(runner_name 1)/app/.runner"; reconcile
+    rm "$ROOT/runners/alpha/$(runner_name 1)/app/.runner"; reconcile
     assert test "$(cat "$FIXTURE/next-id")" = 103
     # Rename keeps old data and defers while the runner is busy.
     alpha_jobs=$ROOT/jobs/alpha/$(runner_name 1)
@@ -294,8 +294,8 @@ SLEEP
     assert jq -e '."1".login=="renamed"' "$ROOT/conf/organizations.json"
     assert test -f "$alpha_jobs/repo/keep"
     assert test -d "$ROOT/jobs/renamed/$(runner_name 1)"
-    assert test ! -e "$ROOT/runner/alpha"
-    assert test -f "$ROOT/runner/renamed/$(runner_name 1)/app/run.sh"
+    assert test ! -e "$ROOT/runners/alpha"
+    assert test -f "$ROOT/runners/renamed/$(runner_name 1)/app/run.sh"
     # Lost state after successful registration recovers the existing identity.
     printf '{}\n' > "$ROOT/conf/organizations.json"; previous=$(cat "$FIXTURE/next-id"); reconcile
     assert test "$(cat "$FIXTURE/next-id")" = "$previous"
@@ -352,7 +352,7 @@ SLEEP
     assert jq -e --arg p "$PREFIX" '[."1",."1.2",."1.3" | .runner_name] | (unique|length)==3 and all(.[]; test("^"+$p+"-[1-9][0-9]*$"))' "$ROOT/conf/organizations.json"
     assert jq -e '.renamed|length==3' "$FIXTURE/remote.json"
     for id in 1.2 1.3; do
-        assert jq -e --arg work "$ROOT/jobs/renamed/$(runner_name "$id")" '.work==$work' "$ROOT/runner/renamed/$(runner_name "$id")/app/.runner"
+        assert jq -e --arg work "$ROOT/jobs/renamed/$(runner_name "$id")" '.work==$work' "$ROOT/runners/renamed/$(runner_name "$id")/app/.runner"
     done
     previous=$(cat "$FIXTURE/next-id"); reconcile
     assert test "$(cat "$FIXTURE/next-id")" = "$previous"
@@ -369,14 +369,14 @@ SLEEP
     jq '.runner_count=1' "$ROOT/conf/settings.json" > "$ROOT/conf/settings.new"; mv "$ROOT/conf/settings.new" "$ROOT/conf/settings.json"
     reconcile
     assert jq -e 'has("1") and (has("1.2")|not) and has("1.3")' "$ROOT/conf/organizations.json"
-    assert test ! -e "$ROOT/runner/renamed/$second" -a ! -e "$ROOT/jobs/renamed/$second"
-    assert test -d "$ROOT/runner/renamed/$third" -a -d "$ROOT/jobs/renamed/$third"
+    assert test ! -e "$ROOT/runners/renamed/$second" -a ! -e "$ROOT/jobs/renamed/$second"
+    assert test -d "$ROOT/runners/renamed/$third" -a -d "$ROOT/jobs/renamed/$third"
     jq '.renamed |= map(.busy=false)' "$FIXTURE/remote.json" > "$FIXTURE/remote.new"; mv "$FIXTURE/remote.new" "$FIXTURE/remote.json"
     reconcile
     assert jq -e 'keys|all(test("^[0-9]+$"))' "$ROOT/conf/organizations.json"
     assert jq -e --argjson id "$(jq '."1".runner_id' "$ROOT/conf/organizations.json")" '.renamed|length==1 and .[0].id==$id' "$FIXTURE/remote.json"
-    assert test ! -e "$ROOT/runner/renamed/$third" -a ! -e "$ROOT/jobs/renamed/$third"
-    assert test -d "$ROOT/runner/renamed/$(runner_name 1)"
+    assert test ! -e "$ROOT/runners/renamed/$third" -a ! -e "$ROOT/jobs/renamed/$third"
+    assert test -d "$ROOT/runners/renamed/$(runner_name 1)"
     assert grep -F 'runner count lowered' "$ROOT/logs/service.log"
     # An organization without runner permission backs off instead of failing every poll.
     printf '[[{"state":"active","organization":{"id":1,"login":"renamed"}},{"state":"active","organization":{"id":8,"login":"denied"}}]]\n' > "$FIXTURE/memberships.json"
@@ -448,13 +448,18 @@ SLEEP
     "$command_path" runner -s > /dev/null
     assert jq -e '.runner_count==1' "$ROOT/conf/settings.json"
     assert test "$(cat "$ROOT/conf/active-work-dir")" = "$ROOT"
+    # Restarting applies the new directory and takes the registered runners along.
     (command_main restart)
     for attempt in $(seq 1 100); do
-        if [ "$(cat "$ROOT/conf/active-work-dir" 2>/dev/null || :)" = "$new_work" ] && jq -e --arg work "$new_work/jobs/renamed/$(runner_name 1)" '.workFolder==$work' "$ROOT/runner/renamed/$(runner_name 1)/app/.runner" >/dev/null; then break; fi
+        if [ "$(cat "$ROOT/conf/active-work-dir" 2>/dev/null || :)" = "$new_work" ] && jq -e --arg work "$new_work/jobs/renamed/$(runner_name 1)" '.workFolder==$work' "$new_work/runners/renamed/$(runner_name 1)/app/.runner" >/dev/null; then break; fi
         sleep 0.1
     done
     assert test "$(cat "$ROOT/conf/active-work-dir")" = "$new_work"
-    assert jq -e --arg work "$new_work/jobs/renamed/$(runner_name 1)" '.workFolder==$work' "$ROOT/runner/renamed/$(runner_name 1)/app/.runner"
+    assert jq -e --arg work "$new_work/jobs/renamed/$(runner_name 1)" '.workFolder==$work' "$new_work/runners/renamed/$(runner_name 1)/app/.runner"
+    assert test ! -e "$ROOT/runners"
+    assert grep -Fq "Moved runners from $ROOT/runners to $new_work/runners" "$new_work/logs/service.log"
+    # Like every new ghr command, the rest of this test sees the applied directory.
+    init control
     # An in-flight timeout may outlive the manager; stop must also sweep its saved record.
     sleep 60 & timeout_orphan=$!
     record_pid "$ROOT/conf/timeouts/orphan.pid" "$timeout_orphan"
@@ -480,11 +485,10 @@ SLEEP
     assert test -f "$command_path"
     rm "$FIXTURE/fail-delete"
     (command_main uninstall)
-    assert test ! -e "$ROOT/conf"
-    assert test ! -e "$ROOT/runner"
+    # Uninstall removes everything it created, in every work directory it used; directories
+    # left empty go too.
+    assert test ! -e "$ROOT" -a ! -e "$new_work"
     assert test ! -e "$command_path"
-    assert test -f "$alpha_jobs/repo/keep"
-    assert test -f "$new_work/logs/service.log"
     assert jq -e '.renamed|length==0' "$FIXTURE/remote.json"
     assert jq -e '.beta|any(.[]; .id==999)' "$FIXTURE/remote.json"
     printf 'PASS %s/%s: discovery, numbered registration, pagination, race retry, recovery, runner count, worker restart, cleanup\n' "$PLATFORM" "$arch"

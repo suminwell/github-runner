@@ -58,7 +58,7 @@ account_setup() {
     chmod 750 "$ROOT/conf" /var/lib/github-runner
     chgrp "$account_gid" "$ROOT/conf/account.json"; chmod 640 "$ROOT/conf/account.json"
     account_traverse "$ROOT" || return 1
-    for writable in "$account_home" "$ROOT/conf/runtime" "$ROOT/runner" "$ROOT/bin/.cache"; do
+    for writable in "$account_home" "$ROOT/conf/runtime" "$ROOT/bin/.cache"; do
         if [ ! -e "$writable" ] && [ ! -L "$writable" ]; then
             mkdir "$writable" && chown "$account_uid:$account_gid" "$writable" && chmod 700 "$writable" || return 1
         fi
@@ -78,7 +78,7 @@ account_traverse() (
 )
 account_work_directory() (
     requested=$(realpath -m -- "$1") || exit 1
-    case "$requested" in "$ROOT/bin"|"$ROOT/bin/"*|"$ROOT/conf"|"$ROOT/conf/"*|"$ROOT/runner"|"$ROOT/runner/"*)
+    case "$requested" in "$ROOT/bin"|"$ROOT/bin/"*|"$ROOT/conf"|"$ROOT/conf/"*)
         echo 'Data must be outside the program and state directories.' >&2; exit 1 ;;
     esac
     if ! account_run mkdir -p "$requested" 2>/dev/null; then
@@ -87,17 +87,18 @@ account_work_directory() (
         account_validate_path "$ancestor" || exit 1
         mkdir -p "$requested" || exit 1
     fi
-    for directory in "$requested/jobs" "$requested/logs"; do
+    for directory in "$requested/jobs" "$requested/runners" "$requested/logs"; do
         [ ! -L "$directory" ] || { echo "Refusing a symlink: $directory" >&2; exit 1; }
     done
     # On a user-writable path, do everything as that user. Only grant permissions
     # as root when no unprivileged process can replace any parent during the change.
-    if account_run mkdir -p "$requested/jobs" "$requested/logs" 2>/dev/null && \
+    if account_run mkdir -p "$requested/jobs" "$requested/runners" "$requested/logs" 2>/dev/null && \
         account_run test -w "$requested/jobs" && account_run test -x "$requested/jobs" && \
+        account_run test -w "$requested/runners" && account_run test -x "$requested/runners" && \
         account_run test -w "$requested/logs" && account_run test -x "$requested/logs"; then exit 0; fi
     account_validate_path "$requested" || exit 1
     account_traverse "$requested" || exit 1
-    for directory in "$requested/jobs" "$requested/logs"; do
+    for directory in "$requested/jobs" "$requested/runners" "$requested/logs"; do
         [ ! -L "$directory" ] || { echo "Refusing a symlink: $directory" >&2; exit 1; }
         if [ ! -e "$directory" ]; then
             mkdir "$directory" && chown "$account_uid:$account_gid" "$directory" && chmod 700 "$directory" || exit 1
@@ -187,8 +188,10 @@ account_command() {
                         [ ! -L "$command_path" ] && grep -Fqx "# ghr: $ROOT" "$command_path" || return 1
                         rm -f "$command_path" || return 1
                     fi
-                    rm -rf "${ROOT:?}/bin" "${ROOT:?}/conf" "${ROOT:?}/runner" || return 1
-                    echo 'Runner uninstalled. Data, logs and the locked ghrunner account/home are retained.'
+                    WORK_DIR=$("$JQ" -er .work_dir "$ROOT/conf/settings.json") || return 1
+                    remove_installation_files "$ROOT/conf/runtime" || return 1
+                    echo 'Runner uninstalled; its jobs, runners, logs and installation directory were removed.'
+                    echo 'The locked ghrunner account and its home are kept for other installations on this machine.'
                     [ -z "$hint" ] || printf '%s\n' "$hint" ;;
                 *) usage ;;
             esac ;;
@@ -219,6 +222,13 @@ account_start() {
     fi
     work=$("$JQ" -er .work_dir "$ROOT/conf/settings.json") || return 1
     account_work_directory "$work" || return 1
+    # A pending directory change takes the runners along; the service account may not
+    # write the old work directory itself.
+    previous=$(cat "$ROOT/conf/runtime/active-work-dir" 2>/dev/null || :)
+    if [ -n "$previous" ] && [ "$previous" != "$work" ] && [ -d "$previous/runners" ] && [ ! -L "$previous/runners" ] && [ -z "$(ls -A "$work/runners" 2>/dev/null)" ]; then
+        rmdir "$work/runners" 2>/dev/null || :
+        mv "$previous/runners" "$work/runners" || return 1
+    fi
     rm -f "$ROOT/conf/stopped" || return 1
     native_service start || { printf 'stopped\n' | atomic "$ROOT/conf/stopped"; account_protect_config; return 1; }
     wsl_host start || return 1

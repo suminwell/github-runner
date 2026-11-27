@@ -10,7 +10,7 @@ worker_loop() {
     stop_record "$ROOT/conf/children/$id.pid"
     trap 'stop_record "$ROOT/conf/children/$id.pid"' EXIT
     trap 'exit 0' TERM INT
-    cd "$ROOT/runner/$login/$name/app" || return 1
+    cd "$RUNNERS_DIR/$login/$name/app" || return 1
     while [ ! -f "$ROOT/conf/stopped" ]; do
         # Reopen the manager's log each round so output follows log rotation.
         [ -z "$log_file" ] || exec >> "$log_file" 2>&1

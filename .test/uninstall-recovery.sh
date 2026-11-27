@@ -9,7 +9,7 @@ for platform in linux macos; do
     setup_case() {
         export LOCAL_RUNNER_ROOT=$fixture/$platform-$1
         ROOT=$LOCAL_RUNNER_ROOT
-        mkdir -p "$ROOT/bin" "$ROOT/conf" "$ROOT/runner/directory-is-not-identity/runner/app"
+        mkdir -p "$ROOT/bin" "$ROOT/conf" "$ROOT/runners/directory-is-not-identity/runner/app"
         cp "$repo/$platform/service.sh" "$repo/$platform/ghr.sh" "$ROOT/bin/"
         command -v jq > "$ROOT/conf/jq-path"
         printf '/bin/false\n' > "$ROOT/conf/gh-path"
@@ -19,7 +19,7 @@ for platform in linux macos; do
         . "$ROOT/bin/ghr.sh"
         init control
         api() { fake_api "$@"; }
-        metadata=$ROOT/runner/directory-is-not-identity/runner/app/.runner
+        metadata=$ROOT/runners/directory-is-not-identity/runner/app/.runner
         jq -n --arg name "$PREFIX-1" '{agentId:42,agentName:$name,gitHubUrl:"https://github.com/alpha"}' > "$metadata"
         fixture_remote=$ROOT/conf/fake-remote.json
         jq -n --arg name "$PREFIX-1" '[{id:42,name:$name},{id:43,name:"unrelated-runner"}]' > "$fixture_remote"
@@ -40,8 +40,8 @@ for platform in linux macos; do
         esac
     }
     setup_case fresh
-    mkdir -p "$ROOT/runner/duplicate-local-copy/runner/app"
-    cp "$metadata" "$ROOT/runner/duplicate-local-copy/runner/app/.runner"
+    mkdir -p "$ROOT/runners/duplicate-local-copy/runner/app"
+    cp "$metadata" "$ROOT/runners/duplicate-local-copy/runner/app/.runner"
     unregister_runners
     assert jq -e 'length==1 and .[0].id==43' "$fixture_remote" >/dev/null
     assert grep -Fxq 42 "$delete_log"
@@ -52,7 +52,7 @@ for platform in linux macos; do
     setup_case same-id-other-organization
     jq -n '{"200":{login:"beta",runner_id:42,runner_name:"tracked-beta"}}' > "$ROOT/conf/organizations.json"
     # Even a misleading directory name cannot override the official organization URL.
-    mv "$ROOT/runner/directory-is-not-identity" "$ROOT/runner/beta"
+    mv "$ROOT/runners/directory-is-not-identity" "$ROOT/runners/beta"
     unregister_runners
     assert jq -e 'length==1 and .[0].id==43' "$fixture_remote" >/dev/null
     assert grep -Fxq 42 "$delete_log"

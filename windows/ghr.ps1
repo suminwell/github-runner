@@ -8,8 +8,8 @@ ghr start: 启动runner
 ghr stop: 停止runner
 ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
-ghr config [--data-dir]: 显示jobs和logs的父目录
-ghr config --data-dir <PATH>: 设置jobs和logs的父目录，路径必须是已存在的空目录，重启后生效
+ghr config [--data-dir]: 显示jobs、runners和logs的父目录
+ghr config --data-dir <PATH>: 设置jobs、runners和logs的父目录，路径必须是已存在的空目录，重启后生效
 ghr runner: 显示每个组织的runner个数及本机上限（CPU核数的一半）
 ghr runner -a|--add: 每个组织增加一个runner，无需重启，超过上限时报错
 ghr runner -s|--sub: 每个组织减少一个runner，最少保留1个，多出的runner空闲后移除
@@ -91,7 +91,7 @@ function Show-Status {
     $items.Add(@('Sleep prevention', (Get-SleepPrevention ([bool]$manager))))
     $items.Add(@('Runners per organization', "$(Get-RunnerCount)"))
     $items.Add(@('Install directory', $script:Root))
-    $items.Add(@('Runner directory', (Join-Path $script:Root 'runner')))
+    $items.Add(@('Runners directory', $script:RunnersDir))
     $work = $script:WorkDir; $directoryState = 'configured; not started yet'
     $active = Join-Path $script:Root 'conf\active-work-dir'
     if ((Test-Path $active) -and (Get-Item -LiteralPath $active).Length -gt 0) {
@@ -230,14 +230,15 @@ function Set-WorkDirectory([string]$Directory) {
     if (-not (Test-Path -LiteralPath $absolute -PathType Container)) { throw "Data directory does not exist: $absolute. Create an empty directory first." }
     if ($absolute -eq $script:WorkDir) { throw "Already the data directory: $absolute" }
     if (@(Get-ChildItem -Force -LiteralPath $absolute).Count) { throw "Data directory is not empty: $absolute. Choose an empty directory." }
-    foreach ($reserved in @((Join-Path $script:Root 'bin'), (Join-Path $script:Root 'conf'), (Join-Path $script:Root 'runner'))) {
+    foreach ($reserved in @((Join-Path $script:Root 'bin'), (Join-Path $script:Root 'conf'))) {
         if ($absolute -eq $reserved -or ($reserved -ne $script:Root -and $absolute.StartsWith($reserved + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase))) { throw 'Data must be outside the program and state directories.' }
     }
     Grant-WorkDirectory (Join-Path $absolute 'jobs')
+    Grant-WorkDirectory (Join-Path $absolute 'runners')
     Grant-WorkDirectory (Join-Path $absolute 'logs')
     Save-Setting 'work_dir' $absolute
     Write-Host "Data directory saved: $absolute"
-    Write-Host 'Run ghr restart (or stop then start) to apply. Existing data and logs are not moved.'
+    Write-Host 'Run ghr restart (or stop then start) to apply. Runners move along; existing jobs and logs stay.'
 }
 function Save-Setting([string]$Name, $Value) {
     $settings = Read-Json (Join-Path $script:Root 'conf\settings.json')
@@ -278,7 +279,7 @@ function Unregister-UntrackedRunners($State) {
         if ($id -cnotmatch '^[1-9]' -or -not (Test-RunnerKey $id) -or "$($entry.runner_id)" -notmatch '^[1-9][0-9]*$' -or -not (Test-Organization $entry.login)) { throw 'Invalid registration state; retained installation for repair.' }
     }
     $targets = @{}
-    $runners = Join-Path $script:Root 'runner'
+    $runners = $script:RunnersDir
     if (-not (Test-Path -LiteralPath $runners)) { return }
     if ((Get-Item -Force -LiteralPath $runners).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing registration recovery through a linked runner directory.' }
     $directories = @(Get-ChildItem -Force -LiteralPath $runners | Where-Object PSIsContainer | ForEach-Object {
@@ -370,12 +371,22 @@ function Uninstall-Runner {
         $remaining = @($userPath -split ';' | Where-Object { [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\') -ne $bin.TrimEnd('\') }) -join ';'
         [Environment]::SetEnvironmentVariable('Path', $remaining, 'User')
     }
-    Remove-InstallationTree (Join-Path $script:Root 'runner')
+    # Everything the installation created goes: jobs, runners and logs in every work directory
+    # it used (and a pending one), then the program and configuration directories. A
+    # directory left empty is removed as well; one holding anything else stays.
+    $works = @($script:WorkDir, (Read-Json (Join-Path $script:Root 'conf\settings.json')).work_dir)
+    foreach ($record in @('work-dirs','active-work-dir')) {
+        $path = Join-Path (Join-Path $script:Root 'conf') $record
+        if (Test-Path -LiteralPath $path) { $works = @(Get-Content -Encoding UTF8 -LiteralPath $path | ForEach-Object { $_.Trim() }) + $works }
+    }
+    $works = @($works | Where-Object { $_ } | Select-Object -Unique)
+    foreach ($work in $works) { foreach ($part in @('jobs','runners','logs')) { Remove-InstallationTree (Join-Path $work $part) } }
     Remove-InstallationTree $bin
     Remove-InstallationTree (Join-Path $script:Root 'conf')
-    foreach ($file in @('install.ps1','service.ps1','ghr.ps1')) { Remove-Item (Join-Path $script:Root $file) -Force -ErrorAction SilentlyContinue }
-    Write-Host "Runner uninstalled. Jobs retained: $script:JobsDir"
-    Write-Host 'Data and logs remain in their original directories.'
+    foreach ($directory in $works + @($script:Root)) {
+        if ((Test-Path -LiteralPath $directory) -and -not @(Get-ChildItem -Force -LiteralPath $directory).Count) { Remove-Item -LiteralPath $directory -Force }
+    }
+    Write-Host 'Runner uninstalled; its jobs, runners, logs and installation directory were removed.'
 }
 if ($Command -ne 'library') {
     Initialize-Manager -Control
@@ -392,7 +403,7 @@ if ($Command -ne 'library') {
         'config' { Invoke-Config $CommandOptions }
         'runner' { Invoke-RunnerCount $CommandOptions }
         'uninstall' { Uninstall-Runner }
-        'install-command' { Install-Command; Grant-WorkDirectory $script:JobsDir; Grant-WorkDirectory $script:LogDir }
+        'install-command' { Install-Command; Grant-WorkDirectory $script:JobsDir; Grant-WorkDirectory (Join-Path $script:WorkDir 'runners'); Grant-WorkDirectory $script:LogDir }
         'help' { Show-Usage }
     }
 }

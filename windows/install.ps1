@@ -60,7 +60,7 @@ $settingsFile = Join-Path $installRoot 'conf\settings.json'
 if (Test-Path $settingsFile) {
     if ((Get-Content -Raw -Encoding UTF8 -LiteralPath $settingsFile | ConvertFrom-Json).platform -ne 'windows') { throw 'Installation configuration belongs to a different platform.' }
 } else {
-    foreach ($part in @('bin','conf','runner')) { if (Test-Path (Join-Path $installRoot $part)) { throw "Refusing to reuse unrelated directory $installRoot\$part; choose another installation directory." } }
+    foreach ($part in @('bin','conf')) { if (Test-Path (Join-Path $installRoot $part)) { throw "Refusing to reuse unrelated directory $installRoot\$part; choose another installation directory." } }
 }
 $bin = Join-Path $installRoot 'bin'; $state = Join-Path $installRoot 'conf'
 $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -101,9 +101,9 @@ Initialize-InstallSettings $installRoot $arch
 # Re-running the installer usually repairs credentials or configuration, so every
 # organization is retried at once instead of after its backoff (up to an hour).
 Remove-Item -Path (Join-Path $installRoot 'conf\backoff\*') -Force -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $bin, $state, (Join-Path $bin 'tools'), (Join-Path $bin '.cache'), (Join-Path $installRoot 'runner') | Out-Null
+New-Item -ItemType Directory -Force -Path $bin, $state, (Join-Path $bin 'tools'), (Join-Path $bin '.cache') | Out-Null
 Protect-AdminFile (Join-Path $state 'settings.json')
-foreach ($writable in @($state, (Join-Path $bin '.cache'), (Join-Path $installRoot 'runner'))) { Grant-ServiceWrite $writable }
+foreach ($writable in @($state, (Join-Path $bin '.cache'))) { Grant-ServiceWrite $writable }
 $ghPath = Join-Path $bin 'tools\gh.exe'
 $existing = Get-Command gh -ErrorAction SilentlyContinue
 $usable = $false
@@ -219,6 +219,6 @@ if ($settings.prevent_sleep) {
     if (Test-Path -LiteralPath $awakeScript) { & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $awakeScript -Action Release -Name $awakeTask; Remove-Item -LiteralPath $awakeScript -Force }
 }
 Write-Host "Installed $taskName in $installRoot"
-Write-Host "Data/logs directory: $($settings.work_dir)"
+Write-Host "Work directory (jobs, runners, logs): $($settings.work_dir)"
 & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'ghr.ps1') help
 Write-Host 'If ghr is not found in an existing terminal, open a new terminal.'

@@ -16,7 +16,7 @@ Windows，在管理员 PowerShell 执行：
 irm https://raw.githubusercontent.com/suminwell/github-runner/main/install.ps1 | iex
 ```
 
-安装时会询问**程序安装目录**，直接回车使用默认值。该目录固定维护 `bin/`、`conf/` 和 `runner/`。首次安装的 job 工作目录和日志默认保存在**执行安装命令时的当前目录**下的 `jobs/`、`logs/`。
+安装时会询问**程序安装目录**，直接回车使用默认值。该目录只维护 `bin/` 和 `conf/`。job 工作目录、官方 Runner 程序和日志默认保存在**执行安装命令时的当前目录**（工作目录）下的 `jobs/`、`runners/`、`logs/`，这些会随 job 增长的内容都不放在安装目录，系统盘空间不够时可以把工作目录放到数据盘。
 
 | 平台 | 默认程序安装目录 | 开机托管 |
 | --- | --- | --- |
@@ -29,11 +29,11 @@ irm https://raw.githubusercontent.com/suminwell/github-runner/main/install.ps1 |
 
 首次安装需要 GitHub 授权、Unix 普通用户的 sudo 权限或 Windows 管理员权限；Linux root 安装无需 sudo。无交互输入时使用默认安装目录；也可设置 `LOCAL_RUNNER_HOME` 跳过目录询问，安装器会追加平台名。重复安装会保留已有配置、编号和数据。
 
-Linux root 安装自动创建锁定登录的系统账户 `ghrunner`，HOME 为 `/var/lib/github-runner/home`，工作流以该普通账户运行，默认不授予 sudo 权限（可选开启，见下文“job 的 Docker 与 sudo 权限”）。安装、登录 GitHub 和 `ghr` 管理命令仍由 root 执行；普通管理用户使用 `sudo ghr ...`。已有普通用户安装应继续以原用户升级，不会自动转换账户。若机器已有同名的非本项目账户，安装器拒绝复用。
+Linux root 安装自动创建锁定登录的系统账户 `ghrunner`，HOME 为 `/var/lib/github-runner/home`，工作流以该普通账户运行，默认可以免密 sudo（与 GitHub 托管 Runner 一致，可关闭，见下文“job 的 Docker 与 sudo 权限”）。安装、登录 GitHub 和 `ghr` 管理命令仍由 root 执行；普通管理用户使用 `sudo ghr ...`。已有普通用户安装应继续以原用户升级，不会自动转换账户。若机器已有同名的非本项目账户，安装器拒绝复用。
 
-root 安装目录及其父目录必须由 root 拥有，且其他用户不能写入。`bin/` 和 `conf/` 中的脚本、配置和凭据由 root 管理；专用账户只读配置，可写 `runner/`、`bin/.cache/`、`conf/runtime/` 和数据、日志。root 安装额外需要 `runuser`、`useradd` 和 POSIX ACL，缺少 `acl` 时会自动安装。即使从 `/root/...` 执行，数据和日志仍默认放在当前目录；安装器给专用账户添加必要的父目录穿越权限和 `data/logs` 写权限，不开放父目录的列表权限，不递归更改已有文件权限。父目录中本来允许读取的文件，在知道路径后可能变得可访问；建议在 `/srv/builds` 等专用构建目录执行安装。需要 root 自动授权的目录及其父目录也须由 root 管理，防止任务替换路径；专用账户本来就能读写的目录可直接使用。已有数据内部若使用其他账户的私有权限，需自行授权。`ghr config --data-dir` 同样处理新目录权限，重启后切换。
+root 安装目录及其父目录必须由 root 拥有，且其他用户不能写入。`bin/` 和 `conf/` 中的脚本、配置和凭据由 root 管理；专用账户只读配置，可写 `bin/.cache/`、`conf/runtime/` 和工作目录下的 `jobs/`、`runners/`、`logs/`。root 安装额外需要 `runuser`、`useradd` 和 POSIX ACL，缺少 `acl` 时会自动安装。即使从 `/root/...` 执行，数据和日志仍默认放在当前目录；安装器给专用账户添加必要的父目录穿越权限和 `data/logs` 写权限，不开放父目录的列表权限，不递归更改已有文件权限。父目录中本来允许读取的文件，在知道路径后可能变得可访问；建议在 `/srv/builds` 等专用构建目录执行安装。需要 root 自动授权的目录及其父目录也须由 root 管理，防止任务替换路径；专用账户本来就能读写的目录可直接使用。已有数据内部若使用其他账户的私有权限，需自行授权。`ghr config --data-dir` 同样处理新目录权限，重启后切换。
 
-卸载 root 安装时保留专用账户及 HOME，避免遗留数据和日志变成无主文件；重新安装复用原 UID。账户记录保存在 root 管理的 `/var/lib/github-runner/account.json`，不随 `config --data-dir` 改变。
+卸载 root 安装时保留锁定登录的专用账户及 HOME，供本机其他架构的安装使用；重新安装复用原 UID。账户记录保存在 root 管理的 `/var/lib/github-runner/account.json`，不随 `config --data-dir` 改变。
 
 符合 [GitHub 官方支持范围](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#linux) 的 Linux（例如 Ubuntu 20.04+、Debian 10+、RHEL/CentOS/Oracle Linux 8+）直接在宿主机运行；新部署建议选择仍在维护的 Ubuntu 24.04、Debian 12 或 RHEL 9。低于这些版本的 glibc 发行版（例如 **CentOS 7**、Ubuntu 18.04）自动改用下面的 **Docker 模式**；Alpine/musl 仍不支持。
 
@@ -45,9 +45,9 @@ Linux 需要 systemd、glibc、Bash、curl、tar、util-linux 的 `flock`，不�
 
 **Docker（默认开启）**：原生模式下，如果安装时检测到 Docker 守护进程，并且 `/var/run/docker.sock` 属于专用组（通常是 `docker`），服务单元会加入 `SupplementaryGroups=<该组>`，job 里 `docker version`、`docker build` 等可以直接使用宿主机 Docker，与 Docker 模式一致。套接字属组是 `root`，或 Docker 已安装但守护进程未运行时，安装输出会说明原因；先装 ghr、后装 Docker 的，装好 Docker 后重新执行一次安装命令即可。不需要时用 `LOCAL_RUNNER_DOCKER_ACCESS=no` 重新安装，服务单元就不再带这个组；之后重复安装沿用该选择，设为 `yes` 可重新开启。Docker 模式本身依赖宿主机 Docker，不能关闭。
 
-**免密 sudo（默认关闭）**：用 `LOCAL_RUNNER_SUDO=yes` 安装后，job 可以执行 `sudo apt-get install -y ...` 这类命令，与 GitHub 托管 Runner 一致；之后重复安装沿用该选择，用 `LOCAL_RUNNER_SUDO=no` 重新安装即可关闭。
+**免密 sudo（root 安装和 Docker 模式默认开启）**：job 可以执行 `sudo apt-get install -y ...` 这类命令，与 GitHub 托管 Runner 一致，workflow 需要的软件可以在 job 里自行安装。用 `LOCAL_RUNNER_SUDO=no` 重新安装即可关闭，之后重复安装沿用这个选择；`LOCAL_RUNNER_SUDO=yes` 可重新开启。只有显式设置的选择会被记住，没有设置时始终按默认值。
 
-- 原生模式只支持 root 安装：安装器为 `ghrunner` 写入 `/etc/sudoers.d/local-github-runner-<UID>-<架构>`（root 所有，权限 0440），写入前用 `visudo -c` 校验。普通用户安装时 job 用的就是你自己的登录账户，开启会让这个账户在任何地方都能免密 sudo，所以安装器会拒绝。
+- 原生模式只在 root 安装时开启：安装器为 `ghrunner` 写入 `/etc/sudoers.d/local-github-runner-<UID>-<架构>`（root 所有，权限 0440），写入前用 `visudo -c` 校验；没有 sudo 时自动安装。若 `/etc/sudoers` 未包含 `/etc/sudoers.d`，默认情况下保持关闭并给出提示。普通用户安装时 job 用的就是你自己的登录账户，开启会让这个账户在任何地方都能免密 sudo，所以默认关闭，`LOCAL_RUNNER_SUDO=yes` 也会被拒绝；需要 sudo 时请改用 root 安装。
 - Docker 模式：镜像自带 sudo，规则文件放在 `/etc/github-runner/sudoers/`，只挂载进容器，宿主机的 sudoers 不变。sudo 的账户检查需要 shadow 记录，所以同时挂载一份只含 root 和运行账户（均为锁定密码）的 `/etc/shadow`，宿主机的密码哈希不会进入容器。
 - 关闭或卸载时只删除带有本项目标记的规则文件；同名但不是本项目写入的文件，安装器不会覆盖，会报错退出。
 
@@ -152,7 +152,7 @@ ghr uninstall: 卸载runner
 - `logs`：显示管理日志最后 200 行；`logs -f` 持续跟踪新增日志，日志轮换后继续跟踪，按 Ctrl+C 结束。
 - `config`：显示 `data-dir`（`jobs/` 和 `logs/` 的父目录）；`config --data-dir` 只输出该路径。`config --data-dir <PATH>` 设置新目录，见[修改数据和日志目录](#修改数据和日志目录)。`config` 只接受完整选项名 `--data-dir`，不支持简写或 `--data-dir=<PATH>` 写法；路径包含空格时用引号括起。
 - `runner`：显示每个组织的 Runner 个数和本机上限；`runner -a`/`--add` 加一个，`runner -s`/`--sub` 减一个，见[每个组织多个 Runner](#每个组织多个-runner)。
-- `uninstall`：停止进程，注销本机记录的 GitHub Runner，移除系统服务、命令、脚本和配置；所有工作数据与日志保留。若注册成功后尚未保存组织状态就退出，会从本地官方 `.runner` 元数据补查组织和远端身份。身份无法确认或 GitHub 注销失败时保留凭据和状态，修复后再次执行卸载。其他机器的 Runner 不会被删除。
+- `uninstall`：停止进程，注销本机记录的 GitHub Runner，移除系统服务（含防休眠守护和 sudo 规则）、`ghr` 命令，以及安装目录的 `bin/`、`conf/`；同时删除本安装用过的每个工作目录下的 `jobs/`、`runners/`、`logs/`，删空的安装目录和工作目录也一并删除，目录里有其他文件时保留。若注册成功后尚未保存组织状态就退出，会从本地官方 `.runner` 元数据补查组织和远端身份。身份无法确认或 GitHub 注销失败时保留凭据和状态，修复后再次执行卸载。其他机器的 Runner 不会被删除。
 
 Unix 的入口为 `/usr/local/bin/ghr`，调用安装目录的 `bin/ghr.sh`。Windows 的 `bin/ghr.cmd` 调用 `bin/ghr.ps1`，安装器将其目录加入安装用户的 PATH。若已有终端找不到 `ghr`，重新打开终端；Unix 的 PATH 需要包含 `/usr/local/bin`。Windows 的启停、目录设置、Runner 个数调整和卸载在管理员 PowerShell 中执行。
 
@@ -166,7 +166,7 @@ Platform                   linux / x64
 Manager                    running (PID 4321)
 Runners per organization   2
 Install directory          /home/user/.local/share/github-runner/linux
-Runner directory           /home/user/.local/share/github-runner/linux/runner
+Runners directory          /srv/builds/runners
 Work directory             /srv/builds (active)
 Jobs directory             /srv/builds/jobs
 Logs directory             /srv/builds/logs
@@ -225,13 +225,18 @@ ghr restart
 │       │   └── repository-one/
 │       │       └── repository-one/  # 官方 checkout / GITHUB_WORKSPACE
 │       └── local-linux-x64-2/   # ghr runner --add 后新增的 Runner
+├── runners/
+│   └── organization-a/
+│       └── local-linux-x64-1/   # 每个 Runner 一个程序目录，以 Runner 名称命名
+│           ├── runner.sh        # 该 Runner 的长期运行脚本
+│           └── app/             # 官方 Runner 程序、凭据及 _diag 日志
 └── logs/
     └── service.log
 ```
 
-配置修改仅保存待生效的目录；当前管理服务及任务继续使用原目录。执行 `restart` 或 `stop` 后再 `start` 才切换，`status` 同时显示配置目录和上次启动使用的目录。旧数据、旧日志保留原位，不自动搬迁。`logs` 在重启前仍读取原目录的日志。
+配置修改仅保存待生效的目录；当前管理服务及任务继续使用原目录。执行 `restart` 或 `stop` 后再 `start` 才切换，`status` 同时显示配置目录和上次启动使用的目录。旧的 job 目录和日志保留原位，不自动搬迁。`logs` 在重启前仍读取原目录的日志。
 
-`bin`、`conf`、`runner` 固定在安装目录，不随 `config --data-dir` 移动。Windows 会给数据和日志目录添加 LocalService 所需权限。
+`bin`、`conf` 固定在安装目录，不随 `config --data-dir` 移动。重启应用新目录时，`runners/` 会随之搬到新目录，已注册的 Runner 不用重新注册；无法搬动时会在新目录以原编号重新注册。`jobs/` 和 `logs/` 保留在原目录。Windows 会给这几个目录添加 LocalService 所需权限。
 
 ## 源码与运行目录
 
@@ -266,12 +271,9 @@ windows/awake.ps1               # Windows 和 WSL 宿主：服务运行期间阻
 │   ├── organizations.json
 │   ├── github-token
 │   └── ...                     # 进程记录及运行状态
-└── runner/
-    └── organization-a/
-        └── local-linux-x64-1/  # 每个 Runner 一个程序目录，以 Runner 名称命名
-            ├── runner.sh       # 该 Runner 的长期运行脚本
-            └── app/            # 官方 Runner 程序、凭据及 _diag 日志
 ```
+
+Runner 程序目录 `runners/` 在工作目录下，见[修改数据和日志目录](#修改数据和日志目录)。卸载时删除 `jobs/`、`runners/` 和 `logs/`。
 
 Windows 使用 `.ps1`，并包含 `bin/ghr.cmd` 和每个 Runner 目录下的 `listener.ps1`。服务持续维护每个组织的 Runner：进程异常退出会恢复，系统重启后重新上线。Windows 使用开机触发、失败重启和每分钟检查的计划任务，文件锁与 `IgnoreNew` 避免重复启动。系统重启不会恢复已经中断的 job 进度；macOS FileVault 仍需先解锁启动磁盘。
 
@@ -309,11 +311,11 @@ ghr runner --sub    # 每个组织减一个，简写 -s
 - 每个组织最少 1 个，最多为本机逻辑 CPU 数的一半（不足 2 个 CPU 时为 1），例如 4 核最多 2 个、8 线程最多 4 个。已经是 1 个时再减、已到上限时再加，都会提示原因并以非零退出码失败。
 - 个数保存在 `conf/settings.json` 的 `runner_count`，运行中的管理服务几秒内生效，不需要重启，也不会中断正在运行的 job。保存的个数超过本机上限时（例如配置拷到核数更少的机器），按上限运行。Linux root 安装和 Windows 需要以 root / 管理员身份执行。
 - 调大时按编号规则依次注册新的 Runner，例如 `local-linux-x64-4`、`local-linux-x64-5`，它们与第一个 Runner 标签相同，GitHub 会把排队的 job 分给空闲的那个。
-- 每个 Runner 有独立的程序目录 `runner/<组织>/<Runner 名称>` 和工作目录 `jobs/<组织>/<Runner 名称>`。
+- 每个 Runner 有独立的程序目录 `runners/<组织>/<Runner 名称>` 和工作目录 `jobs/<组织>/<Runner 名称>`，都在工作目录下。
 - 调小时，多出的 Runner 空闲后才从 GitHub 注销，并删除它的程序目录和 `jobs/` 下的工作目录；正在跑 job 的会等 job 结束。
 - 多个 Runner 共用这台机器的 CPU、内存、端口和 Docker：同时运行的 job 若使用固定端口、固定的容器名或 compose 项目名会互相冲突，可在 workflow 中改用随机端口或 `docker compose -p <唯一名称>`，必须互斥的 job 用 `concurrency:` 控制。
 
-仓库创建、改名后的工作目录由官方 Runner 按实际任务创建；旧目录保留。同名仓库按组织隔离。官方 Runner 会在 `jobs/<组织>/<Runner 名称>/<仓库>/` 下再创建同名 checkout 子目录，并在该 Runner 的工作目录下维护 `_temp`、`_actions`、`_tool` 等目录。组织改名通过稳定的组织 ID 识别，Runner 空闲后以原编号重新注册，并把 `runner/<旧名>/<Runner 名称>` 程序目录迁到新组织名下；`jobs/<旧名>/` 下的工作目录保留原位，新任务使用 `jobs/<新名>/`。编号被其他机器占用而换号时，程序目录随新名称改名。
+仓库创建、改名后的工作目录由官方 Runner 按实际任务创建；旧目录保留。同名仓库按组织隔离。官方 Runner 会在 `jobs/<组织>/<Runner 名称>/<仓库>/` 下再创建同名 checkout 子目录，并在该 Runner 的工作目录下维护 `_temp`、`_actions`、`_tool` 等目录。组织改名通过稳定的组织 ID 识别，Runner 空闲后以原编号重新注册，并把 `runners/<旧名>/<Runner 名称>` 程序目录迁到新组织名下；`jobs/<旧名>/` 下的工作目录保留原位，新任务使用 `jobs/<新名>/`。编号被其他机器占用而换号时，程序目录随新名称改名。
 
 ## 权限、更新与开发
 
@@ -323,7 +325,7 @@ ghr runner --sub    # 每个组织减一个，简写 -s
 
 凭据保存在受权限保护的 `conf/github-token`，不会传给构建子进程或写入日志。同一 OS 身份的任务仍能读取本机文件，只应接入可信组织和 workflow。Windows 上 LocalService 对 `bin\` 只读，只能写入 `conf\`、`runner\`、`bin\.cache` 和数据、日志目录，且 `conf\settings.json`、`conf\github-token` 仅可读，防止任务篡改管理员执行的脚本和配置。Windows LocalService 不具有管理员权限、交互桌面或个人钥匙串；Java、Docker、Xcode 等构建工具链需自行准备。
 
-再次执行安装命令即可更新，请在没有 job 运行时升级。通过 `ghr stop` 停止的安装在升级后仍保持停止，使用 `ghr start` 恢复。重复安装沿用已保存的数据目录，新安装默认使用当前目录。旧版本（`data/` 工作目录、`runner/<组织>/app` 程序目录及更早的布局）不会自动迁移，请先 `ghr uninstall` 再安装；旧的 `data/` 目录保留原位，可自行删除。
+再次执行安装命令即可更新，请在没有 job 运行时升级。通过 `ghr stop` 停止的安装在升级后仍保持停止，使用 `ghr start` 恢复。重复安装沿用已保存的数据目录，新安装默认使用当前目录。旧版本（`data/` 工作目录、安装目录下的 `runner/` 程序目录及更早的布局）不会自动迁移，请先用旧版本的 `ghr uninstall` 卸载再安装；旧版本留下的 `data/` 目录可自行删除。
 
 本地源码安装：
 

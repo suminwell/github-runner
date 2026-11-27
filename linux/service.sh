@@ -41,6 +41,10 @@ init() {
     PREFIX=local-$OS-$ARCH
     WORK_DIR=$("$JQ" -r --arg fallback "$ROOT" '.work_dir // $fallback' "$ROOT/conf/settings.json") || return 1
     JOBS_DIR=$WORK_DIR/jobs; LOG_DIR=$WORK_DIR/logs
+    # The runner programs live in the work directory the manager last ran with; a pending
+    # ghr config --data-dir change moves them when the manager next starts.
+    RUNNERS_DIR=$WORK_DIR/runners
+    if [ -s "$STATE/active-work-dir" ]; then RUNNERS_DIR=$(cat "$STATE/active-work-dir")/runners; fi
     POLL=$("$JQ" -r '.poll_seconds // 300 | if . < 10 then 10 else . end | floor' "$ROOT/conf/settings.json")
     RESTART=$("$JQ" -r '.restart_seconds // 30 | if . < 1 then 1 else . end | floor' "$ROOT/conf/settings.json")
     # Below the 90 s systemd/launchd stop timeout, so a graceful stop is never cut short.
@@ -144,7 +148,8 @@ safe_org() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]; }
 safe_id() { [[ $1 =~ ^[0-9]+$ ]]; }
 # Each organization runs runner_count runners. Runner N of an organization is keyed by the
 # organization ID (N = 1) or <ID>.N in the state; its program lives in
-# runner/<login>/<runner name>/app and its jobs in jobs/<login>/<runner name>.
+# runners/<login>/<runner name>/app and its jobs in jobs/<login>/<runner name>, both in the
+# work directory.
 safe_key() { [[ $1 =~ ^[0-9]+(\.([2-9]|[1-9][0-9]+))?$ ]]; }
 # At most half the logical CPUs (at least 1), so an organization's runners leave room for
 # each other; a count saved on a larger machine is capped here.
@@ -239,7 +244,7 @@ ensure_worker() {
     [ ! -f "$ROOT/conf/stopped" ] && [ ! -f "$STATE/paused/$id" ] || return 0
     name=$("$JQ" -r --arg id "$id" '.[$id] | select(.active != false) | .runner_name // empty' "$STATE/organizations.json")
     indexed_name "$name" || return 0
-    directory=$ROOT/runner/$login/$name
+    directory=$RUNNERS_DIR/$login/$name
     [ -f "$directory/app/.runner" ] || return 0
     record_alive "$STATE/workers/$id.pid" && return 0
     now=$(date +%s); due=$(cat "$STATE/retry/$id" 2>/dev/null || printf 0)
@@ -321,10 +326,10 @@ prepare_workspace() {
     local login=$1 name=$2
     safe_org "$login" && indexed_name "$name" || return 1
     mkdir -p "$JOBS_DIR/$login/$name" || return 1
-    jq_update "$ROOT/runner/$login/$name/app/.runner" --arg work "$JOBS_DIR/$login/$name" '.workFolder=$work'
+    jq_update "$RUNNERS_DIR/$login/$name/app/.runner" --arg work "$JOBS_DIR/$login/$name" '.workFolder=$work'
 }
 configure_runner() {
-    local login=$1 name=$2 directory=$ROOT/runner/$1/$2/app token output status
+    local login=$1 name=$2 directory=$RUNNERS_DIR/$1/$2/app token output status
     ensure_package || return 1
     if [ ! -f "$directory/run.sh" ]; then
         rm -rf "$directory.staging"
@@ -360,7 +365,7 @@ next_name() {
 # entry claims and whose ID and name GitHub still reports. Prints "<name> <ID>".
 unclaimed_registration() {
     local login=$1 remote=$2 config name runner_id
-    for config in "$ROOT/runner/$login"/*/app/.runner; do
+    for config in "$RUNNERS_DIR/$login"/*/app/.runner; do
         [ -f "$config" ] || continue
         name=${config%/app/.runner}; name=${name##*/}
         indexed_name "$name" || continue
@@ -383,8 +388,8 @@ reconcile_one() {
         preferred=${adopted% *}; runner_id=${adopted##* }; old_login=$login
     fi
     local_id=0
-    if indexed_name "$preferred" && [ -f "$ROOT/runner/$old_login/$preferred/app/.runner" ]; then
-        local_id=$("$JQ" -r '.agentId // 0' "$ROOT/runner/$old_login/$preferred/app/.runner")
+    if indexed_name "$preferred" && [ -f "$RUNNERS_DIR/$old_login/$preferred/app/.runner" ]; then
+        local_id=$("$JQ" -r '.agentId // 0' "$RUNNERS_DIR/$old_login/$preferred/app/.runner")
     fi
     registered=$(printf '%s' "$remote" | "$JQ" -c --argjson id "$runner_id" '[.[]|select(.id==$id)][0] // null')
     name=$(printf '%s' "$registered" | "$JQ" -r '.name // empty')
@@ -399,9 +404,9 @@ reconcile_one() {
             remote=$(printf '%s' "$remote" | "$JQ" -c --argjson id "$runner_id" '[.[]|select(.id!=$id)]')
         fi
         # A renamed organization keeps its program directory; old jobs stay in place.
-        if [ "$old_login" != "$login" ] && safe_org "$old_login" && indexed_name "$preferred" && [ -d "$ROOT/runner/$old_login/$preferred" ] && [ ! -e "$ROOT/runner/$login/$preferred" ]; then
-            mkdir -p "$ROOT/runner/$login" && mv "$ROOT/runner/$old_login/$preferred" "$ROOT/runner/$login/$preferred" || return 1
-            rmdir "$ROOT/runner/$old_login" 2>/dev/null || :
+        if [ "$old_login" != "$login" ] && safe_org "$old_login" && indexed_name "$preferred" && [ -d "$RUNNERS_DIR/$old_login/$preferred" ] && [ ! -e "$RUNNERS_DIR/$login/$preferred" ]; then
+            mkdir -p "$RUNNERS_DIR/$login" && mv "$RUNNERS_DIR/$old_login/$preferred" "$RUNNERS_DIR/$login/$preferred" || return 1
+            rmdir "$RUNNERS_DIR/$old_login" 2>/dev/null || :
             log "Moved runner directory $old_login/$preferred to $login/$preferred"
         fi
         registered=null
@@ -414,10 +419,10 @@ reconcile_one() {
         # Preserve this installation's number on repair, unless another machine took it.
         if indexed_name "$preferred" && ! printf '%s' "$remote" | "$JQ" -e --arg name "$preferred" 'any(.[]; (.name|ascii_downcase)==$name)' >/dev/null; then name=$preferred;
         else name=$(next_name "$remote") || return 1; fi
-        directory=$ROOT/runner/$login/$name
+        directory=$RUNNERS_DIR/$login/$name
         # A new number reuses the previous program directory instead of copying the Runner again.
-        if [ "$name" != "$preferred" ] && indexed_name "$preferred" && [ -d "$ROOT/runner/$login/$preferred" ] && [ ! -e "$directory" ]; then
-            mv "$ROOT/runner/$login/$preferred" "$directory" || return 1
+        if [ "$name" != "$preferred" ] && indexed_name "$preferred" && [ -d "$RUNNERS_DIR/$login/$preferred" ] && [ ! -e "$directory" ]; then
+            mv "$RUNNERS_DIR/$login/$preferred" "$directory" || return 1
         fi
         rm -f "$directory/app/.runner" "$directory/app/.credentials" "$directory/app/.credentials_rsaparams"
         if runner_id=$(configure_runner "$login" "$name"); then break; fi
@@ -452,8 +457,8 @@ retire_one() {
     stop_worker "$id"
     if [ "$registered" != null ]; then api "orgs/$login/actions/runners/$runner_id" --method DELETE >/dev/null || return 1; fi
     if indexed_name "$name"; then
-        rm -rf "${ROOT:?}/runner/$login/$name" "${JOBS_DIR:?}/$login/$name" || return 1
-        if [ "$old_login" != "$login" ] && safe_org "$old_login"; then rm -rf "${ROOT:?}/runner/$old_login/$name" || return 1; fi
+        rm -rf "${RUNNERS_DIR:?}/$login/$name" "${JOBS_DIR:?}/$login/$name" || return 1
+        if [ "$old_login" != "$login" ] && safe_org "$old_login"; then rm -rf "${RUNNERS_DIR:?}/$old_login/$name" || return 1; fi
     fi
     jq_update "$STATE/organizations.json" --arg id "$id" 'del(.[$id])' || return 1
     rm -f "$STATE/paused/$id" "$STATE/retry/$id"
@@ -528,6 +533,18 @@ shutdown() {
     stop_records "$STATE"/workers/*.pid "$STATE"/children/*.pid "$STATE"/timeouts/*.pid
     rm -f "$STATE/manager.pid"
 }
+# A ghr config --data-dir change takes the registered runners along. If they cannot move,
+# reconciliation registers them again in the new directory under the same numbers.
+move_runners() {
+    local target=$WORK_DIR/runners
+    # ghr config --data-dir prepares an empty runners directory there.
+    [ "$RUNNERS_DIR" = "$target" ] || [ ! -d "$RUNNERS_DIR" ] || rmdir "$target" 2>/dev/null || :
+    if [ "$RUNNERS_DIR" != "$target" ] && [ -d "$RUNNERS_DIR" ] && [ ! -L "$RUNNERS_DIR" ] && [ ! -e "$target" ]; then
+        if mv "$RUNNERS_DIR" "$target" 2>/dev/null; then log "Moved runners from $RUNNERS_DIR to $target";
+        else log "Cannot move $RUNNERS_DIR to $target; the runners register again there"; fi
+    fi
+    RUNNERS_DIR=$target
+}
 serve() {
     local next=0 now applied= count
     [ ! -f "$ROOT/conf/stopped" ] || return 0
@@ -536,7 +553,10 @@ serve() {
     trap shutdown EXIT
     trap 'exit 0' TERM INT
     record_pid "$STATE/manager.pid" "$$" || return 1
+    move_runners
     printf '%s\n' "$WORK_DIR" | atomic "$STATE/active-work-dir" || return 1
+    # Every work directory used is remembered, so uninstall can clean all of them.
+    grep -Fqx -- "$WORK_DIR" "$STATE/work-dirs" 2>/dev/null || printf '%s\n' "$WORK_DIR" >> "$STATE/work-dirs"
     stop_records "$STATE"/workers/*.pid "$STATE"/children/*.pid "$STATE"/timeouts/*.pid
     log "Started Shell supervisor $PREFIX"
     SUPERVISING=1
@@ -562,7 +582,10 @@ docker_access_state() {
     else printf 'unavailable (no Docker socket with a dedicated group at install time)'; fi
 }
 job_sudo_state() {
-    if [ "$("$JQ" -r '.job_sudo == true' "$ROOT/conf/settings.json")" != true ]; then printf 'off (LOCAL_RUNNER_SUDO=yes turns it on)'
+    if [ "$("$JQ" -r '.job_sudo == true' "$ROOT/conf/settings.json")" != true ]; then
+        if [ "$("$JQ" -r '.job_sudo_choice == false' "$ROOT/conf/settings.json")" = true ]; then printf 'off (LOCAL_RUNNER_SUDO=no)'
+        elif [ "$("$JQ" -r '.runtime // "native"' "$ROOT/conf/settings.json")" = native ] && [ ! -f "$ROOT/conf/account.json" ]; then printf 'off (needs a root installation)'
+        else printf 'off (sudo unavailable; run the installer again after installing it)'; fi
     elif [ "$("$JQ" -r '.runtime // "native"' "$ROOT/conf/settings.json")" = docker ]; then printf 'on; passwordless sudo inside the container'
     else printf 'on; passwordless sudo, which is root on this host'; fi
 }
@@ -603,7 +626,7 @@ status() {
     item 'Job sudo' "$(job_sudo_state)"
     item 'Runners per organization' "$(runner_count)"
     item 'Install directory' "$ROOT"
-    item 'Runner directory' "$ROOT/runner"
+    item 'Runners directory' "$RUNNERS_DIR"
     if [ -s "$STATE/active-work-dir" ]; then
         work=$(cat "$STATE/active-work-dir")
         directory_state='last run; manager stopped'

@@ -171,6 +171,10 @@ assert grep -q 'LOCAL_RUNNER_SUDO=yes needs a root installation' "$home/output"
 assert test ! -e "$home/linux"
 LOCAL_RUNNER_SUDO=maybe run_install linux none "$home" "$FIXTURE/scope-linux" 1
 assert grep -q 'LOCAL_RUNNER_SUDO must be yes or no' "$home/output"
+# By default a normal-user native installation keeps sudo off and says why.
+run_install linux none "$home" "$FIXTURE/scope-linux" 0
+assert grep -q 'Job sudo: off; jobs run as your own login account here' "$home/output"
+assert jq -e '.job_sudo == false and (has("job_sudo_choice") | not)' "$home/linux/conf/settings.json"
 # A dropped GitHub connection is retried; a persistent failure explains how to resume.
 (
     sed '/^if \[ -t 0 \]/,$d' "$REPO/linux/install.sh" > "$FIXTURE/helpers.sh"
