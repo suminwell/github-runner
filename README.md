@@ -33,7 +33,7 @@ Linux root 安装自动创建锁定登录的系统账户 `ghrunner`，HOME 为 `
 
 root 安装目录及其父目录必须由 root 拥有，且其他用户不能写入。`bin/` 和 `conf/` 中的脚本、配置和凭据由 root 管理；专用账户只读配置，可写 `bin/.cache/`、`conf/runtime/` 和工作目录下的 `jobs/`、`runners/`、`logs/`。root 安装额外需要 `runuser`、`useradd` 和 POSIX ACL，缺少 `acl` 时会自动安装。即使从 `/root/...` 执行，数据和日志仍默认放在当前目录；安装器给专用账户添加必要的父目录穿越权限和 `data/logs` 写权限，不开放父目录的列表权限，不递归更改已有文件权限。父目录中本来允许读取的文件，在知道路径后可能变得可访问；建议在 `/srv/builds` 等专用构建目录执行安装。需要 root 自动授权的目录及其父目录也须由 root 管理，防止任务替换路径；专用账户本来就能读写的目录可直接使用。已有数据内部若使用其他账户的私有权限，需自行授权。`ghr config --data-dir` 同样处理新目录权限，重启后切换。
 
-卸载 root 安装时保留锁定登录的专用账户及 HOME，供本机其他架构的安装使用；重新安装复用原 UID。账户记录保存在 root 管理的 `/var/lib/github-runner/account.json`，不随 `config --data-dir` 改变。
+卸载最后一个 root 安装时，一并删除专用账户 `ghrunner`、它的 HOME 和 `/var/lib/github-runner`；本机另一种架构的 root 安装还在时保留账户，重新安装复用原 UID。账户记录保存在 root 管理的 `/var/lib/github-runner/account.json`，不随 `config --data-dir` 改变。
 
 符合 [GitHub 官方支持范围](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#linux) 的 Linux（例如 Ubuntu 20.04+、Debian 10+、RHEL/CentOS/Oracle Linux 8+）直接在宿主机运行；新部署建议选择仍在维护的 Ubuntu 24.04、Debian 12 或 RHEL 9。低于这些版本的 glibc 发行版（例如 **CentOS 7**、Ubuntu 18.04）自动改用下面的 **Docker 模式**；Alpine/musl 仍不支持。
 
@@ -73,7 +73,7 @@ Docker 需要 20.10.10 或更高版本。安装器在改动任何内容之前完
 
 无交互输入时不会自动同意升级或修改软件源；无人值守安装可设置 `LOCAL_RUNNER_ASSUME_YES=yes`，表示同意上述全部询问。也可以在受支持的系统上设置 `LOCAL_RUNNER_RUNTIME=docker` 主动使用 Docker 模式；之后重复安装会沿用已记录的模式，设置 `LOCAL_RUNNER_RUNTIME=native` 重新安装可切回原生运行（仅限受支持的系统）。WSL 内不支持 Docker 模式。
 
-`ghr status` 的第一个表格会显示 `Runtime  Docker (...)`。`ghr uninstall` 保留 Docker 和镜像，因为同一主机上的其他安装可能还在使用；确认不再需要后自行执行 `docker rmi local-github-runner:<架构>`。
+`ghr status` 的第一个表格会显示 `Runtime  Docker (...)`。`ghr uninstall` 会删除镜像 `local-github-runner:<架构>`；本机同架构的另一个安装还在用 Docker 模式时保留镜像。Docker 本身和基础镜像 `ubuntu:22.04` 不删除。
 
 ## 随时待命：不休眠、合盖继续运行
 
@@ -152,7 +152,7 @@ ghr uninstall: 卸载runner
 - `logs`：显示管理日志最后 200 行；`logs -f` 持续跟踪新增日志，日志轮换后继续跟踪，按 Ctrl+C 结束。
 - `config`：显示 `data-dir`（`jobs/` 和 `logs/` 的父目录）；`config --data-dir` 只输出该路径。`config --data-dir <PATH>` 设置新目录，见[修改数据和日志目录](#修改数据和日志目录)。`config` 只接受完整选项名 `--data-dir`，不支持简写或 `--data-dir=<PATH>` 写法；路径包含空格时用引号括起。
 - `runner`：显示每个组织的 Runner 个数和本机上限；`runner -a`/`--add` 加一个，`runner -s`/`--sub` 减一个，见[每个组织多个 Runner](#每个组织多个-runner)。
-- `uninstall`：停止进程，注销本机记录的 GitHub Runner，移除系统服务（含防休眠守护和 sudo 规则）、`ghr` 命令，以及安装目录的 `bin/`、`conf/`；同时删除本安装用过的每个工作目录下的 `jobs/`、`runners/`、`logs/`，删空的安装目录和工作目录也一并删除，目录里有其他文件时保留。若注册成功后尚未保存组织状态就退出，会从本地官方 `.runner` 元数据补查组织和远端身份。身份无法确认或 GitHub 注销失败时保留凭据和状态，修复后再次执行卸载。其他机器的 Runner 不会被删除。
+- `uninstall`：停止进程，注销本机记录的 GitHub Runner，移除系统服务（含防休眠守护和 sudo 规则）、`ghr` 命令，以及安装目录的 `bin/`、`conf/`；同时删除本安装用过的每个工作目录下的 `jobs/`、`runners/`、`logs/`，删空的安装目录和工作目录也一并删除，目录里有其他文件时保留。Docker 模式的镜像和 root 安装的 `ghrunner` 账户也会删除，本机还有其他安装在用时保留。若注册成功后尚未保存组织状态就退出，会从本地官方 `.runner` 元数据补查组织和远端身份。身份无法确认或 GitHub 注销失败时保留凭据和状态，修复后再次执行卸载。其他机器的 Runner 不会被删除。
 
 Unix 的入口为 `/usr/local/bin/ghr`，调用安装目录的 `bin/ghr.sh`。Windows 的 `bin/ghr.cmd` 调用 `bin/ghr.ps1`，安装器将其目录加入安装用户的 PATH。若已有终端找不到 `ghr`，重新打开终端；Unix 的 PATH 需要包含 `/usr/local/bin`。Windows 的启停、目录设置、Runner 个数调整和卸载在管理员 PowerShell 中执行。
 

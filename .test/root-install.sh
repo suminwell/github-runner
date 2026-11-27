@@ -306,5 +306,7 @@ for work in /root/builds '/root/new work' '/root/final work'; do
 done
 assert test ! -e "$root"
 assert jq -e 'length==0' /fixture/runners.json
-assert id ghrunner >/dev/null
+if id ghrunner >/dev/null 2>&1; then echo 'FAIL: ghrunner account kept' >&2; exit 1; fi
+assert test ! -e /var/lib/github-runner
+assert test ! -e /etc/github-runner
 printf 'PASS root install/retry, non-root jobs, protected config, directories, lifecycle, WSL bridge and uninstall\n'

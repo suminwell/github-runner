@@ -18,6 +18,8 @@ ghr uninstall: 卸载runner
 HELP
 }
 privileged() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
+# Progress for commands that can take a while (start, stop, restart, uninstall).
+step() { printf '==> %s\n' "$*"; }
 cli_contents() {
     printf '#!/bin/bash\n# ghr: %s\nunset LOCAL_RUNNER_ROOT\n' "$ROOT"
     printf 'exec /bin/bash %q "$@"\n' "$ROOT/bin/ghr.sh"
@@ -44,10 +46,13 @@ native_service() {
     if [ -f "$DEFINITION" ]; then
         [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$DEFINITION")" = "$ROOT/bin/service.sh" ] || { printf 'Another installation owns %s\n' "$SERVICE_NAME" >&2; return 1; }
         if [ "$action" = start ]; then
+            step "Starting service $SERVICE_NAME"
             privileged launchctl enable "system/$SERVICE_NAME" || return 1
             if ! privileged launchctl print "system/$SERVICE_NAME" >/dev/null 2>&1; then privileged launchctl bootstrap system "$DEFINITION" || return 1; fi
             privileged launchctl kickstart "system/$SERVICE_NAME"; return $?
         fi
+        if [ "$action" = stop ]; then step "Stopping service $SERVICE_NAME (a running job gets time to finish)"
+        else step "Removing service $SERVICE_NAME"; fi
         privileged launchctl disable "system/$SERVICE_NAME" || return 1
         if privileged launchctl print "system/$SERVICE_NAME" >/dev/null 2>&1; then privileged launchctl bootout "system/$SERVICE_NAME" || return 1; fi
     elif [ "$action" = start ]; then printf 'Service definition missing; re-run the installer.\n' >&2; return 1; fi
@@ -66,6 +71,7 @@ remove_awake_guard() {
 }
 # The manager's shlock file is released when this command exits, as by the manager itself.
 stop_processes() {
+    step 'Stopping the manager and runner processes'
     stop_record "$ROOT/conf/manager.pid"
     wait_for_lock || { printf 'Manager is still running.\n' >&2; return 1; }
     trap 'rm -f "$ROOT/conf/service.lock"' EXIT
@@ -197,6 +203,7 @@ unregister_untracked_runners() {
 }
 unregister_runners() {
     local id login runner_id organization remote failed=0
+    step 'Unregistering this machine'"'"'s runners from GitHub'
     unregister_untracked_runners || return 1
     while IFS=$'\t' read -r id login runner_id; do
         safe_key "$id" && safe_id "$runner_id" && safe_org "$login" || { failed=1; continue; }
@@ -207,7 +214,8 @@ unregister_runners() {
         if ! remote=$(list_runners "$login"); then printf 'Cannot query %s; retained registration state.\n' "$login" >&2; failed=1; continue; fi
         if printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" 'any(.[]; .id==$id)' >/dev/null; then
             if ! api "orgs/$login/actions/runners/$runner_id" --method DELETE >/dev/null; then printf 'Cannot unregister %s/%s; retry uninstall.\n' "$login" "$runner_id" >&2; failed=1; continue; fi
-        fi
+            printf '    %s: unregistered runner %s\n' "$login" "$runner_id"
+        else printf '    %s: runner %s was already gone from GitHub\n' "$login" "$runner_id"; fi
         jq_update "$ROOT/conf/organizations.json" --arg id "$id" 'del(.[$id])' || return 1
     done < <("$JQ" -r 'to_entries[]|[.key,.value.login,.value.runner_id]|@tsv' "$ROOT/conf/organizations.json")
     return "$failed"
@@ -236,6 +244,7 @@ uninstall() {
         [ ! -L "$command_path" ] && grep -Fqx "# ghr: $ROOT" "$command_path" || { printf 'Command ownership changed; refusing removal.\n' >&2; return 1; }
         privileged rm -f "$command_path" || return 1
     fi
+    step 'Removing jobs, runners, logs and the installation directory'
     remove_installation_files "$ROOT/conf" || return 1
     printf 'Runner uninstalled; its jobs, runners, logs and installation directory were removed.\n'
 }

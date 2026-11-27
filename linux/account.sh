@@ -183,20 +183,37 @@ account_command() {
                     account_run /bin/bash "$ROOT/bin/ghr.sh" --runtime-unregister || return 1
                     native_service remove && wsl_host remove || return 1
                     command_path=$("$JQ" -r '.command_path // empty' "$ROOT/conf/settings.json")
-                    hint=$(docker_hint)
+                    image=$(docker_image)
                     if [ -n "$command_path" ] && [ -e "$command_path" ]; then
                         [ ! -L "$command_path" ] && grep -Fqx "# ghr: $ROOT" "$command_path" || return 1
                         rm -f "$command_path" || return 1
                     fi
                     WORK_DIR=$("$JQ" -er .work_dir "$ROOT/conf/settings.json") || return 1
+                    step 'Removing jobs, runners, logs and the installation directory'
                     remove_installation_files "$ROOT/conf/runtime" || return 1
                     echo 'Runner uninstalled; its jobs, runners, logs and installation directory were removed.'
-                    echo 'The locked ghrunner account and its home are kept for other installations on this machine.'
-                    [ -z "$hint" ] || printf '%s\n' "$hint" ;;
+                    remove_docker_image "$image"
+                    account_remove ;;
                 *) usage ;;
             esac ;;
         *) usage >&2; return 2 ;;
     esac
+}
+# The ghrunner account, its home and the Docker mode sudo directory go with the last
+# root installation on this host; another one (the other architecture) keeps them.
+account_remove() {
+    for unit in "$SYSTEMD_UNITS"/local-github-runner-*.service; do
+        [ -f "$unit" ] && grep -qx "User=$account_user" "$unit" || continue
+        echo "The $account_user account is kept: ${unit##*/} still uses it."; return 0
+    done
+    step "Removing the $account_user account"
+    if id "$account_user" >/dev/null 2>&1; then
+        userdel "$account_user" || { echo "Cannot remove the $account_user account; remove it with userdel $account_user." >&2; return 0; }
+        ! getent group "$account_user" >/dev/null || groupdel "$account_user" || :
+    fi
+    rm -rf /var/lib/github-runner
+    rmdir "$JOB_SUDOERS_DIR" /etc/github-runner 2>/dev/null || :
+    echo "The $account_user account and its home were removed."
 }
 # settings.json stays root-owned and readable by the runner account.
 account_settings() {
@@ -226,6 +243,7 @@ account_start() {
     # write the old work directory itself.
     previous=$(cat "$ROOT/conf/runtime/active-work-dir" 2>/dev/null || :)
     if [ -n "$previous" ] && [ "$previous" != "$work" ] && [ -d "$previous/runners" ] && [ ! -L "$previous/runners" ] && [ -z "$(ls -A "$work/runners" 2>/dev/null)" ]; then
+        step "Moving runners from $previous to $work"
         rmdir "$work/runners" 2>/dev/null || :
         mv "$previous/runners" "$work/runners" || return 1
     fi

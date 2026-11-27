@@ -1,5 +1,7 @@
 ﻿param([ValidateSet('auto','x64','arm64')][string]$Architecture = 'auto')
 $ErrorActionPreference = 'Stop'
+# Progress before each step that can take a while, so a slow one does not look stuck.
+function Write-Step([string]$Message) { Write-Host "==> $Message" }
 function Get-NativeArchitecture {
     # The machine environment reports native ARM64 even in an emulated x64 shell.
     $native = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE).PROCESSOR_ARCHITECTURE
@@ -90,6 +92,7 @@ function Get-SourceFile([string]$Source, [string]$Destination) {
 # Stop existing processes with the new script from an Administrator-only location, so a
 # broken installed copy cannot block the upgrade.
 if (Test-Path -LiteralPath $state) {
+    Write-Step 'Stopping the installed runner, if running'
     $stopScript = Join-Path ([IO.Path]::GetTempPath()) ('local-github-runner-stop-' + [Guid]::NewGuid().ToString('N') + '.ps1')
     try {
         Get-SourceFile 'windows/service.ps1' $stopScript
@@ -114,6 +117,7 @@ if ($existing) {
 if ($usable) {
     if ($existing.Source -ne $ghPath) { Copy-Item -LiteralPath $existing.Source -Destination $ghPath -Force }
 } else {
+    Write-Step 'Downloading the GitHub CLI (gh)'
     $release = Invoke-RestMethod -TimeoutSec 120 https://api.github.com/repos/cli/cli/releases/latest
     $cliArch = if ($arch -eq 'x64') { 'amd64' } else { 'arm64' }
     $assetName = "gh_$($release.tag_name.TrimStart('v'))_windows_$cliArch.zip"
@@ -130,6 +134,7 @@ if ($usable) {
         Copy-Item $downloaded.FullName $ghPath -Force
     } finally { Remove-Item -LiteralPath $temporary -Recurse -Force }
 }
+Write-Step 'Checking the GitHub login'
 & $ghPath auth status --hostname github.com *> $null
 if ($LASTEXITCODE -ne 0) {
     & $ghPath auth login --hostname github.com --web --scopes admin:org,repo
@@ -178,16 +183,19 @@ switch -Regex ("$env:LOCAL_RUNNER_PREVENT_SLEEP") {
 }
 [IO.File]::WriteAllText($settingsPath, ($settings | ConvertTo-Json -Depth 20), (New-Object Text.UTF8Encoding($false)))
 foreach ($trusted in @('github-token','settings.json')) { Protect-AdminFile (Join-Path $state $trusted) }
+Write-Step "Downloading the runner scripts to $bin"
 Get-SourceFile 'windows/install.ps1' (Join-Path $bin 'install.ps1')
 Get-SourceFile 'windows/service.ps1' (Join-Path $bin 'service.ps1')
 Get-SourceFile 'windows/ghr.ps1' (Join-Path $bin 'ghr.ps1')
 Get-SourceFile 'windows/runner.ps1' (Join-Path $bin 'runner.ps1')
 Get-SourceFile 'windows/awake.ps1' (Join-Path $bin 'awake.ps1')
+Write-Step 'Preparing the official Runner (the first download is about 200 MB)'
 & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'service.ps1') -Mode Prepare
 if ($LASTEXITCODE -ne 0) { throw 'Runner preparation failed.' }
 & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'ghr.ps1') install-command
 if ($LASTEXITCODE -ne 0) { throw 'Management command setup failed.' }
 $env:Path = "$bin;$env:Path"
+Write-Step "Installing and starting scheduled task $taskName"
 $action = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$bin\service.ps1`"" -WorkingDirectory $installRoot
 $boot = New-ScheduledTaskTrigger -AtStartup
 # Indefinite repetition also recovers clean exits; IgnoreNew keeps only one manager.

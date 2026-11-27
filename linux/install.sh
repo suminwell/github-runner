@@ -2,6 +2,8 @@
 # Complete POSIX entry point; safe for curl ... | sh.
 set -eu
 privileged() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
+# Progress before each step that can take a while, so a slow one does not look stuck.
+step() { printf '==> %s\n' "$*"; }
 systemd_property() (
     property_unit=$1; property_name=$2
     property_output=$(privileged systemctl show "$property_unit" -p "$property_name" --all) || {
@@ -296,6 +298,7 @@ install_main() {
         prepare_docker_engine
     fi
     if ! command -v jq >/dev/null 2>&1; then
+        step 'Installing jq'
         if command -v apt-get >/dev/null; then privileged apt-get update; privileged apt-get install -y jq ca-certificates;
         elif command -v dnf >/dev/null; then privileged dnf install -y jq ca-certificates;
         elif command -v zypper >/dev/null; then privileged zypper --non-interactive install jq ca-certificates;
@@ -306,6 +309,7 @@ install_main() {
     command -v flock >/dev/null || { echo 'Install util-linux (flock) first.' >&2; exit 1; }
     if $root_install; then
         if ! command -v setfacl >/dev/null; then
+            step 'Installing acl'
             if command -v apt-get >/dev/null; then apt-get update; apt-get install -y acl;
             elif command -v dnf >/dev/null; then dnf install -y acl;
             elif command -v zypper >/dev/null; then zypper --non-interactive install acl;
@@ -353,6 +357,7 @@ install_main() {
         account_setup
         runtime_uid=$account_uid
     fi
+    step 'Stopping the installed runner service, if any (a running job gets up to 90 seconds)'
     stop_installed_service
     initialize_install_settings
     # Re-running the installer usually repairs credentials or configuration, so every
@@ -372,6 +377,7 @@ install_main() {
         if [ "${gh_major:-0}" -lt 2 ] || { [ "${gh_major:-0}" -eq 2 ] && [ "${gh_minor:-0}" -lt 62 ]; }; then gh_path=; fi
     fi
     if [ -z "$gh_path" ]; then
+        step 'Downloading the GitHub CLI (gh)'
         download_cache=$root/bin/.cache
         if $root_install; then download_cache=$root/conf; fi
         temporary=$(mktemp -d "$download_cache/gh.XXXXXX")
@@ -400,6 +406,7 @@ install_main() {
         cp "$jq_bootstrap/jq" "$root/bin/tools/jq"; chmod 700 "$root/bin/tools/jq"
         jq_path=$root/bin/tools/jq
     fi
+    step 'Checking the GitHub login'
     "$gh_path" auth status --hostname github.com >/dev/null 2>&1 || "$gh_path" auth login --hostname github.com --web --scopes admin:org,repo
     # An existing gh login may predate this installer and lack admin:org, which runner
     # registration requires. Ask gh to add it before the token is saved for the service.
@@ -451,6 +458,7 @@ install_main() {
         '.platform=$platform|.arch=$arch|.owner_uid=$owner_uid|.runtime=$runtime|.prevent_sleep=$prevent_sleep|.docker_access=$docker_access|.job_sudo=$job_sudo|(if $sudo_choice == "" then . else .job_sudo_choice=($sudo_choice == "true") end)|.work_dir //= $default_work|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
         "$root/conf/settings.json" > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
+    step "Downloading the runner scripts to $root/bin"
     if $root_install; then fetch linux/account.sh "$root/bin/account.sh"; fi
     fetch "$platform/install.sh" "$root/bin/install.sh"
     fetch "$platform/service.sh" "$root/bin/service.sh"
@@ -464,7 +472,7 @@ install_main() {
     fetch linux/Dockerfile "$root/bin/Dockerfile"
     chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh" "$root/bin/docker.sh"
     if [ "$runtime" = docker ]; then
-        printf 'Building the Docker mode image.\n'
+        step 'Building the Docker mode image'
         docker_image=$(docker_privileged /bin/bash "$root/bin/docker.sh" build) || { echo 'Docker image build failed; the existing service was left stopped. Fix the error and retry.' >&2; exit 1; }
         "$jq_path" --arg image "$docker_image" '.docker_image=$image' "$root/conf/settings.json" > "$root/conf/settings.new"
         mv "$root/conf/settings.new" "$root/conf/settings.json"
@@ -508,12 +516,16 @@ install_main() {
         account_protect_config
         work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
         account_work_directory "$work_dir"
+        step 'Preparing the official Runner (the first download is about 200 MB)'
         account_prepare_package "$runtime" || { echo 'Preparing the official Runner failed (see the error above). Run the same install command again to retry.' >&2; exit 1; }
+        step 'Checking that the official Runner runs on this host'
         if [ "$runtime" = docker ]; then
             LOCAL_RUNNER_DOCKER_USER=$account_uid:$account_gid LOCAL_RUNNER_DOCKER_HOME=$account_home /bin/bash "$root/bin/docker.sh" verify
         else account_run env -i HOME="$account_home" PATH=/usr/local/bin:/usr/bin:/bin /bin/bash "$root/bin/service.sh" verify; fi
     else
+        step 'Preparing the official Runner (the first download is about 200 MB)'
         /bin/bash "$root/bin/service.sh" prepare || { echo 'Preparing the official Runner failed (see the error above). Run the same install command again to retry.' >&2; exit 1; }
+        step 'Checking that the official Runner runs on this host'
         if [ "$runtime" = docker ]; then
             privileged env LOCAL_RUNNER_DOCKER_USER="$(id -u):$(id -g)" LOCAL_RUNNER_DOCKER_HOME="$HOME" /bin/bash "$root/bin/docker.sh" verify
         else
@@ -539,6 +551,7 @@ install_main() {
         docker_group=$(stat -c %G /var/run/docker.sock)
         [ -n "$docker_group" ] && [ "$docker_group" != root ] && [ "$docker_group" != UNKNOWN ] || { echo 'The Docker socket has no dedicated group; cannot grant the runner account access.' >&2; rm -f "$definition"; exit 1; }
     fi
+    step "Installing and starting $service_name"
     systemd_unit "$user" "$service_home" "$service_path" "$root" "$docker_group" "$docker_access_group" > "$definition"
     privileged install -m 644 "$definition" "/etc/systemd/system/$service_name"
     privileged systemctl daemon-reload

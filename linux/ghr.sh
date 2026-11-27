@@ -19,11 +19,22 @@ ghr wsl setup: 在WSL内配置或修复Windows未登录时的自动启动
 HELP
 }
 privileged() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
-# Another installation on this host may share the Docker mode image, so it is kept.
-docker_hint() {
-    local image
-    image=$("$JQ" -r 'select(.runtime=="docker") | .docker_image // empty' "$ROOT/conf/settings.json" 2>/dev/null) || return 0
-    [ -z "$image" ] || printf 'Docker image %s and Docker itself were kept; remove the image with docker rmi %s when unused.\n' "$image" "$image"
+# Progress for commands that can take a while (start, stop, restart, uninstall).
+step() { printf '==> %s\n' "$*"; }
+docker_image() { "$JQ" -r 'select(.runtime=="docker") | .docker_image // empty' "$ROOT/conf/settings.json" 2>/dev/null || :; }
+# The Docker mode image is built per architecture; it is removed unless another installation
+# of the same architecture on this host still runs Docker mode. Docker itself stays.
+remove_docker_image() {
+    local image=$1 unit
+    [ -n "$image" ] || return 0
+    for unit in "$SYSTEMD_UNITS"/local-github-runner-*-"$ARCH".service; do
+        [ -f "$unit" ] && grep -q 'docker\.sh' "$unit" || continue
+        printf 'Docker image %s kept: %s still uses it.\n' "$image" "${unit##*/}"; return 0
+    done
+    privileged docker image inspect "$image" >/dev/null 2>&1 || return 0
+    step "Removing Docker image $image"
+    if privileged docker rmi "$image" >/dev/null; then printf 'Docker image %s removed.\n' "$image"
+    else printf 'Docker image %s could not be removed; run docker rmi %s.\n' "$image" "$image" >&2; fi
 }
 wsl_host() { [ ! -f "$ROOT/bin/wsl.sh" ] || /bin/bash "$ROOT/bin/wsl.sh" "$1"; }
 cli_contents() {
@@ -70,7 +81,12 @@ native_service() {
     service_identity || return 1
     if [ -f "$DEFINITION" ]; then
         [ "$(systemd_property "$SERVICE_NAME" WorkingDirectory)" = "$ROOT" ] || { printf 'Another installation owns %s\n' "$SERVICE_NAME" >&2; return 1; }
-        if [ "$action" = start ]; then privileged systemctl enable "$SERVICE_NAME" && privileged systemctl start "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; return $?; fi
+        if [ "$action" = start ]; then
+            step "Starting service $SERVICE_NAME"
+            privileged systemctl enable "$SERVICE_NAME" && privileged systemctl start "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; return $?
+        fi
+        if [ "$action" = stop ]; then step "Stopping service $SERVICE_NAME (a running job gets up to 90 seconds to finish)"
+        else step "Removing service $SERVICE_NAME"; fi
         privileged systemctl disable "$SERVICE_NAME" && privileged systemctl stop "$SERVICE_NAME" || {
             printf 'Failed to stop %s; operation incomplete.\n' "$SERVICE_NAME" >&2; return 1;
         }
@@ -90,6 +106,7 @@ native_service() {
     remove_job_sudo
 }
 stop_processes() {
+    step 'Stopping the manager and runner processes'
     stop_record "$STATE/manager.pid"
     wait_for_lock || { printf 'Manager is still running.\n' >&2; return 1; }
     stop_records "$STATE"/workers/*.pid "$STATE"/children/*.pid "$STATE"/timeouts/*.pid
@@ -222,6 +239,7 @@ unregister_untracked_runners() {
 }
 unregister_runners() {
     local id login runner_id organization remote failed=0
+    step 'Unregistering this machine'"'"'s runners from GitHub'
     unregister_untracked_runners || return 1
     while IFS=$'\t' read -r id login runner_id; do
         safe_key "$id" && safe_id "$runner_id" && safe_org "$login" || { failed=1; continue; }
@@ -232,7 +250,8 @@ unregister_runners() {
         if ! remote=$(list_runners "$login"); then printf 'Cannot query %s; retained registration state.\n' "$login" >&2; failed=1; continue; fi
         if printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" 'any(.[]; .id==$id)' >/dev/null; then
             if ! api "orgs/$login/actions/runners/$runner_id" --method DELETE >/dev/null; then printf 'Cannot unregister %s/%s; retry uninstall.\n' "$login" "$runner_id" >&2; failed=1; continue; fi
-        fi
+            printf '    %s: unregistered runner %s\n' "$login" "$runner_id"
+        else printf '    %s: runner %s was already gone from GitHub\n' "$login" "$runner_id"; fi
         jq_update "$STATE/organizations.json" --arg id "$id" 'del(.[$id])' || return 1
     done < <("$JQ" -r 'to_entries[]|[.key,.value.login,.value.runner_id]|@tsv' "$STATE/organizations.json")
     return "$failed"
@@ -252,20 +271,21 @@ remove_installation_files() {
     rmdir "$ROOT" 2>/dev/null || :
 }
 uninstall() {
-    local command_path hint
+    local command_path image
     stop_installation || return 1
     unregister_runners || { printf 'Uninstall incomplete. State and credentials retained; run ghr uninstall again.\n' >&2; return 1; }
     native_service remove || return 1
     wsl_host remove || return 1
     command_path=$("$JQ" -r '.command_path // empty' "$ROOT/conf/settings.json")
-    hint=$(docker_hint)
+    image=$(docker_image)
     if [ -n "$command_path" ] && [ -e "$command_path" ]; then
         [ ! -L "$command_path" ] && grep -Fqx "# ghr: $ROOT" "$command_path" || { printf 'Command ownership changed; refusing removal.\n' >&2; return 1; }
         privileged rm -f "$command_path" || return 1
     fi
+    step 'Removing jobs, runners, logs and the installation directory'
     remove_installation_files "$STATE" || return 1
     printf 'Runner uninstalled; its jobs, runners, logs and installation directory were removed.\n'
-    [ -z "$hint" ] || printf '%s\n' "$hint"
+    remove_docker_image "$image"
 }
 command_main() {
     local command=${1:-help}; [ "$#" -eq 0 ] || shift

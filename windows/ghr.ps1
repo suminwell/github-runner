@@ -53,6 +53,8 @@ function Install-Command {
     Write-Json (Join-Path $script:Root 'conf\settings.json') $script:Settings
     Protect-AdminFile (Join-Path $script:Root 'conf\settings.json')
 }
+# Progress for commands that can take a while (start, stop, restart, uninstall).
+function Write-Step([string]$Message) { Write-Host "==> $Message" }
 function Get-OwnedTask {
     $task = Get-ScheduledTask -TaskName "LocalGitHubRunner-$($script:Settings.arch)" -ErrorAction SilentlyContinue
     if ($task -and (@($task.Actions).Count -ne 1 -or @($task.Actions)[0].Arguments.IndexOf(('"' + (Join-Path $script:Root 'bin\service.ps1') + '"'), [StringComparison]::OrdinalIgnoreCase) -lt 0)) { throw 'Another installation owns this task name.' }
@@ -62,10 +64,12 @@ function Stop-Installation {
     Assert-Administrator
     $task = Get-OwnedTask
     if ($task) {
+        Write-Step "Stopping scheduled task $($task.TaskName)"
         Disable-ScheduledTask -TaskName $task.TaskName | Out-Null
         Stop-ScheduledTask -TaskName $task.TaskName
     }
     Write-AtomicText (Join-Path $script:Root 'conf\stopped') 'stopped'
+    Write-Step 'Stopping the manager and runner processes'
     Stop-Record (Join-Path $script:Root 'conf\manager.json')
     Stop-StateProcesses (Join-Path $script:Root 'conf')
     Write-Host 'Runner stopped; automatic startup disabled. Run ghr start to resume.'
@@ -76,6 +80,7 @@ function Start-Installation {
     $task = Get-OwnedTask
     if (-not $task) { throw 'Scheduled task missing; re-run the installer.' }
     Remove-Item (Join-Path $script:Root 'conf\stopped') -Force -ErrorAction SilentlyContinue
+    Write-Step "Starting scheduled task $($task.TaskName)"
     try { Enable-ScheduledTask -TaskName $task.TaskName | Out-Null; Start-ScheduledTask -TaskName $task.TaskName }
     catch { Write-AtomicText (Join-Path $script:Root 'conf\stopped') 'stopped'; throw }
     Write-Host 'Runner started; automatic startup enabled.'
@@ -311,6 +316,7 @@ function Unregister-UntrackedRunners($State) {
 }
 function Unregister-Runners {
     $state = Get-State; $failed = $false
+    Write-Step "Unregistering this machine's runners from GitHub"
     Unregister-UntrackedRunners $state
     foreach ($id in @($state.Keys)) {
         $entry = $state[$id]
@@ -319,7 +325,10 @@ function Unregister-Runners {
             $organization = Invoke-GitHubApi "organizations/$($id.Split('.')[0])"
             if ("$($organization.id)" -ne $id.Split('.')[0] -or -not (Test-Organization $organization.login)) { throw 'Organization identity mismatch.' }
             $login = $organization.login
-            if (@(Get-RemoteRunners $login | Where-Object id -eq $entry.runner_id).Count) { $null = Invoke-GitHubApi "orgs/$login/actions/runners/$($entry.runner_id)" -Method DELETE }
+            if (@(Get-RemoteRunners $login | Where-Object id -eq $entry.runner_id).Count) {
+                $null = Invoke-GitHubApi "orgs/$login/actions/runners/$($entry.runner_id)" -Method DELETE
+                Write-Host "    ${login}: unregistered runner $($entry.runner_id)"
+            } else { Write-Host "    ${login}: runner $($entry.runner_id) was already gone from GitHub" }
             $state.Remove($id); Save-State $state
         } catch { Write-Warning "Cannot unregister $($entry.login)/$($entry.runner_id); retained state for retry."; $failed = $true }
     }
@@ -362,6 +371,7 @@ function Uninstall-Runner {
     Stop-Installation
     Unregister-Runners
     $task = Get-OwnedTask
+    Write-Step 'Removing the scheduled task and sleep prevention'
     if ($task) { Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false }
     Remove-AwakeGuard
     $bin = Join-Path $script:Root 'bin'; $launcher = Join-Path $bin 'ghr.cmd'
@@ -380,6 +390,7 @@ function Uninstall-Runner {
         if (Test-Path -LiteralPath $path) { $works = @(Get-Content -Encoding UTF8 -LiteralPath $path | ForEach-Object { $_.Trim() }) + $works }
     }
     $works = @($works | Where-Object { $_ } | Select-Object -Unique)
+    Write-Step 'Removing jobs, runners, logs and the installation directory'
     foreach ($work in $works) { foreach ($part in @('jobs','runners','logs')) { Remove-InstallationTree (Join-Path $work $part) } }
     Remove-InstallationTree $bin
     Remove-InstallationTree (Join-Path $script:Root 'conf')

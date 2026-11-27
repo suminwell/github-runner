@@ -10,6 +10,8 @@ token_has_admin_org() {
     case ", $token_scopes," in *", admin:org,"*) return 0 ;; *) return 1 ;; esac
 }
 sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+# Progress before each step that can take a while, so a slow one does not look stuck.
+step() { printf '==> %s\n' "$*"; }
 xml() { printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
 # Interactive: launchd applies no background CPU/IO throttling to the runner and its jobs.
 launchd_plist() {
@@ -113,6 +115,7 @@ install_main() {
             /bin/bash "$setup"; rm -f "$setup"
             if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"; else eval "$(/usr/local/bin/brew shellenv)"; fi
         fi
+        step 'Installing jq with Homebrew'
         brew install jq
     fi
     base=${LOCAL_RUNNER_BASE_URL:-https://raw.githubusercontent.com/suminwell/github-runner/main}
@@ -137,6 +140,7 @@ install_main() {
     else
         for part in bin conf; do [ ! -e "$root/$part" ] || { echo "Refusing to reuse unrelated directory $root/$part; choose another installation directory." >&2; exit 1; }; done
     fi
+    step 'Stopping the installed runner service, if any'
     stop_installed_service
     initialize_install_settings
     # Re-running the installer usually repairs credentials or configuration, so every
@@ -152,6 +156,7 @@ install_main() {
         if [ "${gh_major:-0}" -lt 2 ] || { [ "${gh_major:-0}" -eq 2 ] && [ "${gh_minor:-0}" -lt 62 ]; }; then gh_path=; fi
     fi
     if [ -z "$gh_path" ]; then
+        step 'Downloading the GitHub CLI (gh)'
         temporary=$(mktemp -d "$root/bin/.cache/gh.XXXXXX")
         download https://api.github.com/repos/cli/cli/releases/latest "$temporary/release.json" 120
         version=$("$jq_path" -r '.tag_name|ltrimstr("v")' "$temporary/release.json")
@@ -169,6 +174,7 @@ install_main() {
         gh_path=$root/bin/tools/gh
         rm -rf "$temporary"
     fi
+    step 'Checking the GitHub login'
     "$gh_path" auth status --hostname github.com >/dev/null 2>&1 || "$gh_path" auth login --hostname github.com --web --scopes admin:org,repo
     # An existing gh login may predate this installer and lack admin:org, which runner
     # registration requires. Ask gh to add it before the token is saved for the service.
@@ -200,12 +206,14 @@ install_main() {
         '.platform=$platform|.arch=$arch|.owner_uid=$owner_uid|.prevent_sleep=$prevent_sleep|.work_dir //= $default_work|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
         "$root/conf/settings.json" > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
+    step "Downloading the runner scripts to $root/bin"
     fetch "$platform/install.sh" "$root/bin/install.sh"
     fetch "$platform/service.sh" "$root/bin/service.sh"
     fetch "$platform/ghr.sh" "$root/bin/ghr.sh"
     fetch "$platform/runner.sh" "$root/bin/runner.sh"
     fetch "$platform/awake.sh" "$root/bin/awake.sh"
     chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh" "$root/bin/awake.sh"
+    step 'Preparing the official Runner (the first download is about 200 MB)'
     /bin/bash "$root/bin/service.sh" prepare || { echo 'Preparing the official Runner failed (see the error above). Run the same install command again to retry.' >&2; exit 1; }
     /bin/bash "$root/bin/ghr.sh" --install-command
     work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
@@ -214,6 +222,7 @@ install_main() {
     user=$(id -un); user_id=$(id -u)
     definition=$(mktemp)
     service_name=com.suminwell.github-runner.$user_id.$arch
+    step "Installing and starting $service_name"
     launchd_plist "$service_name" "$user" "$HOME" "$PATH" "$root" > "$definition"
     sudo launchctl bootout "system/$service_name" 2>/dev/null || :
     sudo install -o root -g wheel -m 644 "$definition" "/Library/LaunchDaemons/$service_name.plist"
