@@ -18,7 +18,10 @@ check_linux_host() { :; }
 is_wsl() { return 1; }
 id() { if [ "$1" = -u ]; then echo 1001; else /usr/bin/id "$@"; fi; }
 flock() { return 99; }
-sudo() { printf '%s\n' "$*" >> "$INSTALL_HOME/host-calls"; }
+sudo() {
+    printf '%s\n' "$*" >> "$INSTALL_HOME/host-calls"
+    if [ "$1" = install ] && [ "$2" = -m ]; then cp "$4" "$INSTALL_HOME/unit-${5##*/}"; fi
+}
 stop_installed_service() { printf 'stop\n' >> "$INSTALL_HOME/host-calls"; }
 # Only the systemd-presence predicate is simulated; no host service is touched.
 [() {
@@ -45,6 +48,8 @@ gh() {
 }
 curl() { echo 'Simulated download failure' >&2; return 42; }
 sleep() { :; }
+# The Docker socket's group as GNU stat reports it; units are kept for inspection.
+stat() { if [ "$1" = -c ]; then echo "${INSTALL_SOCKET_GROUP:-docker}"; else command stat "$@"; fi; }
 fetch() { printf '#!/bin/sh\nexit 0\n' > "$2"; }
 install_main auto
 RUN
@@ -160,6 +165,29 @@ assert jq -e '.prevent_sleep == false' "$home/linux/conf/settings.json"
 : > "$home/host-calls"
 LOCAL_RUNNER_PREVENT_SLEEP=yes run_install linux none "$home" "$FIXTURE/scope-linux" 0
 if grep -q 'awake' "$home/host-calls"; then echo 'Installed the inhibitor without logind' >&2; exit 1; fi
+# Native jobs join the Docker socket's group unless LOCAL_RUNNER_DOCKER_ACCESS=no; the
+# choice is kept on re-runs. A root-owned socket group is reported, not granted.
+home=$FIXTURE/linux-scope-ok; unit=$home/unit-local-github-runner-1001-x64.service
+python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$FIXTURE/docker.sock"
+export LOCAL_RUNNER_DOCKER_SOCKET=$FIXTURE/docker.sock
+run_install linux none "$home" "$FIXTURE/scope-linux" 0
+assert grep -Fxq SupplementaryGroups=docker "$unit"
+assert jq -e '.docker_access == true and .docker_group == "docker"' "$home/linux/conf/settings.json"
+LOCAL_RUNNER_DOCKER_ACCESS=no run_install linux none "$home" "$FIXTURE/scope-linux" 0
+if grep -q SupplementaryGroups "$unit"; then echo 'Docker access kept after it was turned off' >&2; exit 1; fi
+run_install linux none "$home" "$FIXTURE/scope-linux" 0
+assert jq -e '.docker_access == false and (has("docker_group") | not)' "$home/linux/conf/settings.json"
+INSTALL_SOCKET_GROUP=root LOCAL_RUNNER_DOCKER_ACCESS=yes run_install linux none "$home" "$FIXTURE/scope-linux" 0
+assert grep -q 'belongs to group root, so jobs cannot use Docker' "$home/output"
+if grep -q SupplementaryGroups "$unit"; then echo 'Granted a root-owned socket group' >&2; exit 1; fi
+unset LOCAL_RUNNER_DOCKER_SOCKET
+# A normal-user native installation refuses passwordless sudo before changing anything.
+home=$FIXTURE/linux-sudo
+LOCAL_RUNNER_SUDO=yes run_install linux none "$home" "$FIXTURE/scope-linux" 1
+assert grep -q 'LOCAL_RUNNER_SUDO=yes needs a root installation' "$home/output"
+assert test ! -e "$home/linux"
+LOCAL_RUNNER_SUDO=maybe run_install linux none "$home" "$FIXTURE/scope-linux" 1
+assert grep -q 'LOCAL_RUNNER_SUDO must be yes or no' "$home/output"
 # A dropped GitHub connection is retried; a persistent failure explains how to resume.
 (
     sed '/^if \[ -t 0 \]/,$d' "$REPO/linux/install.sh" > "$FIXTURE/helpers.sh"

@@ -25,7 +25,8 @@ xml() { printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;
 unit_quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; }
 # systemd unquotes Environment= and ExecStart=, but rejects a quoted WorkingDirectory=.
 # A fifth argument (the Docker socket group) selects Docker mode: the unit then only
-# starts and stops the supervisor's container, as the same account.
+# starts and stops the supervisor's container, as the same account. A sixth gives native
+# mode the Docker socket group.
 systemd_unit() {
     exec_path=$(unit_quote "$4/bin/service.sh" | sed 's/\$/$$/g')
     docker_path=$(unit_quote "$4/bin/docker.sh" | sed 's/\$/$$/g')
@@ -47,6 +48,8 @@ UNIT
     if [ -n "${5:-}" ]; then
         printf 'SupplementaryGroups=%s\nExecStart=/bin/bash "%s" run\nExecStop=/bin/bash "%s" stop\n' "$5" "$docker_path" "$docker_path"
     else
+        # A sixth argument is the Docker socket group that native jobs may use.
+        [ -z "${6:-}" ] || printf 'SupplementaryGroups=%s\n' "$6"
         printf 'ExecStart=/bin/bash "%s"\n' "$exec_path"
     fi
     cat <<UNIT
@@ -75,6 +78,59 @@ RestartSec=60
 [Install]
 WantedBy=$1
 UNIT
+}
+# Job permissions requested for this run (empty keeps the recorded choice). Checked before
+# anything on the host changes.
+yes_no() {
+    case "$2" in
+        yes|true|1) printf true ;; no|false|0) printf false ;; '') ;;
+        *) echo "$1 must be yes or no." >&2; return 1 ;;
+    esac
+}
+check_job_permissions() {
+    requested_docker_access=$(yes_no LOCAL_RUNNER_DOCKER_ACCESS "${LOCAL_RUNNER_DOCKER_ACCESS:-}") || exit 1
+    requested_sudo=$(yes_no LOCAL_RUNNER_SUDO "${LOCAL_RUNNER_SUDO:-}") || exit 1
+    if [ "$runtime" = docker ] && [ "$requested_docker_access" = false ]; then
+        echo 'Docker mode needs the host Docker daemon; LOCAL_RUNNER_DOCKER_ACCESS=no is only possible in native mode.' >&2; exit 1
+    fi
+    if [ "$runtime" = native ] && [ "$requested_sudo" = true ]; then
+        $root_install || {
+            echo 'LOCAL_RUNNER_SUDO=yes needs a root installation: a normal-user installation runs jobs as your own login account, which would then have passwordless sudo everywhere.' >&2; exit 1;
+        }
+        command -v visudo >/dev/null 2>&1 || { echo 'LOCAL_RUNNER_SUDO=yes needs sudo; install it and run the installer again.' >&2; exit 1; }
+        grep -Eq '^[#@]includedir[[:space:]]+/etc/sudoers\.d' /etc/sudoers 2>/dev/null || {
+            echo '/etc/sudoers does not include /etc/sudoers.d; LOCAL_RUNNER_SUDO=yes cannot grant sudo.' >&2; exit 1;
+        }
+    fi
+}
+# Passwordless sudo for the runner account: a validated sudoers.d file in native mode, or a
+# file that only the Docker mode container mounts (the host sudoers stays unchanged).
+# Only files carrying this marker are ever replaced or removed.
+JOB_SUDO_MARK='# github-runner: workflow jobs may use sudo without a password.'
+job_sudo_path() { if [ "$1" = docker ]; then printf '/etc/github-runner/sudoers/%s' "$2"; else printf '/etc/sudoers.d/%s' "$2"; fi; }
+remove_job_sudo() {
+    for sudo_file in "$(job_sudo_path native "$1")" "$(job_sudo_path docker "$1")"; do
+        if [ -f "$sudo_file" ] && [ "$(privileged head -n 1 "$sudo_file")" = "$JOB_SUDO_MARK" ]; then privileged rm -f "$sudo_file" "$sudo_file.shadow"; fi
+    done
+}
+install_job_sudo() {
+    sudo_file=$(job_sudo_path "$1" "$2")
+    if [ -e "$sudo_file" ] && [ "$(privileged head -n 1 "$sudo_file")" != "$JOB_SUDO_MARK" ]; then
+        echo "$sudo_file exists and was not written by this installer; leaving it unchanged." >&2; return 1
+    fi
+    printf '%s\n%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$JOB_SUDO_MARK" "$3" > "$definition"
+    if [ "$1" = native ]; then privileged visudo -cqf "$definition" || { echo 'The generated sudoers rule did not validate; sudo was not granted.' >&2; return 1; }
+    else privileged mkdir -p "${sudo_file%/*}"; fi
+    privileged install -o root -g root -m 0440 "$definition" "$sudo_file"
+    if [ "$1" = docker ]; then
+        # PAM's account check needs a shadow entry; the container gets a locked one for the
+        # account (and root) instead of the host's /etc/shadow.
+        printf 'root:*:20000:0:99999:7:::\n%s:!:20000::::::\n' "$4" > "$definition"
+        privileged install -o root -g root -m 0640 "$definition" "$sudo_file.shadow"
+    fi
+    # Switching between native and Docker mode leaves no rule for the other one behind.
+    if [ "$1" = native ]; then other_sudo_file=$(job_sudo_path docker "$2"); else other_sudo_file=$(job_sudo_path native "$2"); fi
+    if [ -f "$other_sudo_file" ] && [ "$(privileged head -n 1 "$other_sudo_file")" = "$JOB_SUDO_MARK" ]; then privileged rm -f "$other_sudo_file" "$other_sudo_file.shadow"; fi
 }
 launchd_plist() {
     cat <<PLIST
@@ -277,6 +333,7 @@ install_main() {
     esac
     root_install=false
     if [ "$(id -u)" = 0 ]; then root_install=true; else sudo -v; fi
+    check_job_permissions
     base=${LOCAL_RUNNER_BASE_URL:-https://raw.githubusercontent.com/suminwell/github-runner/main}
     docker_engine_ready=false
     if [ "$runtime" = docker ]; then
@@ -347,6 +404,7 @@ install_main() {
     if [ "${LOCAL_RUNNER_RUNTIME:-}" != native ] && [ -f "$root/conf/settings.json" ] && jq -e '.runtime=="docker"' "$root/conf/settings.json" >/dev/null 2>&1; then
         runtime=docker
         if is_wsl; then echo 'Docker mode is not supported in WSL.' >&2; exit 1; fi
+        check_job_permissions
         prepare_docker_engine
     fi
     if [ "$known_installation" = false ]; then
@@ -436,13 +494,22 @@ install_main() {
         '') prevent_sleep=$("$jq_path" -r 'if .prevent_sleep == false then "false" else "true" end' "$root/conf/settings.json" 2>/dev/null || echo true) ;;
         *) echo 'LOCAL_RUNNER_PREVENT_SLEEP must be yes or no.' >&2; exit 1 ;;
     esac
+    # Native jobs may use the host Docker daemon by default; passwordless sudo is opt-in.
+    docker_access=${requested_docker_access:-$("$jq_path" -r 'if .docker_access == false then "false" else "true" end' "$root/conf/settings.json" 2>/dev/null || echo true)}
+    job_sudo=${requested_sudo:-$("$jq_path" -r 'if .job_sudo == true then "true" else "false" end' "$root/conf/settings.json" 2>/dev/null || echo false)}
+    [ "$runtime" != docker ] || docker_access=true
+    # A recorded choice is checked again, for a normal-user installation it was never allowed.
+    if [ "$runtime" = native ] && [ "$job_sudo" = true ] && ! $root_install; then
+        echo 'Passwordless sudo for jobs needs a root installation; run with LOCAL_RUNNER_SUDO=no or as root.' >&2; exit 1
+    fi
     printf '%s\n' "$gh_path" > "$root/conf/gh-path"
     printf '%s\n' "$jq_path" > "$root/conf/jq-path"
     default_work=$(pwd -P)
     [ ! -f "$root/conf/settings.json" ] || default_work=$root
     [ -f "$root/conf/settings.json" ] || printf '{}\n' > "$root/conf/settings.json"
     "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" --argjson owner_uid "${runtime_uid:-$(id -u)}" --arg default_work "$default_work" --arg runtime "$runtime" --argjson prevent_sleep "$prevent_sleep" \
-        '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.runtime=$runtime|.prevent_sleep=$prevent_sleep|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
+        --argjson docker_access "$docker_access" --argjson job_sudo "$job_sudo" \
+        '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.runtime=$runtime|.prevent_sleep=$prevent_sleep|.docker_access=$docker_access|.job_sudo=$job_sudo|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
         "$root/conf/settings.json" > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
     if $root_install; then fetch linux/account.sh "$root/bin/account.sh"; fi
@@ -463,6 +530,24 @@ install_main() {
         "$jq_path" --arg image "$docker_image" '.docker_image=$image' "$root/conf/settings.json" > "$root/conf/settings.new"
         mv "$root/conf/settings.new" "$root/conf/settings.json"
     fi
+    # Native mode joins the Docker socket's group, as Docker mode does, unless turned off.
+    docker_access_group=
+    if [ "$runtime" = native ] && [ "$docker_access" = true ]; then
+        docker_socket=${LOCAL_RUNNER_DOCKER_SOCKET:-/var/run/docker.sock}
+        if [ -S "$docker_socket" ]; then
+            docker_access_group=$(stat -c %G "$docker_socket" 2>/dev/null || :)
+            case "$docker_access_group" in
+                ''|root|UNKNOWN)
+                    printf 'Docker access: %s belongs to group %s, so jobs cannot use Docker. Give the socket a dedicated group (usually docker) and run the installer again.\n' "$docker_socket" "${docker_access_group:-unknown}" >&2
+                    docker_access_group= ;;
+                *) printf 'Docker access: on (group %s); jobs can control the host Docker daemon, which is equivalent to root on this host.\n' "$docker_access_group" ;;
+            esac
+        elif command -v docker >/dev/null 2>&1; then
+            printf 'Docker access: Docker is installed but %s is missing; start Docker and run the installer again so jobs can use it.\n' "$docker_socket" >&2
+        fi
+    fi
+    "$jq_path" --arg group "$docker_access_group" 'if $group == "" then del(.docker_group) else .docker_group=$group end' "$root/conf/settings.json" > "$root/conf/settings.new"
+    mv "$root/conf/settings.new" "$root/conf/settings.json"
     if $root_install; then
         chgrp "$account_gid" "$root/bin/"*.sh "$root/bin/"*.ps1 "$root/bin/tools" "$root/bin/tools/"*
         chmod 755 "$root/bin/"*.sh "$root/bin/tools" "$root/bin/tools/"*
@@ -502,7 +587,7 @@ install_main() {
             docker_group=$(stat -c %G /var/run/docker.sock)
             [ -n "$docker_group" ] && [ "$docker_group" != root ] && [ "$docker_group" != UNKNOWN ] || { echo 'The Docker socket has no dedicated group; cannot grant the runner account access.' >&2; rm -f "$definition"; exit 1; }
         fi
-        systemd_unit "$user" "$service_home" "$service_path" "$root" "$docker_group" > "$definition"
+        systemd_unit "$user" "$service_home" "$service_path" "$root" "$docker_group" "$docker_access_group" > "$definition"
         privileged install -m 644 "$definition" "/etc/systemd/system/$service_name"
         privileged systemctl daemon-reload
         if [ -f "$root/conf/stopped" ]; then privileged systemctl disable "$service_name";
@@ -511,6 +596,13 @@ install_main() {
             privileged systemctl restart "$service_name"
             privileged systemctl is-active --quiet "$service_name"
         fi
+        sudo_name=${service_name%.service}
+        if [ "$job_sudo" = true ]; then
+            sudo_principal=$user; [ "$runtime" != docker ] || sudo_principal="#$user_id"
+            install_job_sudo "$runtime" "$sudo_name" "$sudo_principal" "$user" || { echo 'Passwordless sudo was not granted; run the installer again after fixing the error above.' >&2; rm -f "$definition"; exit 1; }
+            if [ "$runtime" = docker ]; then printf 'Job sudo: on; jobs can use sudo without a password inside the container.\n'
+            else printf 'Job sudo: on; jobs can use sudo without a password, which is root on this host.\n'; fi
+        else remove_job_sudo "$sudo_name"; fi
         # WSL is kept awake by its Windows host task instead (ghr wsl setup).
         awake_name=${service_name%.service}-awake.service
         inhibit_path=$(command -v systemd-inhibit || :); sleep_path=$(command -v sleep || :)

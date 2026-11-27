@@ -29,7 +29,7 @@ irm https://raw.githubusercontent.com/suminwell/github-runner/main/install.ps1 |
 
 首次安装需要 GitHub 授权、Unix 普通用户的 sudo 权限或 Windows 管理员权限；Linux root 安装无需 sudo。无交互输入时使用默认安装目录；也可设置 `LOCAL_RUNNER_HOME` 跳过目录询问，安装器会追加平台名。重复安装会保留已有配置、编号和数据。
 
-Linux root 安装自动创建锁定登录的系统账户 `ghrunner`，HOME 为 `/var/lib/github-runner/home`，工作流以该普通账户运行，不授予 sudo 权限。安装、登录 GitHub 和 `ghr` 管理命令仍由 root 执行；普通管理用户使用 `sudo ghr ...`。已有普通用户安装应继续以原用户升级，不会自动转换账户。若机器已有同名的非本项目账户，安装器拒绝复用。
+Linux root 安装自动创建锁定登录的系统账户 `ghrunner`，HOME 为 `/var/lib/github-runner/home`，工作流以该普通账户运行，默认不授予 sudo 权限（可选开启，见下文“job 的 Docker 与 sudo 权限”）。安装、登录 GitHub 和 `ghr` 管理命令仍由 root 执行；普通管理用户使用 `sudo ghr ...`。已有普通用户安装应继续以原用户升级，不会自动转换账户。若机器已有同名的非本项目账户，安装器拒绝复用。
 
 root 安装目录及其父目录必须由 root 拥有，且其他用户不能写入。`bin/` 和 `conf/` 中的脚本、配置和凭据由 root 管理；专用账户只读配置，可写 `runner/`、`bin/.cache/`、`conf/runtime/` 和数据、日志。root 安装额外需要 `runuser`、`useradd` 和 POSIX ACL，缺少 `acl` 时会自动安装。即使从 `/root/...` 执行，数据和日志仍默认放在当前目录；安装器给专用账户添加必要的父目录穿越权限和 `data/logs` 写权限，不开放父目录的列表权限，不递归更改已有文件权限。父目录中本来允许读取的文件，在知道路径后可能变得可访问；建议在 `/srv/builds` 等专用构建目录执行安装。需要 root 自动授权的目录及其父目录也须由 root 管理，防止任务替换路径；专用账户本来就能读写的目录可直接使用。已有数据内部若使用其他账户的私有权限，需自行授权。`ghr config --dir` 同样处理新目录权限，重启后切换。
 
@@ -40,6 +40,18 @@ root 安装目录及其父目录必须由 root 拥有，且其他用户不能写
 安装器在提权、创建账户或停止旧服务之前拒绝不支持的系统。安装依赖后，还会以实际运行账户执行官方 `Runner.Listener --version` 和包内各个 glibc 版 `node --version`，检查 C++、glibc 和运行环境是否真正可用。检查失败时打印完整的版本缺失错误，退出安装并保留配置供修复后重试，不启用新服务；未知发行版也必须通过二进制运行检查。已有旧系统上的失败安装可用 `ghr stop` 停止重试。Linux 管理命令使用兼容 systemd 219 的属性查询和启停方式，供历史安装停止、卸载使用；新安装仍需满足上述系统要求。
 
 Linux 需要 systemd、glibc、Bash、curl、tar、util-linux 的 `flock`，不支持 Alpine；只有 `yum` 的系统（CentOS 7）缺少 `jq` 时，安装器下载固定 SHA-256 的官方静态 jq 1.8.1 到 `bin/tools/`；macOS 使用系统 Bash 3.2、launchd、`shlock`；Windows 使用 Windows PowerShell 5.1 和任务计划程序。无需 Python 或 C# 服务宿主。
+
+## Linux：job 的 Docker 与 sudo 权限
+
+**Docker（默认开启）**：原生模式下，如果安装时检测到 Docker 守护进程，并且 `/var/run/docker.sock` 属于专用组（通常是 `docker`），服务单元会加入 `SupplementaryGroups=<该组>`，job 里 `docker version`、`docker build` 等可以直接使用宿主机 Docker，与 Docker 模式一致。套接字属组是 `root`，或 Docker 已安装但守护进程未运行时，安装输出会说明原因；先装 ghr、后装 Docker 的，装好 Docker 后重新执行一次安装命令即可。不需要时用 `LOCAL_RUNNER_DOCKER_ACCESS=no` 重新安装，服务单元就不再带这个组；之后重复安装沿用该选择，设为 `yes` 可重新开启。Docker 模式本身依赖宿主机 Docker，不能关闭。
+
+**免密 sudo（默认关闭）**：用 `LOCAL_RUNNER_SUDO=yes` 安装后，job 可以执行 `sudo apt-get install -y ...` 这类命令，与 GitHub 托管 Runner 一致；之后重复安装沿用该选择，用 `LOCAL_RUNNER_SUDO=no` 重新安装即可关闭。
+
+- 原生模式只支持 root 安装：安装器为 `ghrunner` 写入 `/etc/sudoers.d/local-github-runner-<UID>-<架构>`（root 所有，权限 0440），写入前用 `visudo -c` 校验。普通用户安装时 job 用的就是你自己的登录账户，开启会让这个账户在任何地方都能免密 sudo，所以安装器会拒绝。
+- Docker 模式：镜像自带 sudo，规则文件放在 `/etc/github-runner/sudoers/`，只挂载进容器，宿主机的 sudoers 不变。sudo 的账户检查需要 shadow 记录，所以同时挂载一份只含 root 和运行账户（均为锁定密码）的 `/etc/shadow`，宿主机的密码哈希不会进入容器。
+- 关闭或卸载时只删除带有本项目标记的规则文件；同名但不是本项目写入的文件，安装器不会覆盖，会报错退出。
+
+**安全提示**：能访问 Docker 套接字等同于拥有宿主机 root 权限，开启后 `ghrunner` 账户隔离不再构成安全边界；原生模式的免密 sudo 就是宿主机 root。Docker 模式的容器使用宿主机的进程和网络命名空间，并挂载了安装目录、家目录和 Docker 套接字，所以容器内的 root 实际上也能影响宿主机。这几种权限的风险级别相同，只应让受信任的仓库使用这台 Runner。`ghr status` 第一个表格的 `Docker access` 和 `Job sudo` 两行显示当前状态。
 
 ## 旧版 Linux：Docker 模式
 

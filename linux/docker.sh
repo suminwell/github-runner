@@ -208,6 +208,12 @@ docker_load() {
     DOCKER_ARCH=$("$DOCKER_JQ" -er .arch "$DOCKER_ROOT/conf/settings.json") || return 1
     DOCKER_WORK=$("$DOCKER_JQ" -r --arg root "$DOCKER_ROOT" '.work_dir // $root' "$DOCKER_ROOT/conf/settings.json") || return 1
     DOCKER_IMAGE=$("$DOCKER_JQ" -r '.docker_image // empty' "$DOCKER_ROOT/conf/settings.json") || return 1
+    # The installer writes this root-owned rule only when LOCAL_RUNNER_SUDO=yes; it is
+    # mounted into the container and never into the host sudoers.
+    DOCKER_SUDOERS=
+    if [ "$("$DOCKER_JQ" -r '.job_sudo == true' "$DOCKER_ROOT/conf/settings.json")" = true ]; then
+        DOCKER_SUDOERS=${LOCAL_RUNNER_DOCKER_SUDOERS_DIR:-/etc/github-runner/sudoers}/local-github-runner-$("$DOCKER_JQ" -r .owner_uid "$DOCKER_ROOT/conf/settings.json")-$DOCKER_ARCH
+    fi
 }
 # Build the default image; prints the image reference. LOCAL_RUNNER_DOCKER_IMAGE uses a
 # prepared image instead (it must provide bash, jq, curl, git, ps, tar and the Runner's
@@ -247,6 +253,10 @@ docker_arguments() {
     DOCKER_ARGS=(--pid host --network host --user "$user" --group-add "$(stat -c %g "$DOCKER_SOCKET")"
         -e "HOME=$home" -e LOCAL_RUNNER_JQ=/usr/bin/jq -e TZ=UTC -w "$DOCKER_ROOT"
         -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro -v "$DOCKER_SOCKET:$DOCKER_SOCKET")
+    if [ -n "${DOCKER_SUDOERS:-}" ]; then
+        [ -f "$DOCKER_SUDOERS" ] && [ -f "$DOCKER_SUDOERS.shadow" ] || { echo "Job sudo is on but $DOCKER_SUDOERS is missing; re-run the installer." >&2; return 1; }
+        DOCKER_ARGS+=(-v "$DOCKER_SUDOERS:/etc/sudoers.d/github-runner:ro" -v "$DOCKER_SUDOERS.shadow:/etc/shadow:ro")
+    fi
     # Identical paths inside and outside; a path already covered by an exact mount is skipped.
     for path in "$DOCKER_ROOT" "$DOCKER_WORK" "$home"; do
         [ -d "$path" ] || continue

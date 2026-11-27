@@ -214,6 +214,17 @@ MOCK
     touch "$FIXTURE/running"
     PATH="$FIXTURE/bin:$PATH" bash "$root/bin/docker.sh" stop
     assert grep -Fxq "local-github-runner-$(id -u)-x64" "$FIXTURE/docker-stop"
+    # Job sudo mounts the installer's root-owned rule into the container only.
+    refute grep -q sudoers "$FIXTURE/docker-run"
+    jq --argjson uid "$(id -u)" '.job_sudo=true|.owner_uid=$uid' "$root/conf/settings.json" > "$FIXTURE/s" && mv "$FIXTURE/s" "$root/conf/settings.json"
+    export LOCAL_RUNNER_DOCKER_SUDOERS_DIR=$FIXTURE/sudoers
+    if PATH="$FIXTURE/bin:$PATH" bash "$root/bin/docker.sh" run 2> "$FIXTURE/out"; then echo 'Ran without the sudo rule' >&2; exit 1; fi
+    assert grep -q 'Job sudo is on but' "$FIXTURE/out"
+    command mkdir -p "$FIXTURE/sudoers"; : > "$FIXTURE/sudoers/local-github-runner-$(id -u)-x64"; : > "$FIXTURE/sudoers/local-github-runner-$(id -u)-x64.shadow"
+    PATH="$FIXTURE/bin:$PATH" HOME=$home bash "$root/bin/docker.sh" run
+    assert grep -Fxq -- "$FIXTURE/sudoers/local-github-runner-$(id -u)-x64:/etc/sudoers.d/github-runner:ro" "$FIXTURE/docker-run"
+    assert grep -Fxq -- "$FIXTURE/sudoers/local-github-runner-$(id -u)-x64.shadow:/etc/shadow:ro" "$FIXTURE/docker-run"
+    unset LOCAL_RUNNER_DOCKER_SUDOERS_DIR
     jq 'del(.docker_image)' "$root/conf/settings.json" > "$FIXTURE/s" && mv "$FIXTURE/s" "$root/conf/settings.json"
     if PATH="$FIXTURE/bin:$PATH" bash "$root/bin/docker.sh" run 2> "$FIXTURE/out"; then echo 'Ran without an image' >&2; exit 1; fi
     assert grep -q 'No Docker image configured' "$FIXTURE/out"

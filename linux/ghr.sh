@@ -53,6 +53,15 @@ systemd_property() (
         *) printf 'Missing systemd property %s for %s.\n' "$property_name" "$property_unit" >&2; exit 1 ;;
     esac
 )
+# Remove the passwordless sudo rules this installation wrote (only files with its marker).
+remove_job_sudo() {
+    local name=${SERVICE_NAME%.service} file
+    for file in "$SUDOERS_DIR/$name" "$JOB_SUDOERS_DIR/$name"; do
+        [ -f "$file" ] || continue
+        [ "$(privileged head -n 1 "$file")" = '# github-runner: workflow jobs may use sudo without a password.' ] || continue
+        privileged rm -f "$file" "$file.shadow" || return 1
+    done
+}
 native_service() {
     local action=$1 installed_root command_path state
     service_identity || return 1
@@ -76,6 +85,7 @@ native_service() {
                 privileged rm -f "${DEFINITION%.service}-awake.service" || return 1
             fi
             privileged rm -f "$DEFINITION" && privileged systemctl daemon-reload || return 1
+            remove_job_sudo || return 1
         fi
     else
         if [ -f "$DEFINITION" ]; then

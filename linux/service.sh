@@ -7,6 +7,8 @@ SERVICE_FILE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SO
 ROOT=${LOCAL_RUNNER_ROOT:-$(cd "$(dirname "$SERVICE_FILE")/.." && pwd)}
 STATE=$ROOT/conf
 SYSTEMD_UNITS=${LOCAL_RUNNER_SYSTEMD_UNITS:-/etc/systemd/system}
+SUDOERS_DIR=${LOCAL_RUNNER_SUDOERS_DIR:-/etc/sudoers.d}
+JOB_SUDOERS_DIR=${LOCAL_RUNNER_DOCKER_SUDOERS_DIR:-/etc/github-runner/sudoers}
 [ ! -f "$ROOT/conf/account.json" ] || STATE=$ROOT/conf/runtime
 atomic() { local target=$1; cat > "$target.tmp.$$" && chmod 600 "$target.tmp.$$" && mv -f "$target.tmp.$$" "$target"; }
 # Rewrite JSON in place only when jq succeeds; a failed or truncated run keeps the original.
@@ -479,6 +481,20 @@ serve() {
         sleep 5 & wait $! || :
     done
 }
+# Whether jobs can use the host Docker daemon and passwordless sudo, for ghr status.
+docker_access_state() {
+    local group
+    if [ "$("$JQ" -r '.runtime // "native"' "$ROOT/conf/settings.json")" = docker ]; then printf 'on (Docker mode); root-equivalent on this host'; return 0; fi
+    if [ "$("$JQ" -r '.docker_access != false' "$ROOT/conf/settings.json")" = false ]; then printf 'off (LOCAL_RUNNER_DOCKER_ACCESS=no)'; return 0; fi
+    group=$("$JQ" -r '.docker_group // empty' "$ROOT/conf/settings.json")
+    if [ -n "$group" ]; then printf 'on (group %s); root-equivalent on this host' "$group"
+    else printf 'unavailable (no Docker socket with a dedicated group at install time)'; fi
+}
+job_sudo_state() {
+    if [ "$("$JQ" -r '.job_sudo == true' "$ROOT/conf/settings.json")" != true ]; then printf 'off (LOCAL_RUNNER_SUDO=yes turns it on)'
+    elif [ "$("$JQ" -r '.runtime // "native"' "$ROOT/conf/settings.json")" = docker ]; then printf 'on; passwordless sudo inside the container'
+    else printf 'on; passwordless sudo, which is root on this host'; fi
+}
 # What keeps this machine awake for the installation, for ghr status.
 sleep_prevention() {
     local unit
@@ -511,6 +527,8 @@ status() {
     fi
     [ ! -f "$ROOT/conf/account.json" ] || item 'Runner account' "ghrunner (UID $("$JQ" -r .owner_uid "$ROOT/conf/settings.json"))"
     item 'Sleep prevention' "$(sleep_prevention "$manager")"
+    item 'Docker access' "$(docker_access_state)"
+    item 'Job sudo' "$(job_sudo_state)"
     item 'Install directory' "$ROOT"
     item 'Runner directory' "$ROOT/runner"
     if [ -s "$STATE/active-work-dir" ]; then

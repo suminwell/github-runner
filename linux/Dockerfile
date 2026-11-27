@@ -12,7 +12,7 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
         bash ca-certificates curl git git-lfs gnupg jq procps tar gzip bzip2 xz-utils zip unzip \
-        openssh-client rsync wget file python3 util-linux \
+        openssh-client rsync wget file python3 util-linux sudo \
         libicu70 libkrb5-3 libssl3 liblttng-ust1 zlib1g; \
     install -m 0755 -d /etc/apt/keyrings; \
     curl -fsSL --retry 3 "$DOCKER_MIRROR/linux/ubuntu/gpg" -o /etc/apt/keyrings/docker.asc; \

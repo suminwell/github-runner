@@ -5,7 +5,7 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 if [ "${1:-}" != --inside ]; then
     tar_options=(); [ "$(uname -s)" != Darwin ] || tar_options=(--no-xattrs)
     COPYFILE_DISABLE=1 tar "${tar_options[@]}" -C "$REPO" --exclude=.git -cf - . | docker run --rm -i debian:bookworm sh -c \
-        'mkdir /source && tar -C /source -xf - && apt-get update -qq && apt-get install -y -qq jq acl curl ca-certificates procps >/dev/null && bash /source/.test/root-install.sh --inside'
+        'mkdir /source && tar -C /source -xf - && apt-get update -qq && apt-get install -y -qq jq acl curl ca-certificates procps sudo >/dev/null && bash /source/.test/root-install.sh --inside'
     exit $?
 fi
 [ -f /.dockerenv ] && [ "$(id -u)" = 0 ] || exit 1
@@ -203,6 +203,50 @@ assert test ! -f /fixture/active
 assert test "$(id -u ghrunner)" = "$uid"
 ghr start
 assert wait_file "$root/conf/runtime/manager.pid"
+# Native jobs join the Docker socket's group by default; LOCAL_RUNNER_DOCKER_ACCESS=no is kept.
+unit=/etc/systemd/system/local-github-runner-$uid-$arch.service
+groupadd -f docker
+perl -MIO::Socket::UNIX -e 'IO::Socket::UNIX->new(Local => $ARGV[0], Listen => 1) or die "$!"' /fixture/docker.sock
+chgrp docker /fixture/docker.sock
+export LOCAL_RUNNER_DOCKER_SOCKET=/fixture/docker.sock
+sh "$REPO/install.sh" </dev/null > /fixture/docker-output 2>&1
+assert grep -Fxq SupplementaryGroups=docker "$unit"
+assert grep -q 'Docker access: on (group docker)' /fixture/docker-output
+ghr status > /fixture/status
+assert grep -Eq '^Docker access +on \(group docker\)' /fixture/status
+assert grep -Eq '^Job sudo +off' /fixture/status
+LOCAL_RUNNER_DOCKER_ACCESS=no sh "$REPO/install.sh" </dev/null >/dev/null 2>&1
+if grep -q SupplementaryGroups "$unit"; then echo 'Docker access kept after it was turned off' >&2; exit 1; fi
+sh "$REPO/install.sh" </dev/null >/dev/null 2>&1
+if grep -q SupplementaryGroups "$unit"; then echo 'Docker access returned on a plain re-run' >&2; exit 1; fi
+chgrp root /fixture/docker.sock
+LOCAL_RUNNER_DOCKER_ACCESS=yes sh "$REPO/install.sh" </dev/null > /fixture/docker-output 2>&1
+assert grep -q 'belongs to group root, so jobs cannot use Docker' /fixture/docker-output
+if grep -q SupplementaryGroups "$unit"; then echo 'Granted a root-owned socket group' >&2; exit 1; fi
+unset LOCAL_RUNNER_DOCKER_SOCKET
+# Passwordless sudo is opt-in, validated, kept on re-runs and removed when turned off.
+sudoers=/etc/sudoers.d/local-github-runner-$uid-$arch
+if runuser -u ghrunner -- sudo -n true 2>/dev/null; then echo 'Runner account had sudo by default' >&2; exit 1; fi
+LOCAL_RUNNER_SUDO=yes sh "$REPO/install.sh" </dev/null > /fixture/sudo-output 2>&1
+assert test "$(stat -c '%a %U' "$sudoers")" = '440 root'
+assert runuser -u ghrunner -- sudo -n true
+assert grep -q 'Job sudo: on' /fixture/sudo-output
+sh "$REPO/install.sh" </dev/null >/dev/null 2>&1
+assert runuser -u ghrunner -- sudo -n true
+ghr status > /fixture/status
+assert grep -Eq '^Job sudo +on; passwordless sudo, which is root on this host' /fixture/status
+LOCAL_RUNNER_SUDO=no sh "$REPO/install.sh" </dev/null >/dev/null 2>&1
+assert test ! -e "$sudoers"
+if runuser -u ghrunner -- sudo -n true 2>/dev/null; then echo 'sudo kept after it was turned off' >&2; exit 1; fi
+# A sudoers file this installer did not write is never replaced.
+printf 'Defaults:ghrunner !lecture\n' > "$sudoers"; chmod 440 "$sudoers"
+if LOCAL_RUNNER_SUDO=yes sh "$REPO/install.sh" </dev/null > /fixture/sudo-output 2>&1; then echo 'Replaced a foreign sudoers file' >&2; exit 1; fi
+assert grep -q 'was not written by this installer' /fixture/sudo-output
+assert test "$(cat "$sudoers")" = 'Defaults:ghrunner !lecture'
+rm "$sudoers"
+LOCAL_RUNNER_SUDO=yes sh "$REPO/install.sh" </dev/null >/dev/null 2>&1
+assert test -f "$sudoers"
+ghr start >/dev/null 2>&1 || :
 # WSL bridges from the root shell, while describe/hold/link use the service identity.
 cat > /usr/bin/wslpath <<'MOCK'
 #!/bin/sh
@@ -223,6 +267,7 @@ assert grep -Fxq status /fixture/wsl-arguments
 ghr status > /fixture/status
 assert grep -Fxq status /fixture/wsl-arguments
 ghr uninstall
+assert test ! -e "$sudoers"
 assert test ! -d "$root/conf"
 assert test ! -e /usr/local/bin/ghr
 assert test -f '/root/new work/data/fixture-org/demo/demo/job-uid'
