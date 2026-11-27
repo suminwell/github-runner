@@ -101,7 +101,9 @@ for platform in linux macos; do
 
     setup_case symlink
     ln -s "$ROOT" "$ROOT-alias"
-    if env -u LOCAL_RUNNER_ROOT /bin/bash "$ROOT-alias/bin/ghr.sh" config --dir "$ROOT-alias/bin" 2>/dev/null; then echo 'Allowed program data through an installation alias' >&2; exit 1; fi
-    assert test ! -d "$ROOT/bin/data"
+    mkdir "$ROOT/bin/empty"
+    if env -u LOCAL_RUNNER_ROOT /bin/bash "$ROOT-alias/bin/ghr.sh" config --data-dir "$ROOT-alias/bin/empty" 2> "$ROOT-alias.err"; then echo 'Allowed program data through an installation alias' >&2; exit 1; fi
+    assert grep -q 'outside the program and state directories' "$ROOT-alias.err"
+    assert test ! -d "$ROOT/bin/empty/data"
     printf 'PASS %s uninstall recovery, identity validation, retry and physical directory guard\n' "$platform"
 done

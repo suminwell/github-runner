@@ -31,9 +31,9 @@ irm https://raw.githubusercontent.com/suminwell/github-runner/main/install.ps1 |
 
 Linux root 安装自动创建锁定登录的系统账户 `ghrunner`，HOME 为 `/var/lib/github-runner/home`，工作流以该普通账户运行，默认不授予 sudo 权限（可选开启，见下文“job 的 Docker 与 sudo 权限”）。安装、登录 GitHub 和 `ghr` 管理命令仍由 root 执行；普通管理用户使用 `sudo ghr ...`。已有普通用户安装应继续以原用户升级，不会自动转换账户。若机器已有同名的非本项目账户，安装器拒绝复用。
 
-root 安装目录及其父目录必须由 root 拥有，且其他用户不能写入。`bin/` 和 `conf/` 中的脚本、配置和凭据由 root 管理；专用账户只读配置，可写 `runner/`、`bin/.cache/`、`conf/runtime/` 和数据、日志。root 安装额外需要 `runuser`、`useradd` 和 POSIX ACL，缺少 `acl` 时会自动安装。即使从 `/root/...` 执行，数据和日志仍默认放在当前目录；安装器给专用账户添加必要的父目录穿越权限和 `data/logs` 写权限，不开放父目录的列表权限，不递归更改已有文件权限。父目录中本来允许读取的文件，在知道路径后可能变得可访问；建议在 `/srv/builds` 等专用构建目录执行安装。需要 root 自动授权的目录及其父目录也须由 root 管理，防止任务替换路径；专用账户本来就能读写的目录可直接使用。已有数据内部若使用其他账户的私有权限，需自行授权。`ghr config --dir` 同样处理新目录权限，重启后切换。
+root 安装目录及其父目录必须由 root 拥有，且其他用户不能写入。`bin/` 和 `conf/` 中的脚本、配置和凭据由 root 管理；专用账户只读配置，可写 `runner/`、`bin/.cache/`、`conf/runtime/` 和数据、日志。root 安装额外需要 `runuser`、`useradd` 和 POSIX ACL，缺少 `acl` 时会自动安装。即使从 `/root/...` 执行，数据和日志仍默认放在当前目录；安装器给专用账户添加必要的父目录穿越权限和 `data/logs` 写权限，不开放父目录的列表权限，不递归更改已有文件权限。父目录中本来允许读取的文件，在知道路径后可能变得可访问；建议在 `/srv/builds` 等专用构建目录执行安装。需要 root 自动授权的目录及其父目录也须由 root 管理，防止任务替换路径；专用账户本来就能读写的目录可直接使用。已有数据内部若使用其他账户的私有权限，需自行授权。`ghr config --data-dir` 同样处理新目录权限，重启后切换。
 
-卸载 root 安装时保留专用账户及 HOME，避免遗留数据和日志变成无主文件；重新安装复用原 UID。账户记录保存在 root 管理的 `/var/lib/github-runner/account.json`，不随 `config --dir` 改变。
+卸载 root 安装时保留专用账户及 HOME，避免遗留数据和日志变成无主文件；重新安装复用原 UID。账户记录保存在 root 管理的 `/var/lib/github-runner/account.json`，不随 `config --data-dir` 改变。
 
 符合 [GitHub 官方支持范围](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#linux) 的 Linux（例如 Ubuntu 20.04+、Debian 10+、RHEL/CentOS/Oracle Linux 8+）直接在宿主机运行；新部署建议选择仍在维护的 Ubuntu 24.04、Debian 12 或 RHEL 9。低于这些版本的 glibc 发行版（例如 **CentOS 7**、Ubuntu 18.04）自动改用下面的 **Docker 模式**；Alpine/musl 仍不支持。
 
@@ -137,19 +137,24 @@ ghr start: 启动runner
 ghr stop: 停止runner
 ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
-ghr config --dir [<PATH>]: 设置data和logs的父目录，默认为当前目录，重启后生效（--dir 可简写为 -d）
+ghr config [--data-dir]: 显示data和logs的父目录
+ghr config --data-dir <PATH>: 设置data和logs的父目录，路径必须是已存在的空目录，重启后生效
+ghr runner: 显示每个组织的runner个数及本机上限（CPU核数的一半）
+ghr runner -a|--add: 每个组织增加一个runner，无需重启，超过上限时报错
+ghr runner -s|--sub: 每个组织减少一个runner，最少保留1个，多出的runner空闲后移除
 ghr uninstall: 卸载runner
 ```
 
 - `status`：显示平台和架构、安装目录、Runner 程序目录、当前数据和日志目录、管理进程状态与 PID，并逐组织显示本机 Runner 在 GitHub 上的 `online/offline/missing/unknown`、是否忙碌、本地进程状态及 PID，最后汇总数量。网络或权限失败显示 `unknown`，不会误报离线。本地 `restarting` 表示组织管理进程仍在，但监听进程尚未启动或正在重启。
 - `start`：启动管理服务并启用开机自动启动。已运行时不会重启，也不会提前应用待生效配置。
 - `stop`：关闭自动启动，停止管理服务及各组织的 Runner，保留注册和数据。Linux 会核验原生服务已停止；查询或停止失败会显示错误并返回非零退出码。正在运行的 job 会被中断：Linux/macOS 先发送 TERM，等待官方 Runner 取消 job 并上报（最多 `stop_seconds` 秒）后再强制结束；Windows 直接强制结束。
-- `restart`：先停止再启动，并应用保存的目录配置。
+- `restart`：先停止再启动，并应用保存的目录配置。Runner 个数不需要重启。
 - `logs`：显示管理日志最后 200 行；`logs -f` 持续跟踪新增日志，日志轮换后继续跟踪，按 Ctrl+C 结束。
-- `config --dir <PATH>` 或 `config -d <PATH>`：等价，设置数据和日志的父目录。`config`、`config --dir`、`config -d` 或路径为 `.` 时使用当前目录。路径包含空格时用引号括起；不支持 `--dir=<PATH>` 写法。
+- `config`：显示 `data-dir`（数据和日志的父目录）；`config --data-dir` 只输出该路径。`config --data-dir <PATH>` 设置新目录，见[修改数据和日志目录](#修改数据和日志目录)。`config` 只接受完整选项名 `--data-dir`，不支持 `-d` 简写、旧的 `--dir`，也不支持 `--data-dir=<PATH>` 写法；路径包含空格时用引号括起。
+- `runner`：显示每个组织的 Runner 个数和本机上限；`runner -a`/`--add` 加一个，`runner -s`/`--sub` 减一个，见[每个组织多个 Runner](#每个组织多个-runner)。
 - `uninstall`：停止进程，注销本机记录的 GitHub Runner，移除系统服务、命令、脚本和配置；所有工作数据与日志保留。若注册成功后尚未保存组织状态就退出，会从本地官方 `.runner` 元数据补查组织和远端身份。身份无法确认或 GitHub 注销失败时保留凭据和状态，修复后再次执行卸载。其他机器的 Runner 不会被删除。
 
-Unix 的入口为 `/usr/local/bin/ghr`，调用安装目录的 `bin/ghr.sh`。Windows 的 `bin/ghr.cmd` 调用 `bin/ghr.ps1`，安装器将其目录加入安装用户的 PATH。若已有终端找不到 `ghr`，重新打开终端；Unix 的 PATH 需要包含 `/usr/local/bin`。Windows 的启停、目录设置和卸载在管理员 PowerShell 中执行。
+Unix 的入口为 `/usr/local/bin/ghr`，调用安装目录的 `bin/ghr.sh`。Windows 的 `bin/ghr.cmd` 调用 `bin/ghr.ps1`，安装器将其目录加入安装用户的 PATH。若已有终端找不到 `ghr`，重新打开终端；Unix 的 PATH 需要包含 `/usr/local/bin`。Windows 的启停、目录设置、Runner 个数调整和卸载在管理员 PowerShell 中执行。
 
 `ghr status` 输出示例：
 
@@ -159,6 +164,7 @@ GitHub Runner status
 ITEM                       VALUE
 Platform                   linux / x64
 Manager                    running (PID 4321)
+Runners per organization   2
 Install directory          /home/user/.local/share/github-runner/linux
 Runner directory           /home/user/.local/share/github-runner/linux/runner
 Work directory             /srv/builds (active)
@@ -170,18 +176,21 @@ Configuration              no pending directory change
 ORGANIZATION / RUNNER                GITHUB    BUSY  LOCAL       PID
 organization-a
 ├── local-linux-x64-1                online    true  running     4350
+├── local-linux-x64-2                online    false running     4352
 ├── local-macos-arm64-1              online    false other       -
 └── local-windows-x64-1              offline   false other       -
 organization-b
-└── local-linux-x64-1                offline   false restarting  4360
+├── local-linux-x64-1                offline   false restarting  4360
+└── local-linux-x64-2                online    false running     4362
 
 SUMMARY                    VALUE
 Organizations              2
-GitHub                     1 online, 1 offline, 0 missing, 0 unknown; 1 busy
+Runners                    4
+GitHub                     3 online, 1 offline, 0 missing, 0 unknown; 1 busy
 Other runners              2 (1 online, 1 offline); 0 busy
-Local                      1 running, 1 restarting, 0 stopped/paused
+Local                      3 running, 1 restarting, 0 stopped/paused
 
-restarting: organization worker is alive; listener is not running yet.
+restarting: runner worker is alive; listener is not running yet.
 ```
 
 修改目录但尚未重启时，会标记 `Configuration: pending` 并列出下次启动使用的数据和日志目录；停止后则标明上次运行的目录。即使尚未注册任何组织，也会保留完整的安装和目录概览。WSL 还会显示 Windows 宿主任务状态。
@@ -191,17 +200,20 @@ restarting: organization worker is alive; listener is not running yet.
 Linux / macOS：
 
 ```sh
-ghr config --dir /srv/builds
-# 等价写法：ghr config -d /srv/builds
+mkdir /srv/builds
+ghr config --data-dir /srv/builds
 ghr restart
 ```
 
 Windows：
 
 ```powershell
-ghr config --dir "D:\Build Workspace"
+New-Item -ItemType Directory "D:\Build Workspace"
+ghr config --data-dir "D:\Build Workspace"
 ghr restart
 ```
+
+新目录必须已经存在且为空（包括隐藏文件），否则拒绝设置，避免 Runner 的 `data/`、`logs/` 与其他文件混在一起。当前正在使用的目录也不能再次设置。
 
 重启后使用：
 
@@ -209,15 +221,16 @@ ghr restart
 指定目录/
 ├── data/
 │   └── organization-a/
-│       └── repository-one/
-│           └── repository-one/  # 官方 checkout / GITHUB_WORKSPACE
+│   │   └── repository-one/
+│   │       └── repository-one/  # 官方 checkout / GITHUB_WORKSPACE
+│   └── organization-a.2/       # ghr runner --add 后，第 2 个 Runner 的工作目录
 └── logs/
     └── service.log
 ```
 
 配置修改仅保存待生效的目录；当前管理服务及任务继续使用原目录。执行 `restart` 或 `stop` 后再 `start` 才切换，`status` 同时显示配置目录和上次启动使用的目录。旧数据、旧日志保留原位，不自动搬迁。`logs` 在重启前仍读取原目录的日志。
 
-`bin`、`conf`、`runner` 固定在安装目录，不随 `config --dir` 移动。Windows 会给数据和日志目录添加 LocalService 所需权限。
+`bin`、`conf`、`runner` 固定在安装目录，不随 `config --data-dir` 移动。Windows 会给数据和日志目录添加 LocalService 所需权限。
 
 ## 源码与运行目录
 
@@ -280,6 +293,23 @@ jobs:
 ```
 
 使用 `[self-hosted, local-linux-x64]` 可让组织内任意 Linux x64 Runner 接活。GitHub 按标签及 Runner Group 访问规则分配任务；单个 Runner 同时运行一个 job，不同组织可以同时派活。
+
+### 每个组织多个 Runner
+
+默认每个组织一个 Runner，同一组织的 job 依次排队。需要同一台机器并行跑多个 job 时：
+
+```sh
+ghr runner          # Runners per organization: 1 (maximum 4: 8 CPUs / 2)
+ghr runner --add    # 每个组织加一个，简写 -a
+ghr runner --sub    # 每个组织减一个，简写 -s
+```
+
+- 每个组织最少 1 个，最多为本机逻辑 CPU 数的一半（不足 2 个 CPU 时为 1），例如 4 核最多 2 个、8 线程最多 4 个。已经是 1 个时再减、已到上限时再加，都会提示原因并以非零退出码失败。
+- 个数保存在 `conf/settings.json` 的 `runner_count`，运行中的管理服务几秒内生效，不需要重启，也不会中断正在运行的 job。保存的个数超过本机上限时（例如配置拷到核数更少的机器），按上限运行。Linux root 安装和 Windows 需要以 root / 管理员身份执行。
+- 调大时按编号规则依次注册新的 Runner，例如 `local-linux-x64-4`、`local-linux-x64-5`，它们与第一个 Runner 标签相同，GitHub 会把排队的 job 分给空闲的那个。
+- 每个 Runner 有独立的程序目录和工作目录：第 1 个仍是 `runner/<组织>`、`data/<组织>`，第 N 个是 `runner/<组织>.N`、`data/<组织>.N`，现有安装不需要迁移。
+- 调小时，多出的 Runner 空闲后才从 GitHub 注销并删除程序目录；正在跑 job 的会等 job 结束。它们的工作数据保留原位。
+- 多个 Runner 共用这台机器的 CPU、内存、端口和 Docker：同时运行的 job 若使用固定端口、固定的容器名或 compose 项目名会互相冲突，可在 workflow 中改用随机端口或 `docker compose -p <唯一名称>`，必须互斥的 job 用 `concurrency:` 控制。
 
 仓库创建、改名后的工作目录由官方 Runner 按实际任务创建；旧目录保留。同名仓库按组织隔离。官方 Runner 会在 `data/<组织>/<仓库>/` 下再创建同名 checkout 子目录，并在组织工作目录下维护 `_temp`、`_actions`、`_tool` 等目录。组织改名通过稳定的组织 ID 识别，Runner 空闲后以原编号重新注册，并把 `runner/<旧名>` 程序目录迁到新名字；`data/<旧名>` 工作数据保留原位，新任务使用 `data/<新名>`。
 

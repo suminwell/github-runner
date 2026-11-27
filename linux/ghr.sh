@@ -9,7 +9,11 @@ ghr start: 启动runner
 ghr stop: 停止runner
 ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
-ghr config --dir [<PATH>]: 设置data和logs的父目录，默认为当前目录，重启后生效（--dir 可简写为 -d）
+ghr config [--data-dir]: 显示data和logs的父目录
+ghr config --data-dir <PATH>: 设置data和logs的父目录，路径必须是已存在的空目录，重启后生效
+ghr runner: 显示每个组织的runner个数及本机上限（CPU核数的一半）
+ghr runner -a|--add: 每个组织增加一个runner，无需重启，超过上限时报错
+ghr runner -s|--sub: 每个组织减少一个runner，最少保留1个，多出的runner空闲后移除
 ghr uninstall: 卸载runner
 ghr wsl setup: 在WSL内配置或修复Windows未登录时的自动启动
 HELP
@@ -127,17 +131,72 @@ start_installation() {
     wsl_host start || return 1
     printf 'Runner started; automatic startup enabled.\n'
 }
-configure_directory() {
-    local requested=${1:-.} absolute program_root
-    case "$requested" in ''|*'
-'*) printf 'A nonempty directory path without newlines is required.\n' >&2; return 1 ;; esac
-    mkdir -p "$requested" || return 1
-    absolute=$(cd "$requested" && pwd -P) || return 1
+# ghr config [--data-dir [<PATH>]]: full option names only. Sets CONFIG_VALUE (empty:
+# show the setting).
+config_arguments() {
+    CONFIG_VALUE=
+    [ "$#" -gt 0 ] || return 0
+    [ "$1" = --data-dir ] && [ "$#" -le 2 ] || { usage >&2; return 2; }
+    if [ "$#" = 2 ] && [ -z "$2" ]; then usage >&2; return 2; fi
+    CONFIG_VALUE=${2:-}
+}
+show_config() { if [ "$#" = 0 ]; then printf '%-10s %s\n' data-dir "$WORK_DIR"; else printf '%s\n' "$WORK_DIR"; fi; }
+# A new data directory must already exist and be empty: switching to a directory that
+# holds other files would mix them with runner work data and logs.
+config_directory() {
+    local requested=$1 entries
+    case "$requested" in *'
+'*) printf 'Newlines are not supported in paths.\n' >&2; return 1 ;; esac
+    [ -d "$requested" ] || { printf 'Data directory does not exist: %s\nCreate an empty directory first.\n' "$requested" >&2; return 1; }
+    CONFIG_DIRECTORY=$(cd "$requested" && pwd -P) || return 1
+    if [ "$CONFIG_DIRECTORY" = "$WORK_DIR" ]; then printf 'Already the data directory: %s\n' "$CONFIG_DIRECTORY" >&2; return 1; fi
+    entries=$(ls -A -- "$CONFIG_DIRECTORY") || return 1
+    [ -z "$entries" ] || { printf 'Data directory is not empty: %s\nChoose an empty directory.\n' "$CONFIG_DIRECTORY" >&2; return 1; }
+}
+config_saved() { printf 'Data directory saved: %s\nRun ghr restart (or stop then start) to apply. Existing data and logs are not moved.\n' "$CONFIG_DIRECTORY"; }
+configure() {
+    local program_root
+    config_arguments "$@" || return $?
+    if [ -z "$CONFIG_VALUE" ]; then show_config "$@"; return 0; fi
+    config_directory "$CONFIG_VALUE" || return 1
     program_root=$(cd "$ROOT" && pwd -P) || return 1
-    case "$absolute" in "$program_root/bin"|"$program_root/bin/"*|"$program_root/conf"|"$program_root/conf/"*|"$program_root/runner"|"$program_root/runner/"*) printf 'Data must be outside the program and state directories.\n' >&2; return 1 ;; esac
-    mkdir -p "$absolute/data" "$absolute/logs" || return 1
-    jq_update "$ROOT/conf/settings.json" --arg directory "$absolute" '.work_dir=$directory' || return 1
-    printf 'Work directory saved: %s\nRun ghr restart (or stop then start) to apply. Existing data and logs are not moved.\n' "$absolute"
+    case "$CONFIG_DIRECTORY" in "$program_root/bin"|"$program_root/bin/"*|"$program_root/conf"|"$program_root/conf/"*|"$program_root/runner"|"$program_root/runner/"*) printf 'Data must be outside the program and state directories.\n' >&2; return 1 ;; esac
+    mkdir -p "$CONFIG_DIRECTORY/data" "$CONFIG_DIRECTORY/logs" || return 1
+    jq_update "$ROOT/conf/settings.json" --arg directory "$CONFIG_DIRECTORY" '.work_dir=$directory' || return 1
+    config_saved
+}
+# ghr runner [-a|--add | -s|--sub]: one runner more or fewer for every organization, from
+# 1 up to max_runners (half the CPUs). Sets RUNNER_CHANGE (empty: show the count).
+runner_arguments() {
+    RUNNER_CHANGE=
+    case "$#:${1:-}" in
+        0:) ;; 1:-a|1:--add) RUNNER_CHANGE=1 ;; 1:-s|1:--sub) RUNNER_CHANGE=-1 ;;
+        *) usage >&2; return 2 ;;
+    esac
+}
+show_runners() { printf 'Runners per organization: %s (maximum %s: %s CPUs / 2)\n' "$(runner_count)" "$(max_runners)" "$(cpu_count)"; }
+# Sets RUNNER_FROM and RUNNER_TO, or explains why the change is refused.
+runner_target() {
+    local maximum
+    RUNNER_FROM=$(runner_count) || return 1; maximum=$(max_runners) || return 1
+    RUNNER_TO=$((RUNNER_FROM + RUNNER_CHANGE))
+    if [ "$RUNNER_TO" -lt 1 ]; then printf 'Cannot remove a runner: every organization keeps at least 1.\n' >&2; return 1; fi
+    if [ "$RUNNER_TO" -gt "$maximum" ]; then
+        printf 'Cannot add a runner: %s per organization is the maximum on this machine (%s CPUs / 2).\n' "$maximum" "$(cpu_count)" >&2; return 1
+    fi
+}
+runner_saved() {
+    printf 'Runners per organization: %s -> %s\n' "$RUNNER_FROM" "$RUNNER_TO"
+    if ! record_alive "$1"; then printf 'Applied when the runner starts (ghr start).\n'
+    elif [ "$RUNNER_CHANGE" = 1 ]; then printf 'The running manager registers the new runners within a few seconds.\n'
+    else printf 'The running manager removes the extra runners once they are idle; running jobs finish first.\n'; fi
+}
+manage_runners() {
+    runner_arguments "$@" || return $?
+    if [ -z "$RUNNER_CHANGE" ]; then show_runners; return 0; fi
+    runner_target || return 1
+    jq_update "$ROOT/conf/settings.json" --argjson count "$RUNNER_TO" '.runner_count=$count' || return 1
+    runner_saved "$STATE/manager.pid"
 }
 show_logs() {
     local active=$WORK_DIR file
@@ -153,7 +212,7 @@ unregister_untracked_runners() {
     # A registration can finish before save_entry. Its official metadata remains the
     # ownership evidence until the entire uninstall succeeds, including retry failures.
     local config directory runner_id name login organization id remote targets failed=0
-    "$JQ" -e 'type=="object" and all(to_entries[]; (.key|test("^[1-9][0-9]*$")) and (.value|type=="object") and (.value.login|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")) and (.value.runner_id|type=="number" and .>0 and floor==.))' "$STATE/organizations.json" >/dev/null || { printf 'Invalid registration state; retained installation for repair.\n' >&2; return 1; }
+    "$JQ" -e 'type=="object" and all(to_entries[]; (.key|test("^[1-9][0-9]*([.]([2-9]|[1-9][0-9]+))?$")) and (.value|type=="object") and (.value.login|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")) and (.value.runner_id|type=="number" and .>0 and floor==.))' "$STATE/organizations.json" >/dev/null || { printf 'Invalid registration state; retained installation for repair.\n' >&2; return 1; }
     targets=$(mktemp "$STATE/unregister.XXXXXX") || return 1
     for config in "$ROOT"/runner/*/app/.runner; do
         [ -e "$config" ] || [ -L "$config" ] || continue
@@ -162,7 +221,7 @@ unregister_untracked_runners() {
         runner_id=$("$JQ" -er '.agentId | select(type=="number" and .>0 and floor==.) | tostring' "$config") || { failed=1; break; }
         # A runner ID is scoped to its organization. The existing directory/state
         # pair supports older metadata; all other directories use the official URL.
-        if "$JQ" -e '.gitHubUrl==null' "$config" >/dev/null && "$JQ" -e --arg login "${directory##*/}" --argjson runner_id "$runner_id" 'any(.[]; .login==$login and .runner_id==$runner_id)' "$STATE/organizations.json" >/dev/null; then continue; fi
+        if "$JQ" -e '.gitHubUrl==null' "$config" >/dev/null && "$JQ" -e --arg login "${directory##*/}" --argjson runner_id "$runner_id" 'any(to_entries[]; .value.login+(.key|ltrimstr(split(".")[0]))==$login and .value.runner_id==$runner_id)' "$STATE/organizations.json" >/dev/null; then continue; fi
         name=$("$JQ" -er '.agentName | select(type=="string")' "$config") || { failed=1; break; }
         if [ "$name" != "$PREFIX" ] && ! indexed_name "$name"; then failed=1; break; fi
         login=$("$JQ" -er '.gitHubUrl | capture("^https://github\\.com/(?<login>[A-Za-z0-9][A-Za-z0-9-]{0,38})/?$";"i") | .login' "$config") || { failed=1; break; }
@@ -170,7 +229,7 @@ unregister_untracked_runners() {
         id=$(printf '%s' "$organization" | "$JQ" -er '.id | select(type=="number" and .>0 and floor==.) | tostring') || { failed=1; break; }
         login=$(printf '%s' "$organization" | "$JQ" -er '.login') || { failed=1; break; }
         safe_org "$login" || { failed=1; break; }
-        if "$JQ" -e --arg id "$id" --argjson runner_id "$runner_id" '.[$id].runner_id==$runner_id' "$STATE/organizations.json" >/dev/null; then continue; fi
+        if "$JQ" -e --arg id "$id" --argjson runner_id "$runner_id" 'any(to_entries[]; (.key|split(".")[0])==$id and .value.runner_id==$runner_id)' "$STATE/organizations.json" >/dev/null; then continue; fi
         remote=$(list_runners "$login") || { failed=1; break; }
         if ! printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" 'any(.[]; .id==$id)' >/dev/null; then continue; fi
         printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" --arg name "$name" '[.[]|select(.id==$id)] | length==1 and .[0].name==$name' >/dev/null || { failed=1; break; }
@@ -188,10 +247,10 @@ unregister_runners() {
     local id login runner_id organization remote failed=0
     unregister_untracked_runners || return 1
     while IFS=$'\t' read -r id login runner_id; do
-        safe_id "$id" && safe_id "$runner_id" && safe_org "$login" || { failed=1; continue; }
+        safe_key "$id" && safe_id "$runner_id" && safe_org "$login" || { failed=1; continue; }
         # Resolve by immutable ID so an organization rename cannot redirect cleanup.
-        if ! organization=$(api "organizations/$id"); then printf 'Cannot resolve organization %s; retained registration state.\n' "$login" >&2; failed=1; continue; fi
-        login=$(printf '%s' "$organization" | "$JQ" -er --argjson id "$id" 'select(.id==$id)|.login') || { failed=1; continue; }
+        if ! organization=$(api "organizations/${id%%.*}"); then printf 'Cannot resolve organization %s; retained registration state.\n' "$login" >&2; failed=1; continue; fi
+        login=$(printf '%s' "$organization" | "$JQ" -er --argjson id "${id%%.*}" 'select(.id==$id)|.login') || { failed=1; continue; }
         safe_org "$login" || { failed=1; continue; }
         if ! remote=$(list_runners "$login"); then printf 'Cannot query %s; retained registration state.\n' "$login" >&2; failed=1; continue; fi
         if printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" 'any(.[]; .id==$id)' >/dev/null; then
@@ -222,10 +281,8 @@ command_main() {
     case "$command" in
         wsl) [ "$#" -eq 1 ] && [ "$1" = setup ] || { usage >&2; return 2; }; wsl_host setup ;;
         --install-command) [ "$#" -eq 0 ] || return 2; install_cli ;;
-        config)
-            if [ "$#" -eq 0 ]; then configure_directory .;
-            elif [ "$#" -le 2 ] && { [ "$1" = --dir ] || [ "$1" = -d ]; }; then configure_directory "${2:-.}";
-            else usage >&2; return 2; fi ;;
+        config) configure "$@" ;;
+        runner) manage_runners "$@" ;;
         logs) [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = -f ]; } || { usage >&2; return 2; }; show_logs "${1:-}" ;;
         status|start|stop|restart|uninstall|help|--help|-h)
             [ "$#" -eq 0 ] || { usage >&2; return 2; }

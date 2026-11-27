@@ -23,11 +23,11 @@ for platform in linux macos; do
     record_pid "$ROOT/conf/children/1.pid" "$$"
     record_pid "$ROOT/conf/workers/2.pid" "$$"
     printf '%s\n' "$old_work" > "$ROOT/conf/active-work-dir"
-    jq -n --arg name "$PREFIX-1" '{"1":{login:"alpha",runner_id:101,runner_name:$name},"2":{login:"beta",runner_id:102,runner_name:$name},"3":{login:"gamma",runner_id:103,runner_name:$name,active:false},"4":{login:"denied",runner_id:104,runner_name:$name}}' > "$ROOT/conf/organizations.json"
+    jq -n --arg name "$PREFIX-1" --arg second "$PREFIX-2" '{"1.2":{login:"alpha",runner_id:204,runner_name:$second},"1":{login:"alpha",runner_id:101,runner_name:$name},"2":{login:"beta",runner_id:102,runner_name:$name},"3":{login:"gamma",runner_id:103,runner_name:$name,active:false},"4":{login:"denied",runner_id:104,runner_name:$name}}' > "$ROOT/conf/organizations.json"
     deny=true
     list_runners() {
         case "$1" in
-            alpha) jq -n --arg name "$PREFIX-1" '[{id:203,name:"zeta-manual",status:"online",busy:false},{id:101,name:$name,status:"online",busy:true},{id:201,name:"Build-box",status:"online",busy:true},{id:202,name:"local-macos-arm64-1",status:"offline",busy:null}]' ;;
+            alpha) jq -n --arg name "$PREFIX-1" --arg second "$PREFIX-2" '[{id:204,name:$second,status:"online",busy:false},{id:203,name:"zeta-manual",status:"online",busy:false},{id:101,name:$name,status:"online",busy:true},{id:201,name:"Build-box",status:"online",busy:true},{id:202,name:"local-macos-arm64-1",status:"offline",busy:null}]' ;;
             beta) jq -n --arg name "$PREFIX-1" '[{id:102,name:$name,status:"offline",busy:false}]' ;;
             gamma) jq -n --arg name "$PREFIX-1" '[{id:999,name:$name,status:"online",busy:false}]' ;;
             denied) if $deny; then return 1; else printf '[]\n'; fi ;;
@@ -58,14 +58,18 @@ for platform in linux macos; do
     block denied | grep -Eq '^`-- [^ ]+ +unknown +\? +stopped +-$'
     # Columns line up with the header whatever the runner name.
     assert test "$(awk '/^ORGANIZATION/ {print index($0,"GITHUB")}' "$fixture/report")" = "$(block alpha | head -n 1 | awk '{print index($0,"online")}')"
-    assert grep -Fxq "$(field GitHub '1 online, 1 offline, 1 missing, 1 unknown; 1 busy')" "$fixture/report"
-    # All other runners of an organization follow this installation's row, sorted by name.
-    assert test "$(block alpha | awk '{print $2}' | paste -sd, -)" = "$PREFIX-1,Build-box,local-macos-arm64-1,zeta-manual"
+    assert grep -Fxq "$(field GitHub '2 online, 1 offline, 1 missing, 1 unknown; 1 busy')" "$fixture/report"
+    # This installation's runners come first, in order, then all other runners sorted by name.
+    assert test "$(block alpha | awk '{print $2}' | paste -sd, -)" = "$PREFIX-1,$PREFIX-2,Build-box,local-macos-arm64-1,zeta-manual"
+    block alpha | sed -n 2p | grep -Eq "^\|-- $PREFIX-2 +online +false +stopped +-$"
+    assert grep -Fxq "$(field Organizations 4)" "$fixture/report"
+    assert grep -Fxq "$(field Runners 5)" "$fixture/report"
+    assert grep -Fxq "$(field 'Runners per organization' 1)" "$fixture/report"
     block alpha | grep -Eq '^\|-- Build-box +online +true +other +-$'
     block alpha | grep -Eq '^\|-- local-macos-arm64-1 +offline +\? +other +-$'
     block alpha | tail -n 1 | grep -Eq '^`-- zeta-manual +online +false +other +-$'
     assert grep -Fxq "$(field 'Other runners' '4 (3 online, 1 offline); 1 busy')" "$fixture/report"
-    assert grep -Fxq "$(field Local '1 running, 1 restarting, 2 stopped/paused')" "$fixture/report"
+    assert grep -Fxq "$(field Local '1 running, 1 restarting, 3 stopped/paused')" "$fixture/report"
     assert test "$(cat "$ROOT/conf/organizations.json")" = "$before"
     LC_ALL=en_US.UTF-8 status > "$fixture/report" 2>/dev/null || :
     assert grep -Fq "├── $PREFIX-1" "$fixture/report"

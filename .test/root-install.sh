@@ -165,7 +165,11 @@ if runuser -u ghrunner -- cat /root/private >/dev/null 2>&1; then echo 'Root pri
 ghr status > /fixture/status
 assert grep -q -E '^Runner account +ghrunner' /fixture/status
 assert grep -q 'online' /fixture/status
-ghr config --dir '/root/new work'
+if ghr config --data-dir '/root/new work' > /fixture/missing-dir 2>&1; then echo 'Accepted a missing data directory' >&2; exit 1; fi
+assert grep -q 'does not exist' /fixture/missing-dir
+mkdir '/root/new work'
+ghr config --data-dir '/root/new work'
+assert test "$(ghr config --data-dir)" = '/root/new work'
 assert test "$(cat "$root/conf/runtime/active-work-dir")" = /root/builds
 ghr start
 assert test "$(cat "$root/conf/runtime/active-work-dir")" = /root/builds
@@ -175,17 +179,31 @@ assert test "$(cat '/root/new work/data/fixture-org/demo/demo/job-uid')" = "$uid
 mkdir -p /fixture/untrusted/blocked
 chown ghrunner:ghrunner /fixture/untrusted
 chmod 700 /fixture/untrusted/blocked
-if ghr config --dir /fixture/untrusted/blocked > /fixture/unsafe-path-error 2>&1; then echo 'Granted root permissions through a user-writable parent' >&2; exit 1; fi
+if ghr config --data-dir /fixture/untrusted/blocked > /fixture/unsafe-path-error 2>&1; then echo 'Granted root permissions through a user-writable parent' >&2; exit 1; fi
 assert test "$(stat -c %a /fixture/untrusted/blocked)" = 700
-ghr config --dir /fixture/untrusted
-assert runuser -u ghrunner -- touch /fixture/untrusted/data/job
-ghr config --dir '/root/new work'
+if ghr config --data-dir /fixture/untrusted > /fixture/nonempty-error 2>&1; then echo 'Accepted a non-empty data directory' >&2; exit 1; fi
+assert grep -q 'not empty' /fixture/nonempty-error
+runuser -u ghrunner -- mkdir /fixture/untrusted/open
+ghr config --data-dir /fixture/untrusted/open
+assert runuser -u ghrunner -- touch /fixture/untrusted/open/data/job
+mkdir '/root/final work'
+ghr config --data-dir '/root/final work'
 ghr logs > /fixture/logs
 assert grep -q 'Started Shell supervisor' /fixture/logs
 ghr stop
 assert test -f "$root/conf/stopped"
 ghr status > /fixture/stopped-status
 assert grep -q -E '^Manager +stopped' /fixture/stopped-status
+# Root management saves the runner count in the protected settings file.
+LOCAL_RUNNER_CPU_COUNT=4 ghr runner --add
+assert test "$(LOCAL_RUNNER_CPU_COUNT=4 ghr runner)" = 'Runners per organization: 2 (maximum 2: 4 CPUs / 2)'
+assert test "$(runuser -u ghrunner -- jq .runner_count "$root/conf/settings.json")" = 2
+assert test "$(stat -c '%U:%G %a' "$root/conf/settings.json")" = 'root:ghrunner 640'
+if LOCAL_RUNNER_CPU_COUNT=4 ghr runner -a > /fixture/runner-error 2>&1; then echo 'Exceeded half the CPUs' >&2; exit 1; fi
+assert grep -q 'maximum on this machine' /fixture/runner-error
+if ghr config -d /tmp > /dev/null 2>&1; then echo 'Accepted the removed -d option' >&2; exit 1; fi
+LOCAL_RUNNER_CPU_COUNT=4 ghr runner -s
+assert test "$(runuser -u ghrunner -- jq .runner_count "$root/conf/settings.json")" = 1
 assert test ! -f /fixture/active
 # A forged PID file must never let root management signal an unrelated root process.
 sleep 120 & unrelated=$!

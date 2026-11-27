@@ -118,6 +118,25 @@ function Invoke-GitHubApi([string]$Endpoint, [string]$Method = 'GET', [switch]$P
     return $null
 }
 function Test-Organization([string]$Login) { return $Login -cmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$' }
+# Each organization runs runner_count runners. The first keeps the organization ID as its
+# state key and runner\<login>, data\<login> as its directories; runner N (N >= 2) is
+# keyed <ID>.N and uses <login>.N, which no organization login can be (logins have no dot).
+function Test-RunnerKey([string]$Key) { return $Key -cmatch '^\d+(\.([2-9]|[1-9]\d+))?$' }
+function Get-KeySuffix([string]$Key) { if ($Key.Contains('.')) { return '.' + $Key.Split('.')[1] }; return '' }
+# At most half the logical CPUs (at least 1), so an organization's runners leave room for
+# each other; a count saved on a larger machine is capped here. LOCAL_RUNNER_CPU_COUNT
+# stands in for the machine in tests.
+function Get-CpuCount {
+    if ($env:LOCAL_RUNNER_CPU_COUNT -match '^[1-9][0-9]*$') { return [int]$env:LOCAL_RUNNER_CPU_COUNT }
+    return [Environment]::ProcessorCount
+}
+function Get-MaxRunners { return [int][Math]::Max(1, [Math]::Floor((Get-CpuCount) / 2)) }
+function Get-RunnerCount {
+    $settings = Read-Json (Join-Path $script:Root 'conf\settings.json')
+    $count = $settings.runner_count
+    if ($count -is [ValueType] -and $count -ge 1) { return [int][Math]::Min((Get-MaxRunners), [Math]::Floor([double]$count)) }
+    return 1
+}
 function Record-Process([string]$Path, $Process) {
     try { Write-Json $Path @{ process_id=$Process.Id; started=$Process.StartTime.ToUniversalTime().Ticks } } catch { }
 }
@@ -172,18 +191,18 @@ function Write-RunnerWrapper([string]$Id, [string]$Login) {
     Write-AtomicText (Join-Path $directory 'listener.ps1') "Set-Location (Join-Path `$PSScriptRoot 'app')`n& .\run.cmd`nexit `$LASTEXITCODE`n"
 }
 function Start-Worker([string]$Id, [string]$Login) {
-    $entry = (Get-State)[$Id]
+    $entry = (Get-State)[$Id]; $folder = $Login + (Get-KeySuffix $Id)
     if ($entry.active -eq $false -or $entry.relocated -or -not (Test-IndexedName $entry.runner_name) -or (Test-Path (Join-Path $script:Root 'conf\stopped'))) { return }
     if (Test-Path (Join-Path $script:Root "conf\paused\$Id")) { return }
-    if (-not (Test-Path (Join-Path $script:Root "runner\$Login\app\.runner"))) { return }
+    if (-not (Test-Path (Join-Path $script:Root "runner\$folder\app\.runner"))) { return }
     $record = Join-Path $script:Root "conf\workers\$Id.json"
     if ($null -ne (Get-RecordedProcess $record)) { return }
     $retry = Read-Json (Join-Path $script:Root "conf\retry\$Id.json")
     if ($null -ne $retry -and [DateTime]::UtcNow.Ticks -lt [long]$retry.after) { return }
     Stop-Worker $Id
-    Set-RunnerWorkspace $Login
-    Write-RunnerWrapper $Id $Login
-    $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $script:Root "runner\$Login\runner.ps1"),'-Root',$script:Root,'-OrgId',$Id)
+    Set-RunnerWorkspace $Login (Get-KeySuffix $Id)
+    Write-RunnerWrapper $Id $folder
+    $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $script:Root "runner\$folder\runner.ps1"),'-Root',$script:Root,'-OrgId',$Id)
     $process = [Diagnostics.Process]::Start($info)
     Record-Process $record $process
     Write-Json (Join-Path $script:Root "conf\retry\$Id.json") @{ after=[DateTime]::UtcNow.AddSeconds($script:RestartSeconds).Ticks }
@@ -191,7 +210,7 @@ function Start-Worker([string]$Id, [string]$Login) {
 }
 function Ensure-Workers {
     $state = Get-State
-    foreach ($id in @($state.Keys)) { if ($id -match '^\d+$' -and (Test-Organization $state[$id].login)) { Start-Worker $id $state[$id].login } }
+    foreach ($id in @($state.Keys)) { if ((Test-RunnerKey $id) -and (Test-Organization $state[$id].login)) { Start-Worker $id $state[$id].login } }
 }
 function Ensure-Package {
     $script:Package = Join-Path $script:Root 'bin\.cache\package'
@@ -216,18 +235,18 @@ function Ensure-Package {
     } finally { Remove-Item -LiteralPath $temporary -Recurse -Force }
     Write-Log "Downloaded official Runner $version"
 }
-function Set-RunnerWorkspace([string]$Login) {
+function Set-RunnerWorkspace([string]$Login, [string]$Suffix = '') {
     if (-not (Test-Organization $Login)) { throw 'Invalid organization.' }
-    $work = Join-Path $script:DataDir $Login
+    $work = Join-Path $script:DataDir "$Login$Suffix"
     New-Item -ItemType Directory -Force -Path $work | Out-Null
-    $configuration = Join-Path $script:Root "runner\$Login\app\.runner"
+    $configuration = Join-Path $script:Root "runner\$Login$Suffix\app\.runner"
     $runner = Read-Json $configuration
     $runner | Add-Member -NotePropertyName workFolder -NotePropertyValue $work -Force
     Write-Json $configuration $runner
 }
-function Register-Runner([string]$Login, [string]$Name) {
+function Register-Runner([string]$Login, [string]$Name, [string]$Suffix = '') {
     Ensure-Package
-    $directory = Join-Path $script:Root "runner\$Login\app"
+    $directory = Join-Path $script:Root "runner\$Login$Suffix\app"
     if (-not (Test-Path (Join-Path $directory 'run.cmd'))) {
         if (Test-Path "$directory.staging") { Remove-Item "$directory.staging" -Recurse -Force }
         New-Item -ItemType Directory -Force -Path (Split-Path $directory -Parent) | Out-Null
@@ -235,7 +254,7 @@ function Register-Runner([string]$Login, [string]$Name) {
         if (Test-Path $directory) { Remove-Item $directory -Recurse -Force }
         Move-Item "$directory.staging" $directory
     }
-    $work = Join-Path $script:DataDir $Login
+    $work = Join-Path $script:DataDir "$Login$Suffix"
     New-Item -ItemType Directory -Force -Path $work | Out-Null
     $token = (Invoke-GitHubApi "orgs/$Login/actions/runners/registration-token" -Method POST).token
     $wrapper = Join-Path $directory 'configure.ps1'
@@ -261,10 +280,11 @@ function Get-NextName($Remote) {
     return "$script:Prefix-$($maximum+1)"
 }
 function Reconcile-Organization([string]$Id, [string]$Login) {
-    if ($Id -notmatch '^\d+$' -or -not (Test-Organization $Login)) { throw 'Invalid organization.' }
+    if (-not (Test-RunnerKey $Id) -or -not (Test-Organization $Login)) { throw 'Invalid organization.' }
+    $suffix = Get-KeySuffix $Id
     $remote = @(Get-RemoteRunners $Login)
     $state = Get-State; $entry = $state[$Id]
-    $directory = Join-Path $script:Root "runner\$Login\app"
+    $directory = Join-Path $script:Root "runner\$Login$suffix\app"
     $local = Read-Json (Join-Path $directory '.runner')
     # Recover ownership when registration succeeded before state was saved.
     if ($null -eq $entry -and $null -ne $local) {
@@ -283,11 +303,11 @@ function Reconcile-Organization([string]$Id, [string]$Login) {
             $remote = @($remote | Where-Object id -ne $registered.id)
         }
         # A renamed organization keeps its program directory; old work data stays in place.
-        $oldDirectory = Join-Path $script:Root "runner\$($entry.login)"
-        $newDirectory = Join-Path $script:Root "runner\$Login"
+        $oldDirectory = Join-Path $script:Root "runner\$($entry.login)$suffix"
+        $newDirectory = Join-Path $script:Root "runner\$Login$suffix"
         if ($entry.login -cne $Login -and (Test-Organization $entry.login) -and (Test-Path -LiteralPath $oldDirectory) -and -not (Test-Path -LiteralPath $newDirectory)) {
             Move-Item -LiteralPath $oldDirectory -Destination $newDirectory
-            Write-Log "Moved runner directory of $($entry.login) to $Login"
+            Write-Log "Moved runner directory of $($entry.login)$suffix to $Login$suffix"
         }
         $registered = $null
     }
@@ -298,7 +318,7 @@ function Reconcile-Organization([string]$Id, [string]$Login) {
             $name = if ((Test-IndexedName $preferred) -and -not @($remote | Where-Object name -eq $preferred).Count) { $preferred } else { Get-NextName $remote }
             New-Item -ItemType Directory -Force -Path (Split-Path $directory -Parent) | Out-Null
             foreach ($file in @('.runner','.credentials','.credentials_rsaparams')) { Remove-Item (Join-Path $directory $file) -Force -ErrorAction SilentlyContinue }
-            try { $runnerId = Register-Runner $Login $name; break }
+            try { $runnerId = Register-Runner $Login $name $suffix; break }
             catch {
                 # Refresh after a collision; never replace another machine's runner.
                 $failure = $_
@@ -314,6 +334,38 @@ function Reconcile-Organization([string]$Id, [string]$Login) {
     Save-State $state
     Remove-Item $pause -Force -ErrorAction SilentlyContinue
 }
+# A runner beyond runner_count leaves once it is idle, so a running job is never cut off.
+# Its registration and program directory go; its work data stays.
+function Remove-ExtraRunner([string]$Key, [string]$Login) {
+    $suffix = Get-KeySuffix $Key
+    if (-not (Test-RunnerKey $Key) -or -not $suffix -or -not (Test-Organization $Login)) { throw 'Invalid runner.' }
+    $state = Get-State; $entry = $state[$Key]
+    if ("$($entry.runner_id)" -notmatch '^\d+$') { throw 'Invalid registration ID.' }
+    $registered = @(Get-RemoteRunners $Login | Where-Object id -eq $entry.runner_id) | Select-Object -First 1
+    if ($null -ne $registered -and $registered.busy) { return }
+    Write-AtomicText (Join-Path $script:Root "conf\paused\$Key") 'paused'; Stop-Worker $Key
+    if ($null -ne $registered) { $null = Invoke-GitHubApi "orgs/$Login/actions/runners/$($registered.id)" -Method DELETE }
+    foreach ($owner in @($Login, $entry.login) | Select-Object -Unique) {
+        $directory = Join-Path $script:Root "runner\$owner$suffix"
+        if ((Test-Organization $owner) -and (Test-Path -LiteralPath $directory)) { Remove-Item -LiteralPath $directory -Recurse -Force }
+    }
+    $state = Get-State; $state.Remove($Key); Save-State $state
+    foreach ($file in @("conf\paused\$Key", "conf\retry\$Key.json")) { Remove-Item -LiteralPath (Join-Path $script:Root $file) -Force -ErrorAction SilentlyContinue }
+    Write-Log "Removed $($entry.runner_name) from $Login (runner count lowered); work data retained in $(Join-Path $script:DataDir "$Login$suffix")"
+}
+# Register, start and retire this organization's runners to match runner_count.
+function Reconcile-Runners([string]$Id, [string]$Login, [int]$Count) {
+    for ($slot = 1; $slot -le $Count; $slot++) {
+        $key = if ($slot -eq 1) { $Id } else { "$Id.$slot" }
+        Reconcile-Organization $key $Login
+        # Start each runner now; with many organizations and a slow network, waiting
+        # for the whole pass would leave registered runners offline for minutes.
+        if ($script:Supervising) {
+            try { Start-Worker $key $Login } catch { Write-Log "Organization ${Login}: runner start failed: $($_.Exception.Message)" }
+        }
+    }
+    foreach ($key in @((Get-State).Keys | Where-Object { $_.StartsWith("$Id.") -and [int]$_.Split('.')[1] -gt $Count })) { Remove-ExtraRunner $key $Login }
+}
 function Invoke-Reconcile {
     # API failure must not be interpreted as an empty membership list.
     $pages = Invoke-GitHubApi 'user/memberships/orgs?state=active&per_page=100' -Paginate
@@ -326,18 +378,14 @@ function Invoke-Reconcile {
             $desired["$($member.organization.id)"] = $login
         }
     }
+    $count = Get-RunnerCount
     foreach ($id in @($desired.Keys)) {
         $backoff = Join-Path $script:Root "conf\backoff\$id.json"
         $previous = Read-Json $backoff
         if ($null -ne $previous -and [DateTime]::UtcNow.Ticks -lt [long]$previous.after) { continue }
         try {
-            Reconcile-Organization $id $desired[$id]
+            Reconcile-Runners $id $desired[$id] $count
             if ($null -ne $previous) { Remove-Item -LiteralPath $backoff -Force; Write-Log "Organization $($desired[$id]): reconciliation recovered" }
-            # Start this organization now; with many organizations and a slow network, waiting
-            # for the whole pass would leave registered runners offline for minutes.
-            if ($script:Supervising) {
-                try { Start-Worker $id $desired[$id] } catch { Write-Log "Organization $($desired[$id]): runner start failed: $($_.Exception.Message)" }
-            }
         } catch {
             # Organizations without runner permission (or with persistent errors) back off
             # exponentially from poll_seconds to one hour instead of failing every poll.
@@ -349,10 +397,11 @@ function Invoke-Reconcile {
     }
     $state = Get-State
     foreach ($id in @($state.Keys)) {
-        if (-not $desired.ContainsKey($id)) {
+        $organizationId = $id.Split('.')[0]
+        if (-not $desired.ContainsKey($organizationId)) {
             # Already deactivated: nothing to stop and nothing new to log.
             if ($state[$id].active -eq $false) { continue }
-            Remove-Item -LiteralPath (Join-Path $script:Root "conf\backoff\$id.json") -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath (Join-Path $script:Root "conf\backoff\$organizationId.json") -Force -ErrorAction SilentlyContinue
             Stop-Worker $id
             $state[$id] | Add-Member -NotePropertyName active -NotePropertyValue $false -Force
             Save-State $state
@@ -369,10 +418,13 @@ function Invoke-Supervisor {
         foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $script:Root "conf\$folder") -Filter *.json | ForEach-Object { Stop-Record $_.FullName } }
         Write-Log "Started PowerShell supervisor $script:Prefix"
         $script:Supervising = $true
-        $next = [DateTime]::MinValue
+        $next = [DateTime]::MinValue; $applied = $null
         while (-not (Test-Path (Join-Path $script:Root 'conf\stopped'))) {
             Ensure-Workers
-            if ([DateTime]::UtcNow -ge $next) {
+            # ghr runner --add/--sub takes effect without waiting for the next poll.
+            $count = try { Get-RunnerCount } catch { $applied }
+            if ([DateTime]::UtcNow -ge $next -or $count -ne $applied) {
+                $applied = $count
                 try { Invoke-Reconcile } catch { Write-Log "Discovery failed; retaining current runners: $($_.Exception.Message)" }
                 $next = [DateTime]::UtcNow.AddSeconds($script:PollSeconds)
             }

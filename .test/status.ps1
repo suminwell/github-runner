@@ -16,6 +16,7 @@ try {
     Record-Process (Join-Path $fixture 'conf/workers/2.json') $current
     Write-AtomicText (Join-Path $fixture 'conf/active-work-dir') $oldWork
     Save-State @{
+        '1.2'=@{login='alpha';runner_id=204;runner_name="$script:Prefix-2"}
         '1'=@{login='alpha';runner_id=101;runner_name="$script:Prefix-1"}
         '2'=@{login='beta';runner_id=102;runner_name="$script:Prefix-1"}
         '3'=@{login='gamma';runner_id=103;runner_name="$script:Prefix-1";active=$false}
@@ -25,6 +26,7 @@ try {
     function Get-RemoteRunners([string]$Login) {
         switch ($Login) {
             alpha { return @(
+                [pscustomobject]@{id=204;name="$script:Prefix-2";status='online';busy=$false},
                 [pscustomobject]@{id=203;name='zeta-manual';status='online';busy=$false},
                 [pscustomobject]@{id=101;name="$script:Prefix-1";status='online';busy=$true},
                 [pscustomobject]@{id=201;name='Build-box';status='online';busy=$true},
@@ -70,12 +72,14 @@ try {
     Assert ($denied.Count -eq 1 -and $denied[0] -match ' unknown +\? +stopped +-\s*$') 'API error is unknown'
     $header = @($report -split "`r?`n" | Where-Object { $_ -clike 'ORGANIZATION /*' })[0]
     Assert ($header.IndexOf('GITHUB') -eq $alpha[0].IndexOf('online')) 'columns align with the header'
-    Assert ((Has-Line $report (Field 'GitHub' '1 online, 1 offline, 1 missing, 1 unknown; 1 busy')) -and (Has-Line $report (Field 'Local' '1 running, 1 restarting, 2 stopped/paused'))) 'remote and local counts'
+    Assert ((Has-Line $report (Field 'GitHub' '2 online, 1 offline, 1 missing, 1 unknown; 1 busy')) -and (Has-Line $report (Field 'Local' '1 running, 1 restarting, 3 stopped/paused'))) 'remote and local counts'
+    Assert ((Has-Line $report (Field 'Organizations' '4')) -and (Has-Line $report (Field 'Runners' '5')) -and (Has-Line $report (Field 'Runners per organization' '1'))) 'organization and runner counts'
     $alphaRows = @($alpha | ForEach-Object { ($_ -split ' +')[1] })
-    Assert (($alphaRows -join ',') -ceq "$script:Prefix-1,Build-box,local-linux-x64-1,zeta-manual") 'other runners follow this installation, sorted by name'
-    Assert ($alpha[1] -match ' Build-box +online +true +other +-\s*$') 'busy runner of another machine'
-    Assert ($alpha[2] -match ' local-linux-x64-1 +offline +\? +other +-\s*$') 'other platform runner'
-    Assert ($alpha[3].StartsWith("$end zeta-manual ")) 'last runner closes the branch'
+    Assert (($alphaRows -join ',') -ceq "$script:Prefix-1,$script:Prefix-2,Build-box,local-linux-x64-1,zeta-manual") 'this installation first, in order, then other runners sorted by name'
+    Assert ($alpha[1] -match " $script:Prefix-2 +online +false +stopped +-\s*$") 'second runner of the organization'
+    Assert ($alpha[2] -match ' Build-box +online +true +other +-\s*$') 'busy runner of another machine'
+    Assert ($alpha[3] -match ' local-linux-x64-1 +offline +\? +other +-\s*$') 'other platform runner'
+    Assert ($alpha[4].StartsWith("$end zeta-manual ")) 'last runner closes the branch'
     Assert ((Has-Line $report (Field 'Other runners' '4 (3 online, 1 offline); 1 busy'))) 'other runner counts'
     Assert ((Get-Content -Raw -LiteralPath (Join-Path $fixture 'conf/organizations.json')) -ceq $before) 'status leaves registrations unchanged'
     $script:Deny = $false

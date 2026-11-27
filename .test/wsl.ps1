@@ -47,8 +47,18 @@ $firstName = $script:TaskName
 Initialize-WslHost
 Assert ($script:TaskName -eq $firstName) 'stable task identity'
 Assert ($script:HoldArguments.Contains('"Ubuntu Work"') -and $script:HoldArguments.Contains('"/home/runner/Runner Work/bin/wsl.sh"')) 'native paths with spaces quoted'
+# wsl.exe only recognizes its options unquoted; a quoted "--distribution" ran as a shell command.
+Assert ($script:HoldArguments.StartsWith('--distribution "Ubuntu Work" --user ') -and $script:HoldArguments.Contains(' --exec /bin/bash ') -and $script:HoldArguments.EndsWith(' hold')) 'wsl.exe options unquoted'
+Assert ((Quote-WslArgument 'a"b') -ceq '"a\"b"' -and (Quote-WslArgument '') -ceq '""') 'quotes and empty values still quoted'
 $script:SavedTask = $null; $script:Enabled = $false; $script:Started = $false; $script:Linked = $false; $script:LinuxStopped = $false
 function Get-ScheduledTask { param($TaskName,$ErrorAction); return $script:SavedTask }
+# A task registered by an earlier version, with every argument quoted, is still this installation's.
+$script:SavedTask = [pscustomobject]@{Actions=@([pscustomobject]@{Execute=$script:WslExe;Arguments=$script:LegacyHoldArguments});Principal=[pscustomobject]@{UserId='fixture\owner';LogonType='Password';RunLevel='Limited'};Description=$script:TaskDescription;State='Running'}
+Assert ($script:LegacyHoldArguments.StartsWith('"--distribution" ') -and $null -ne (Get-OwnedWslTask)) 'legacy fully quoted task still owned'
+$script:SavedTask.Actions[0].Arguments = '--distribution Other hold'
+$failed = $false; try { $null = Get-OwnedWslTask } catch { $failed = $true }
+Assert $failed 'a changed action is still refused'
+$script:SavedTask = $null
 function Get-Credential { param($UserName,$Message); return [pscredential]::new($UserName,(ConvertTo-SecureString 'fake-password-only' -AsPlainText -Force)) }
 function Register-WslTask([pscredential]$Credential, [bool]$Stopped) {
     Assert ($Credential.GetNetworkCredential().Password -eq 'fake-password-only' -and $Credential.UserName -eq 'fixture\owner') 'credential passed only to registration boundary'

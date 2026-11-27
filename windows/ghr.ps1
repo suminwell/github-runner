@@ -1,4 +1,4 @@
-﻿param([ValidateSet('status','start','stop','restart','logs','config','uninstall','help','install-command','library')][string]$Command = 'help')
+﻿param([ValidateSet('status','start','stop','restart','logs','config','runner','uninstall','help','install-command','library')][string]$Command = 'help')
 $CommandOptions = @($args)
 . (Join-Path $PSScriptRoot 'service.ps1') -Mode Library -Root (Split-Path $PSScriptRoot -Parent)
 function Show-Usage {
@@ -8,7 +8,11 @@ ghr start: 启动runner
 ghr stop: 停止runner
 ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
-ghr config --dir [<PATH>]: 设置data和logs的父目录，默认为当前目录，重启后生效（--dir 可简写为 -d）
+ghr config [--data-dir]: 显示data和logs的父目录
+ghr config --data-dir <PATH>: 设置data和logs的父目录，路径必须是已存在的空目录，重启后生效
+ghr runner: 显示每个组织的runner个数及本机上限（CPU核数的一半）
+ghr runner -a|--add: 每个组织增加一个runner，无需重启，超过上限时报错
+ghr runner -s|--sub: 每个组织减少一个runner，最少保留1个，多出的runner空闲后移除
 ghr uninstall: 卸载runner
 '@
 }
@@ -85,6 +89,7 @@ function Show-Status {
     elseif (Test-Path (Join-Path $script:Root 'conf\stopped')) { $items.Add(@('Manager', 'stopped (run ghr start to resume)')) }
     else { $items.Add(@('Manager', 'stopped')) }
     $items.Add(@('Sleep prevention', (Get-SleepPrevention ([bool]$manager))))
+    $items.Add(@('Runners per organization', "$(Get-RunnerCount)"))
     $items.Add(@('Install directory', $script:Root))
     $items.Add(@('Runner directory', (Join-Path $script:Root 'runner')))
     $work = $script:WorkDir; $directoryState = 'configured; not started yet'
@@ -115,35 +120,46 @@ function Show-Status {
     $line = [string][char]0x2500 * 2
     $middle = [string][char]0x251C + $line; $last = [string][char]0x2514 + $line
     Write-Host ''; Write-Host ('{0,-36} {1,-9} {2,-5} {3,-11} {4}' -f 'ORGANIZATION / RUNNER','GITHUB','BUSY','LOCAL','PID')
-    foreach ($id in @($state.Keys | Sort-Object { $state[$_].login })) {
-        $entry = $state[$id]; $runner = $null; $remoteStatus = 'missing'; $busy = '-'; $name = $entry.runner_name
-        $listener = Get-RecordedProcess (Join-Path $script:Root "conf\children\$id.json")
-        $worker = Get-RecordedProcess (Join-Path $script:Root "conf\workers\$id.json")
-        $localStatus = 'stopped'; $localPid = '-'
-        if ($listener) { $localStatus = 'running'; $localPid = $listener.Id; $listening++ }
-        elseif ($worker) { $localStatus = 'restarting'; $localPid = $worker.Id; $restarting++ }
-        elseif ($entry.active -eq $false -or (Test-Path (Join-Path $script:Root "conf\paused\$id"))) { $localStatus = 'paused' }
-        $others = @()
+    $organizations = @($state.Keys | Group-Object { $_.Split('.')[0] } | ForEach-Object {
+        $keys = @($_.Group | Sort-Object { if ($_.Contains('.')) { [int]$_.Split('.')[1] } else { 1 } })
+        [pscustomobject]@{ keys=$keys; login=$state[$keys[0]].login }
+    } | Sort-Object login)
+    foreach ($organization in $organizations) {
+        $localIds = @($organization.keys | ForEach-Object { $state[$_].runner_id })
+        $remote = $null; $others = @()
         try {
-            $remote = @(Get-RemoteRunners $entry.login)
-            $runner = @($remote | Where-Object id -eq $entry.runner_id) | Select-Object -First 1
+            $remote = @(Get-RemoteRunners $organization.login)
             # Every other runner of the organization: other machines, platforms or manual runners.
-            $others = @($remote | Where-Object { $_.id -ne $entry.runner_id } | Sort-Object { "$($_.name)".ToLowerInvariant() })
-            if ($runner) {
-                if ($runner.name) { $name = $runner.name }
-                $remoteStatus = $runner.status
-                $busy = if ($null -eq $runner.busy) { '?' } else { "$($runner.busy)".ToLowerInvariant() }
+            $others = @($remote | Where-Object { $localIds -notcontains $_.id } | Sort-Object { "$($_.name)".ToLowerInvariant() })
+        } catch { $remote = $null; $failed = $true }
+        $remaining = $organization.keys.Count + $others.Count
+        Write-Host $organization.login
+        foreach ($id in $organization.keys) {
+            $entry = $state[$id]; $remoteStatus = 'unknown'; $busy = '?'; $name = $entry.runner_name
+            $listener = Get-RecordedProcess (Join-Path $script:Root "conf\children\$id.json")
+            $worker = Get-RecordedProcess (Join-Path $script:Root "conf\workers\$id.json")
+            $localStatus = 'stopped'; $localPid = '-'
+            if ($listener) { $localStatus = 'running'; $localPid = $listener.Id; $listening++ }
+            elseif ($worker) { $localStatus = 'restarting'; $localPid = $worker.Id; $restarting++ }
+            elseif ($entry.active -eq $false -or (Test-Path (Join-Path $script:Root "conf\paused\$id"))) { $localStatus = 'paused' }
+            if ($null -ne $remote) {
+                $runner = @($remote | Where-Object id -eq $entry.runner_id) | Select-Object -First 1
+                $remoteStatus = 'missing'; $busy = '-'
+                if ($runner) {
+                    if ($runner.name) { $name = $runner.name }
+                    $remoteStatus = $runner.status
+                    $busy = if ($null -eq $runner.busy) { '?' } else { "$($runner.busy)".ToLowerInvariant() }
+                }
             }
-        } catch { $remoteStatus = 'unknown'; $busy = '?'; $failed = $true }
-        switch ($remoteStatus) {
-            'online' { $online++ }; 'offline' { $offline++ }; 'missing' { $missing++ }
-            default { $remoteStatus = 'unknown'; $busy = '?'; $unknown++; $failed = $true }
+            switch ($remoteStatus) {
+                'online' { $online++ }; 'offline' { $offline++ }; 'missing' { $missing++ }
+                default { $remoteStatus = 'unknown'; $busy = '?'; $unknown++; $failed = $true }
+            }
+            if ($busy -eq 'true') { $jobs++ }
+            $remaining--
+            $branch = if ($remaining) { $middle } else { $last }
+            Write-Host ($rowFormat -f $branch,$name,$remoteStatus,$busy,$localStatus,$localPid)
         }
-        if ($busy -eq 'true') { $jobs++ }
-        Write-Host $entry.login
-        $branch = if ($others.Count) { $middle } else { $last }
-        Write-Host ($rowFormat -f $branch,$name,$remoteStatus,$busy,$localStatus,$localPid)
-        $remaining = $others.Count
         foreach ($other in $others) {
             $remaining--
             $branch = if ($remaining) { $middle } else { $last }
@@ -156,11 +172,12 @@ function Show-Status {
         }
     }
     if (-not $state.Count) { Write-Host 'No runners registered yet. Use ghr logs to check discovery and registration.' }
-    $items.Add(@('Organizations', "$($state.Count)"))
+    $items.Add(@('Organizations', "$($organizations.Count)"))
+    $items.Add(@('Runners', "$($state.Count)"))
     $items.Add(@('GitHub', "$online online, $offline offline, $missing missing, $unknown unknown; $jobs busy"))
     if ($otherCount) { $items.Add(@('Other runners', "$otherCount ($otherOnline online, $otherOffline offline); $otherJobs busy")) }
     $items.Add(@('Local', "$listening running, $restarting restarting, $($state.Count - $listening - $restarting) stopped/paused"))
-    if ($restarting) { $notes += 'restarting: organization worker is alive; listener is not running yet.' }
+    if ($restarting) { $notes += 'restarting: runner worker is alive; listener is not running yet.' }
     Write-Host ''; Write-Host ('{0,-26} {1}' -f 'SUMMARY','VALUE')
     foreach ($item in $items) { Write-Host ('{0,-26} {1}' -f $item[0],$item[1]) }
     if ($notes.Count -or $failed) { Write-Host '' }
@@ -203,23 +220,53 @@ function Grant-DataDirectory([string]$Directory) {
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, 'Modify', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
     Set-Acl -LiteralPath $Directory -AclObject $acl
 }
+# A new data directory must already exist and be empty: switching to a directory that
+# holds other files would mix them with runner work data and logs.
 function Set-WorkDirectory([string]$Directory) {
     Assert-Administrator
-    if ([string]::IsNullOrWhiteSpace($Directory)) { $Directory = '.' }
     if (-not [IO.Path]::IsPathRooted($Directory)) { $Directory = Join-Path (Get-Location).ProviderPath $Directory }
     $absolute = [IO.Path]::GetFullPath($Directory)
     if ($absolute.Length -gt [IO.Path]::GetPathRoot($absolute).Length) { $absolute = $absolute.TrimEnd([IO.Path]::DirectorySeparatorChar) }
+    if (-not (Test-Path -LiteralPath $absolute -PathType Container)) { throw "Data directory does not exist: $absolute. Create an empty directory first." }
+    if ($absolute -eq $script:WorkDir) { throw "Already the data directory: $absolute" }
+    if (@(Get-ChildItem -Force -LiteralPath $absolute).Count) { throw "Data directory is not empty: $absolute. Choose an empty directory." }
     foreach ($reserved in @((Join-Path $script:Root 'bin'), (Join-Path $script:Root 'conf'), (Join-Path $script:Root 'runner'))) {
         if ($absolute -eq $reserved -or ($reserved -ne $script:Root -and $absolute.StartsWith($reserved + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase))) { throw 'Data must be outside the program and state directories.' }
     }
     Grant-DataDirectory (Join-Path $absolute 'data')
     Grant-DataDirectory (Join-Path $absolute 'logs')
+    Save-Setting 'work_dir' $absolute
+    Write-Host "Data directory saved: $absolute"
+    Write-Host 'Run ghr restart (or stop then start) to apply. Existing data and logs are not moved.'
+}
+function Save-Setting([string]$Name, $Value) {
     $settings = Read-Json (Join-Path $script:Root 'conf\settings.json')
-    $settings | Add-Member -NotePropertyName work_dir -NotePropertyValue $absolute -Force
+    $settings | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
     Write-Json (Join-Path $script:Root 'conf\settings.json') $settings
     Protect-AdminFile (Join-Path $script:Root 'conf\settings.json')
-    Write-Host "Work directory saved: $absolute"
-    Write-Host 'Run ghr restart (or stop then start) to apply. Existing data and logs are not moved.'
+}
+# ghr runner [-a|--add | -s|--sub]: one runner more or fewer for every organization, from 1
+# up to half the CPUs.
+function Invoke-RunnerCount([object[]]$Options) {
+    $count = Get-RunnerCount; $maximum = Get-MaxRunners
+    if (-not $Options.Count) { Write-Output "Runners per organization: $count (maximum ${maximum}: $(Get-CpuCount) CPUs / 2)"; return }
+    if ($Options.Count -ne 1 -or "$($Options[0])" -cnotin @('-a','--add','-s','--sub')) { throw 'Usage: ghr runner [-a|--add | -s|--sub]' }
+    Assert-Administrator
+    $add = "$($Options[0])" -cin @('-a','--add')
+    $target = if ($add) { $count + 1 } else { $count - 1 }
+    if ($target -lt 1) { throw 'Cannot remove a runner: every organization keeps at least 1.' }
+    if ($target -gt $maximum) { throw "Cannot add a runner: $maximum per organization is the maximum on this machine ($(Get-CpuCount) CPUs / 2)." }
+    Save-Setting 'runner_count' $target
+    Write-Output "Runners per organization: $count -> $target"
+    if ($null -eq (Get-RecordedProcess (Join-Path $script:Root 'conf\manager.json'))) { Write-Output 'Applied when the runner starts (ghr start).' }
+    elseif ($add) { Write-Output 'The running manager registers the new runners within a few seconds.' }
+    else { Write-Output 'The running manager removes the extra runners once they are idle; running jobs finish first.' }
+}
+# ghr config [--data-dir [<PATH>]]: full option names only.
+function Invoke-Config([object[]]$Options) {
+    if (-not $Options.Count) { Write-Output ('{0,-10} {1}' -f 'data-dir',$script:WorkDir); return }
+    if ($Options.Count -gt 2 -or "$($Options[0])" -cne '--data-dir' -or ($Options.Count -eq 2 -and -not "$($Options[1])")) { throw 'Usage: ghr config [--data-dir [<PATH>]]' }
+    if ($Options.Count -eq 1) { Write-Output $script:WorkDir } else { Set-WorkDirectory "$($Options[1])" }
 }
 function Unregister-UntrackedRunners($State) {
     # Keep official .runner evidence until all cleanup succeeds, so interrupted
@@ -228,7 +275,7 @@ function Unregister-UntrackedRunners($State) {
     if ($null -eq $raw -or $raw -isnot [pscustomobject]) { throw 'Invalid registration state; retained installation for repair.' }
     foreach ($id in $State.Keys) {
         $entry = $State[$id]
-        if ($id -notmatch '^[1-9][0-9]*$' -or "$($entry.runner_id)" -notmatch '^[1-9][0-9]*$' -or -not (Test-Organization $entry.login)) { throw 'Invalid registration state; retained installation for repair.' }
+        if ($id -cnotmatch '^[1-9]' -or -not (Test-RunnerKey $id) -or "$($entry.runner_id)" -notmatch '^[1-9][0-9]*$' -or -not (Test-Organization $entry.login)) { throw 'Invalid registration state; retained installation for repair.' }
     }
     $targets = @{}
     $runners = Join-Path $script:Root 'runner'
@@ -245,13 +292,13 @@ function Unregister-UntrackedRunners($State) {
         if ($null -eq $local -or "$($local.agentId)" -notmatch '^[1-9][0-9]*$') { throw 'Invalid local registration; retained metadata for repair.' }
         # Existing directory/state pairs support older metadata, but an ID alone
         # never identifies a registration in another organization.
-        if ($null -eq $local.gitHubUrl -and @($State.Values | Where-Object { $_.runner_id -eq $local.agentId -and $_.login -ceq $directory.Name }).Count) { continue }
+        if ($null -eq $local.gitHubUrl -and @($State.Keys | Where-Object { $State[$_].runner_id -eq $local.agentId -and ($State[$_].login + (Get-KeySuffix $_)) -ceq $directory.Name }).Count) { continue }
         if ($local.agentName -cne $script:Prefix -and -not (Test-IndexedName $local.agentName)) { throw 'Local runner name does not identify this installation.' }
         if ($local.gitHubUrl -notmatch '^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/?$') { throw 'Local registration does not identify a GitHub organization URL.' }
         $organization = Invoke-GitHubApi "orgs/$($Matches[1])"
         if ("$($organization.id)" -notmatch '^[1-9][0-9]*$' -or -not (Test-Organization $organization.login)) { throw 'Invalid organization identity.' }
         $login = $organization.login
-        if ($State.ContainsKey("$($organization.id)") -and $State["$($organization.id)"].runner_id -eq $local.agentId) { continue }
+        if (@($State.Keys | Where-Object { $_.Split('.')[0] -eq "$($organization.id)" -and $State[$_].runner_id -eq $local.agentId }).Count) { continue }
         $remote = @(Get-RemoteRunners $login | Where-Object id -eq $local.agentId)
         if (-not $remote.Count) { continue }
         if ($remote.Count -ne 1 -or $remote[0].name -cne $local.agentName) { throw 'Local and remote runner identities disagree; retained metadata for repair.' }
@@ -265,9 +312,9 @@ function Unregister-Runners {
     foreach ($id in @($state.Keys)) {
         $entry = $state[$id]
         try {
-            if ($id -notmatch '^\d+$' -or "$($entry.runner_id)" -notmatch '^\d+$') { throw 'Invalid registration identity.' }
-            $organization = Invoke-GitHubApi "organizations/$id"
-            if ("$($organization.id)" -ne $id -or -not (Test-Organization $organization.login)) { throw 'Organization identity mismatch.' }
+            if (-not (Test-RunnerKey $id) -or "$($entry.runner_id)" -notmatch '^\d+$') { throw 'Invalid registration identity.' }
+            $organization = Invoke-GitHubApi "organizations/$($id.Split('.')[0])"
+            if ("$($organization.id)" -ne $id.Split('.')[0] -or -not (Test-Organization $organization.login)) { throw 'Organization identity mismatch.' }
             $login = $organization.login
             if (@(Get-RemoteRunners $login | Where-Object id -eq $entry.runner_id).Count) { $null = Invoke-GitHubApi "orgs/$login/actions/runners/$($entry.runner_id)" -Method DELETE }
             $state.Remove($id); Save-State $state
@@ -330,13 +377,8 @@ function Uninstall-Runner {
 }
 if ($Command -ne 'library') {
     Initialize-Manager -Control
-    if ($Command -eq 'config') {
-        if ($CommandOptions.Count -eq 0) { $directory = '.' }
-        elseif ($CommandOptions.Count -le 2 -and ($CommandOptions[0] -ceq '--dir' -or $CommandOptions[0] -ceq '-d')) {
-            $directory = if ($CommandOptions.Count -eq 2) { $CommandOptions[1] } else { '.' }
-        }
-        else { throw 'Usage: ghr config [--dir [<PATH>] | -d [<PATH>]]' }
-    } elseif ($Command -eq 'logs') {
+    if ($Command -in @('config','runner')) { }
+    elseif ($Command -eq 'logs') {
         if ($CommandOptions.Count -gt 1 -or ($CommandOptions.Count -eq 1 -and $CommandOptions[0] -ne '-f')) { throw 'Usage: ghr logs [-f]' }
     } elseif ($CommandOptions.Count) { throw 'Invalid arguments. Run ghr help.' }
     switch ($Command) {
@@ -345,7 +387,8 @@ if ($Command -ne 'library') {
         'stop' { Stop-Installation }
         'restart' { Stop-Installation; Start-Installation }
         'logs' { Show-Logs -Track:($CommandOptions.Count -eq 1) }
-        'config' { Set-WorkDirectory $directory }
+        'config' { Invoke-Config $CommandOptions }
+        'runner' { Invoke-RunnerCount $CommandOptions }
         'uninstall' { Uninstall-Runner }
         'install-command' { Install-Command; Grant-DataDirectory $script:DataDir; Grant-DataDirectory $script:LogDir }
         'help' { Show-Usage }

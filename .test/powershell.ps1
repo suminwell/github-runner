@@ -150,7 +150,7 @@ try {
             }
             throw "Unexpected fake API endpoint: $Endpoint"
         }
-        function Register-Runner([string]$Login, [string]$Name) {
+        function Register-Runner([string]$Login, [string]$Name, [string]$Suffix = '') {
             if ($Login -eq 'race' -and -not $script:Raced) {
                 $script:Raced = $true
                 $script:Remote.race = @([pscustomobject]@{id=997;name=$Name;busy=$false})
@@ -158,8 +158,8 @@ try {
             }
             if (@($script:Remote[$Login] | Where-Object name -eq $Name).Count) { throw 'Name already exists.' }
             $runnerId = $script:NextId; $script:NextId++
-            $directory = Join-Path $script:Root "runner\$Login\app"
-            New-Item -ItemType Directory -Force -Path $directory, (Join-Path $script:Root "data\$Login") | Out-Null
+            $directory = Join-Path $script:Root "runner\$Login$Suffix\app"
+            New-Item -ItemType Directory -Force -Path $directory, (Join-Path $script:Root "data\$Login$Suffix") | Out-Null
             Write-Json (Join-Path $directory '.runner') @{agentId=$runnerId;agentName=$Name}
             $script:Remote[$Login] = @($script:Remote[$Login] | Where-Object { $null -ne $_ }) + @([pscustomobject]@{id=$runnerId; name=$Name; busy=$false; status='online'})
             if ($Login -eq 'partial') { throw 'Reported failure after registration.' }
@@ -191,6 +191,32 @@ try {
         Assert (-not (Test-Path (Join-Path $testRoot 'runner\alpha')) -and (Test-Path (Join-Path $testRoot 'runner\renamed\app'))) 'rename moves the program directory'
         Save-State @{}; $previous = $script:NextId; Invoke-Reconcile
         Assert ($script:NextId -eq $previous) 'registration recovered after state loss'
+        # runner_count: each organization gets that many runners, each with its own number,
+        # program directory and work directory; the first keeps the existing layout.
+        function Set-FixtureCount([int]$Count) {
+            $settings = Read-Json (Join-Path $testRoot 'conf\settings.json')
+            $settings | Add-Member -NotePropertyName runner_count -NotePropertyValue $Count -Force
+            Write-Json (Join-Path $testRoot 'conf\settings.json') $settings
+        }
+        # Half of 6 CPUs allows 3 runners per organization, whatever machine runs the tests.
+        $env:LOCAL_RUNNER_CPU_COUNT = '6'
+        Set-FixtureCount 3; Invoke-Reconcile
+        $state = Get-State
+        Assert ($state.ContainsKey('1.2') -and $state.ContainsKey('1.3') -and $state['1.3'].login -eq 'renamed') 'extra runners registered'
+        Assert (@($state['1'].runner_name, $state['1.2'].runner_name, $state['1.3'].runner_name | Select-Object -Unique).Count -eq 3) 'each runner has its own number'
+        Assert ((Test-Path (Join-Path $testRoot 'runner\renamed.2\app\.runner')) -and (Test-Path (Join-Path $testRoot 'data\renamed.3'))) 'each runner has its own directories'
+        Assert ($script:Remote.renamed.Count -eq 3) 'three registrations'
+        $previous = $script:NextId; Invoke-Reconcile
+        Assert ($script:NextId -eq $previous) 'runner count is idempotent'
+        # Lowering the count removes the extra runners once idle; a busy one finishes its job.
+        Write-AtomicText (Join-Path $testRoot 'data\renamed.2\keep') 'keep'
+        ($script:Remote.renamed | Where-Object id -eq $state['1.3'].runner_id).busy = $true
+        Set-FixtureCount 1; Invoke-Reconcile
+        $state = Get-State
+        Assert ($state.ContainsKey('1.3') -and -not $state.ContainsKey('1.2')) 'idle extra runner removed, busy one kept'
+        Assert (-not (Test-Path (Join-Path $testRoot 'runner\renamed.2')) -and (Test-Path (Join-Path $testRoot 'data\renamed.2\keep'))) 'program directory removed, work data kept'
+        $script:Remote.renamed | ForEach-Object { $_.busy = $false }; Invoke-Reconcile
+        Assert (-not (Get-State).ContainsKey('1.3') -and $script:Remote.renamed.Count -eq 1 -and $script:Remote.renamed[0].id -eq (Get-State)['1'].runner_id) 'busy extra runner removed once idle'
         $otherArch = if ($arch -eq 'x64') { 'arm64' } else { 'x64' }
         $script:Remote.beta = @([pscustomobject]@{id=999;name="local-windows-$otherArch-50";busy=$false})
         Reconcile-Organization '2' 'beta'
@@ -356,22 +382,43 @@ exit 0
             $deadline = [DateTime]::UtcNow.AddSeconds(15)
             while ($null -eq (Get-RecordedProcess (Join-Path $testRoot 'conf\manager.json')) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
             Assert ($script:TaskEnabled) 'start enables startup'
-            $defaultWork = Join-Path $fixture "default work $arch"
-            New-Item -ItemType Directory -Path $defaultWork | Out-Null
-            Push-Location $defaultWork
-            try {
-                foreach ($flag in @('--dir','-d')) {
-                    & $launcher config $flag
-                    Assert ($LASTEXITCODE -eq 0 -and (Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq $defaultWork) 'omitted path uses current directory'
-                }
-            } finally { Pop-Location }
-            & $launcher config -d "$newWork-short"
-            Assert ($LASTEXITCODE -eq 0 -and (Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq "$newWork-short") 'public -d syntax with spaces in path'
-            & $launcher config --dir $newWork
-            Assert ($LASTEXITCODE -eq 0 -and (Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq $newWork) 'public --dir space syntax with spaces in path'
+            # ghr config: full option names only; a new data directory must exist and be empty.
+            $shown = & $launcher config --data-dir
+            Assert ($LASTEXITCODE -eq 0 -and "$shown".Trim() -eq $testRoot) 'show data directory'
+            function Test-ConfigRejected([string[]]$Arguments) {
+                try { $null = Invoke-Native $script:PowerShell (@('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $testRoot 'bin\ghr.ps1'),'config') + $Arguments); return $false }
+                catch { return $true }
+            }
+            foreach ($arguments in @(@('-d',$newWork), @('--dir',$newWork), @('--runner-count','2'), @('--data-dir',$newWork,'extra'))) {
+                Assert (Test-ConfigRejected $arguments) "rejected ghr config $($arguments -join ' ')"
+            }
+            Assert ((Test-ConfigRejected @('--data-dir',$newWork)) -and -not (Test-Path $newWork)) 'missing data directory rejected'
+            New-Item -ItemType Directory -Path $newWork | Out-Null; Write-AtomicText (Join-Path $newWork 'other') 'other'
+            Assert (Test-ConfigRejected @('--data-dir',$newWork)) 'non-empty data directory rejected'
+            Remove-Item -LiteralPath (Join-Path $newWork 'other')
+            & $launcher config --data-dir $newWork
+            Assert ($LASTEXITCODE -eq 0 -and (Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq $newWork) 'public --data-dir syntax with spaces in path'
+            # ghr runner: one more or one fewer per organization, from 1 to half the CPUs.
+            function Test-RunnerRejected([string[]]$Arguments) {
+                try { $null = Invoke-Native $script:PowerShell (@('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $testRoot 'bin\ghr.ps1'),'runner') + $Arguments); return $false }
+                catch { $script:RunnerError = $_.Exception.Message; return $true }
+            }
+            $shown = & $launcher runner
+            Assert ($LASTEXITCODE -eq 0 -and "$shown".Trim() -ceq 'Runners per organization: 1 (maximum 3: 6 CPUs / 2)') 'show runner count and maximum'
+            Assert ((Test-RunnerRejected @('-s')) -and $script:RunnerError -match 'keeps at least 1') 'last runner kept'
+            $shown = & $launcher runner --add
+            Assert ($LASTEXITCODE -eq 0 -and "$shown" -match 'registers the new runners') 'add one runner'
+            $shown = & $launcher runner -a
+            Assert ($LASTEXITCODE -eq 0 -and "$shown" -match 'Runners per organization: 2 -> 3' -and (Read-Json (Join-Path $testRoot 'conf\settings.json')).runner_count -eq 3) 'add up to the maximum'
+            Assert ((Test-RunnerRejected @('--add')) -and $script:RunnerError -match 'maximum on this machine \(6 CPUs / 2\)') 'more than half the CPUs refused'
+            foreach ($arguments in @(@('--count'), @('-x'), @('-a','-s'), @('add'))) { Assert (Test-RunnerRejected $arguments) "rejected ghr runner $($arguments -join ' ')" }
+            $shown = & $launcher runner --sub
+            Assert ($LASTEXITCODE -eq 0 -and "$shown" -match 'once they are idle') 'remove one runner'
+            & $launcher runner -s | Out-Null
+            Assert ((Read-Json (Join-Path $testRoot 'conf\settings.json')).runner_count -eq 1) 'back to one runner'
             $failed = $false
-            try { $null = Invoke-Native $script:PowerShell @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $testRoot 'bin\ghr.ps1'),'config',"--dir=$newWork-equals") } catch { $failed = $true }
-            Assert ($failed -and -not (Test-Path "$newWork-equals")) 'removed --dir= syntax rejected without creating directory'
+            try { $null = Invoke-Native $script:PowerShell @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $testRoot 'bin\ghr.ps1'),'config',"--data-dir=$newWork-equals") } catch { $failed = $true }
+            Assert ($failed -and -not (Test-Path "$newWork-equals")) 'removed --data-dir= syntax rejected without creating directory'
             Assert ((Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq $newWork) 'invalid syntax leaves configuration unchanged'
             Assert ((Get-Content -Raw -Encoding UTF8 (Join-Path $testRoot 'conf\active-work-dir')) -eq $testRoot) 'configuration remains pending'
             Stop-Installation; Start-Installation
@@ -399,6 +446,7 @@ exit 0
             $script:LogDir = $previousLogDir
             Assert ($captured -match 'follow-marker' -and $captured -match 'rotation-marker') 'logs follow new lines across rotation'
         } else {
+            New-Item -ItemType Directory -Path $newWork | Out-Null
             Set-WorkDirectory $newWork
             Assert ($script:WorkDir -eq $testRoot) 'configuration does not change running settings'
             Assert ((Read-Json (Join-Path $testRoot 'conf\settings.json')).work_dir -eq $newWork) 'new directory saved'

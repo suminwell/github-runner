@@ -9,7 +9,7 @@ cleanup() {
     if declare -F stop_worker >/dev/null; then
         stop_record "$ROOT/conf/manager.pid" 2>/dev/null || :
         [ ! -f "$FIXTURE/follower.pid" ] || stop_record "$FIXTURE/follower.pid" 2>/dev/null || :
-        for id in 1 2 3 4 5 6 7; do stop_worker "$id" 2>/dev/null || :; done
+        for id in 1 1.2 1.3 2 3 4 5 6 7; do stop_worker "$id" 2>/dev/null || :; done
         for record in "$FIXTURE/watchdog-records/"*.pid; do stop_record "$record" 2>/dev/null || :; done
     fi
     if [ "${TEST_FAILED:-1}" = 0 ]; then rm -rf "$FIXTURE"; else printf "Retained fixture: %s\n" "$FIXTURE"; fi
@@ -118,6 +118,8 @@ INSTALL
         assert test "$(plutil -extract WorkingDirectory raw -o - "$FIXTURE/unit-check.plist")" = "$root"
     fi
 )
+# Half of 6 CPUs: up to 3 runners per organization, whatever machine runs the tests.
+export LOCAL_RUNNER_CPU_COUNT=6
 for arch in x64 arm64; do
     export LOCAL_RUNNER_ROOT=$FIXTURE/$arch
     ROOT=$LOCAL_RUNNER_ROOT
@@ -373,6 +375,36 @@ SLEEP
     assert record_alive "$ROOT/conf/workers/1.pid"
     stop_worker 1; rm -f "$ROOT/conf/retry/1"
     assert test ! -f "$ROOT/conf/workers/1.pid"
+    # runner_count: each organization gets that many runners, each with its own number,
+    # program directory and work directory; the first keeps the existing layout.
+    jq '.runner_count=3' "$ROOT/conf/settings.json" > "$ROOT/conf/settings.new"; mv "$ROOT/conf/settings.new" "$ROOT/conf/settings.json"
+    reconcile
+    assert jq -e '."1.2".login=="renamed" and ."1.3".login=="renamed"' "$ROOT/conf/organizations.json"
+    assert jq -e --arg p "$PREFIX" '[."1",."1.2",."1.3" | .runner_name] | (unique|length)==3 and all(.[]; test("^"+$p+"-[1-9][0-9]*$"))' "$ROOT/conf/organizations.json"
+    assert jq -e '.renamed|length==3' "$FIXTURE/remote.json"
+    assert jq -e --arg work "$ROOT/data/renamed.3" '.work==$work' "$ROOT/runner/renamed.3/app/.runner"
+    assert jq -e --arg work "$ROOT/data/renamed.2" '.work==$work' "$ROOT/runner/renamed.2/app/.runner"
+    previous=$(cat "$FIXTURE/next-id"); reconcile
+    assert test "$(cat "$FIXTURE/next-id")" = "$previous"
+    SUPERVISING=1 reconcile
+    assert record_alive "$ROOT/conf/workers/1.2.pid"
+    assert record_alive "$ROOT/conf/workers/1.3.pid"
+    for id in 1 1.2 1.3; do stop_worker "$id"; rm -f "$ROOT/conf/retry/$id"; done
+    # Lowering the count removes the extra runners once idle; a busy one finishes its job.
+    mkdir -p "$ROOT/data/renamed.2/repo"; printf keep > "$ROOT/data/renamed.2/repo/keep"
+    busy_id=$(jq -r '."1.3".runner_id' "$ROOT/conf/organizations.json")
+    jq --argjson id "$busy_id" '.renamed |= map(if .id==$id then .busy=true else . end)' "$FIXTURE/remote.json" > "$FIXTURE/remote.new"; mv "$FIXTURE/remote.new" "$FIXTURE/remote.json"
+    jq '.runner_count=1' "$ROOT/conf/settings.json" > "$ROOT/conf/settings.new"; mv "$ROOT/conf/settings.new" "$ROOT/conf/settings.json"
+    reconcile
+    assert jq -e 'has("1") and (has("1.2")|not) and has("1.3")' "$ROOT/conf/organizations.json"
+    assert test ! -e "$ROOT/runner/renamed.2"
+    assert test -f "$ROOT/data/renamed.2/repo/keep"
+    jq '.renamed |= map(.busy=false)' "$FIXTURE/remote.json" > "$FIXTURE/remote.new"; mv "$FIXTURE/remote.new" "$FIXTURE/remote.json"
+    reconcile
+    assert jq -e 'keys|all(test("^[0-9]+$"))' "$ROOT/conf/organizations.json"
+    assert jq -e --argjson id "$(jq '."1".runner_id' "$ROOT/conf/organizations.json")" '.renamed|length==1 and .[0].id==$id' "$FIXTURE/remote.json"
+    assert test ! -e "$ROOT/runner/renamed.3"
+    assert grep -F 'runner count lowered' "$ROOT/logs/service.log"
     # An organization without runner permission backs off instead of failing every poll.
     printf '[[{"state":"active","organization":{"id":1,"login":"renamed"}},{"state":"active","organization":{"id":8,"login":"denied"}}]]\n' > "$FIXTURE/memberships.json"
     reconcile
@@ -404,20 +436,44 @@ SLEEP
     command_main start
     for attempt in $(seq 1 100); do record_alive "$ROOT/conf/manager.pid" && break; sleep 0.1; done
     assert record_alive "$ROOT/conf/manager.pid"
-    default_work=$FIXTURE/"default work $arch"
-    mkdir -p "$default_work"
-    for flag in --dir -d; do
-        (cd "$default_work" && "$command_path" config "$flag")
-        assert jq -e --arg work "$default_work" '.work_dir==$work' "$ROOT/conf/settings.json"
-    done
+    # ghr config: full option names only; a new data directory must exist and be empty.
+    assert test "$("$command_path" config --data-dir)" = "$ROOT"
+    assert grep -Eqx "data-dir +$ROOT" <<< "$("$command_path" config)"
     new_work=$FIXTURE/"new work $arch"
-    "$command_path" config -d "$new_work-short"
-    assert jq -e --arg work "$new_work-short" '.work_dir==$work' "$ROOT/conf/settings.json"
-    "$command_path" config --dir "$new_work"
+    for arguments in "-d|$new_work" "--dir|$new_work" "--data-dir=$new_work|" "--runner-count|2" "--data-dir|$new_work|extra"; do
+        IFS='|' read -r -a parts <<< "$arguments"
+        if "$command_path" config "${parts[@]}" > /dev/null 2>&1; then echo "Accepted ghr config ${parts[*]}" >&2; exit 1; fi
+    done
+    if "$command_path" config --data-dir "$new_work" > /dev/null 2>&1; then echo 'Accepted a missing data directory' >&2; exit 1; fi
+    assert test ! -e "$new_work"
+    mkdir -p "$new_work"; touch "$new_work/.other"
+    if "$command_path" config --data-dir "$new_work" > /dev/null 2>&1; then echo 'Accepted a non-empty data directory' >&2; exit 1; fi
+    rm "$new_work/.other"
+    (cd "$new_work" && "$command_path" config --data-dir .)
     assert jq -e --arg work "$new_work" '.work_dir==$work' "$ROOT/conf/settings.json"
-    if "$command_path" config "--dir=$new_work-equals" > /dev/null 2>&1; then echo 'Accepted removed --dir= syntax' >&2; exit 1; fi
-    assert jq -e --arg work "$new_work" '.work_dir==$work' "$ROOT/conf/settings.json"
-    assert test ! -e "$new_work-equals"
+    assert test -d "$new_work/data" -a -d "$new_work/logs"
+    if "$command_path" config --data-dir "$new_work" > /dev/null 2>&1; then echo 'Accepted the current data directory again' >&2; exit 1; fi
+    # ghr runner: one more or one fewer per organization, from 1 to half the CPUs, without a
+    # restart; the running manager picks the new count up at once.
+    assert test "$("$command_path" runner)" = 'Runners per organization: 1 (maximum 3: 6 CPUs / 2)'
+    if "$command_path" runner -s 2> "$FIXTURE/runner-error"; then echo 'Removed the last runner' >&2; exit 1; fi
+    assert grep -Fq 'keeps at least 1' "$FIXTURE/runner-error"
+    output=$("$command_path" runner --add); assert grep -Fq 'registers the new runners within a few seconds' <<< "$output"
+    output=$("$command_path" runner -a); assert grep -Fqx 'Runners per organization: 2 -> 3' <<< "$output"
+    assert jq -e '.runner_count==3' "$ROOT/conf/settings.json"
+    if "$command_path" runner --add 2> "$FIXTURE/runner-error"; then echo 'Exceeded half the CPUs' >&2; exit 1; fi
+    assert grep -Fq 'Cannot add a runner: 3 per organization is the maximum on this machine (6 CPUs / 2).' "$FIXTURE/runner-error"
+    assert jq -e '.runner_count==3' "$ROOT/conf/settings.json"
+    for arguments in "--count" "-x" "-a|-s" "add" "--add|1"; do
+        IFS='|' read -r -a parts <<< "$arguments"
+        if "$command_path" runner "${parts[@]}" > /dev/null 2>&1; then echo "Accepted ghr runner ${parts[*]}" >&2; exit 1; fi
+    done
+    # A count saved on a larger machine is capped by this one.
+    assert test "$(LOCAL_RUNNER_CPU_COUNT=4 "$command_path" runner)" = 'Runners per organization: 2 (maximum 2: 4 CPUs / 2)'
+    assert test "$(LOCAL_RUNNER_CPU_COUNT=1 runner_count)" = 1
+    output=$("$command_path" runner --sub); assert grep -Fq 'removes the extra runners once they are idle' <<< "$output"
+    "$command_path" runner -s > /dev/null
+    assert jq -e '.runner_count==1' "$ROOT/conf/settings.json"
     assert test "$(cat "$ROOT/conf/active-work-dir")" = "$ROOT"
     (command_main restart)
     for attempt in $(seq 1 100); do
@@ -456,6 +512,7 @@ SLEEP
     assert test ! -e "$command_path"
     assert test -f "$ROOT/data/alpha/repo/keep"
     assert test -f "$new_work/logs/service.log"
+    assert jq -e '.renamed|length==0' "$FIXTURE/remote.json"
     assert jq -e '.beta|any(.[]; .id==999)' "$FIXTURE/remote.json"
     printf 'PASS %s/%s: discovery, numbered registration, pagination, race retry, migration, recovery, worker restart, cleanup\n' "$PLATFORM" "$arch"
 done

@@ -154,19 +154,19 @@ account_command() {
     fi
     case "$command" in
         config)
-            if [ "$#" = 0 ]; then requested=.;
-            elif [ "$#" -le 2 ] && { [ "$1" = --dir ] || [ "$1" = -d ]; }; then requested=${2:-.};
-            else usage >&2; return 2; fi
-            case "$requested" in *'
-'*) echo 'Newlines are not supported in paths.' >&2; return 1 ;; esac
-            account_work_directory "$requested" || return 1
-            absolute=$(cd "$requested" && pwd -P) || return 1
-            temporary=$(mktemp "$ROOT/conf/settings.XXXXXX") || return 1
-            if ! "$JQ" --arg directory "$absolute" '.work_dir=$directory' "$ROOT/conf/settings.json" > "$temporary" || \
-                ! chgrp "$account_gid" "$temporary" || ! chmod 640 "$temporary" || ! mv -f "$temporary" "$ROOT/conf/settings.json"; then
-                rm -f "$temporary"; return 1
-            fi
-            printf 'Work directory saved: %s\nRun ghr restart (or stop then start) to apply. Existing data and logs are not moved.\n' "$absolute" ;;
+            config_arguments "$@" || return $?
+            WORK_DIR=$("$JQ" -er .work_dir "$ROOT/conf/settings.json") || return 1
+            if [ -z "$CONFIG_VALUE" ]; then show_config "$@"; return 0; fi
+            config_directory "$CONFIG_VALUE" || return 1
+            account_work_directory "$CONFIG_DIRECTORY" || return 1
+            account_settings --arg directory "$CONFIG_DIRECTORY" '.work_dir=$directory' || return 1
+            config_saved ;;
+        runner)
+            runner_arguments "$@" || return $?
+            if [ -z "$RUNNER_CHANGE" ]; then show_runners; return 0; fi
+            runner_target || return 1
+            account_settings --argjson count "$RUNNER_TO" '.runner_count=$count' || return 1
+            runner_saved "$ROOT/conf/runtime/manager.pid" ;;
         logs) account_run /bin/bash "$ROOT/bin/ghr.sh" logs "$@" ;;
         wsl) [ "$#" = 1 ] && [ "$1" = setup ] || return 2; wsl_host setup ;;
         status|start|stop|restart|uninstall|--install-command|help|--help|-h)
@@ -194,6 +194,15 @@ account_command() {
             esac ;;
         *) usage >&2; return 2 ;;
     esac
+}
+# settings.json stays root-owned and readable by the runner account.
+account_settings() {
+    local temporary
+    temporary=$(mktemp "$ROOT/conf/settings.XXXXXX") || return 1
+    if ! "$JQ" "$@" "$ROOT/conf/settings.json" > "$temporary" || \
+        ! chgrp "$account_gid" "$temporary" || ! chmod 640 "$temporary" || ! mv -f "$temporary" "$ROOT/conf/settings.json"; then
+        rm -f "$temporary"; return 1
+    fi
 }
 account_stop() {
     native_service stop || return 1

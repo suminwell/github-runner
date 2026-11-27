@@ -1,11 +1,12 @@
 #!/bin/bash
-# One persistent organization runner, launched by service.sh.
+# One persistent runner of an organization, launched by service.sh.
 . "${1:?installation root required}/bin/service.sh"
 worker_loop() {
     local id=$1 log_file=${2:-} login process_id
-    safe_id "$id" || return 1
+    safe_key "$id" || return 1
     login=$("$JQ" -r --arg id "$id" '.[$id].login // empty' "$ROOT/conf/organizations.json")
     safe_org "$login" || return 1
+    login=$login$(key_suffix "$id")
     stop_record "$ROOT/conf/children/$id.pid"
     trap 'stop_record "$ROOT/conf/children/$id.pid"' EXIT
     trap 'exit 0' TERM INT
@@ -24,4 +25,4 @@ worker_loop() {
 umask 077
 # The log path comes from the manager: pending work_dir changes must not apply here.
 init control || exit 1
-worker_loop "${2:?organization ID required}" "${3:-}"
+worker_loop "${2:?runner key required}" "${3:-}"

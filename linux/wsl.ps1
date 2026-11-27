@@ -19,7 +19,11 @@ function Resolve-WindowsSid([string]$Account) {
     if ($Account -match '^S-1-') { return (New-Object Security.Principal.SecurityIdentifier($Account)).Value }
     return (New-Object Security.Principal.NTAccount($Account)).Translate([Security.Principal.SecurityIdentifier]).Value
 }
-function Quote-WslArgument([string]$Value) {
+# wsl.exe reads its own options from the raw command line and treats a quoted
+# "--distribution" as a command for the default shell, so only values that need quoting
+# (spaces, quotes, empty) are quoted. -Always gives the form earlier versions wrote.
+function Quote-WslArgument([string]$Value, [switch]$Always) {
+    if (-not $Always -and $Value -and $Value -notmatch '[\s"]') { return $Value }
     return '"' + [regex]::Replace([regex]::Replace($Value, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1') + '"'
 }
 function Initialize-WslHost {
@@ -41,6 +45,9 @@ function Initialize-WslHost {
     $script:TaskDescription = "github-runner WSL host: $key"
     $script:WslArguments = @('--distribution',$Distribution,'--user',$LinuxUser,'--exec','/bin/bash',"$script:InstallRoot/bin/wsl.sh")
     $script:HoldArguments = (($script:WslArguments + @('hold') | ForEach-Object { Quote-WslArgument $_ }) -join ' ')
+    # A task registered by an earlier version quoted every argument; it is still ours and
+    # setup rewrites it in the form above.
+    $script:LegacyHoldArguments = (($script:WslArguments + @('hold') | ForEach-Object { Quote-WslArgument $_ -Always }) -join ' ')
 }
 function Invoke-WslHelper([string[]]$Arguments, [ValidateRange(1,120)][int]$TimeoutSeconds = 120) {
     $info = New-Object Diagnostics.ProcessStartInfo
@@ -70,7 +77,7 @@ function Get-OwnedWslTask {
     if ($task) {
         $actions = @($task.Actions)
         if ($task.Description -cne $script:TaskDescription -or $actions.Count -ne 1 -or
-            $actions[0].Execute -ine $script:WslExe -or $actions[0].Arguments -cne $script:HoldArguments) {
+            $actions[0].Execute -ine $script:WslExe -or ($actions[0].Arguments -cne $script:HoldArguments -and $actions[0].Arguments -cne $script:LegacyHoldArguments)) {
             throw 'Another task owns this name or its action was changed; refusing to modify it.'
         }
         $principalSid = Resolve-WindowsSid $task.Principal.UserId
