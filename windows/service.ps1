@@ -91,7 +91,7 @@ function Invoke-Native([string]$Executable, [string[]]$Arguments, [int]$Timeout 
         # A descendant may inherit the output handles after the executable exits.
         # Bound pipe draining by the same deadline instead of waiting for EOF forever.
         if (-not $exited -or -not [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($output,$errors), $remaining)) {
-            if (-not $process.HasExited) { & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null }
+            if (-not $process.HasExited) { Stop-ProcessTree $process.Id }
             if ($exited) { throw 'Native command timed out. Output streams remained open after the process exited.' }
             throw 'Native command timed out.'
         }
@@ -137,6 +137,13 @@ function Get-RunnerCount {
     if ($count -is [ValueType] -and $count -ge 1) { return [int][Math]::Min((Get-MaxRunners), [Math]::Floor([double]$count)) }
     return 1
 }
+# taskkill reports a tree member that exits while it works ("could not be terminated") on
+# stderr. Windows PowerShell turns redirected native stderr into a terminating error under
+# ErrorActionPreference Stop, which aborted ghr stop and the manager; the tree is gone either way.
+function Stop-ProcessTree([int]$ProcessId) {
+    $previous = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { & taskkill.exe /PID $ProcessId /T /F 2>$null | Out-Null } finally { $ErrorActionPreference = $previous }
+}
 function Record-Process([string]$Path, $Process) {
     try { Write-Json $Path @{ process_id=$Process.Id; started=$Process.StartTime.ToUniversalTime().Ticks } } catch { }
 }
@@ -163,7 +170,7 @@ function Test-StoppableProcess([int]$ProcessId) {
 }
 function Stop-Record([string]$Path) {
     $process = Get-RecordedProcess $Path
-    if ($null -ne $process -and $process.Id -ne $PID -and (Test-StoppableProcess $process.Id)) { & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null }
+    if ($null -ne $process -and $process.Id -ne $PID -and (Test-StoppableProcess $process.Id)) { Stop-ProcessTree $process.Id }
     Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
 }
 function Open-ServiceLock([string]$Path, [int]$Seconds = 15) {
