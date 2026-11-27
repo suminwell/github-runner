@@ -85,7 +85,11 @@ result=0; /bin/bash "$ROOT/bin/ghr.sh" stop > "$FIXTURE/cli-error" 2>&1 || resul
 assert test "$result" != 0
 assert grep -q 'ghr stop failed' "$FIXTURE/cli-error"
 install_cli "$FIXTURE/commands/ghr"
+# The bound sleep inhibitor unit goes with the supervisor.
+touch "$FIXTURE/unit-awake.service"
 command_main uninstall
+assert grep -qx 'stop local-github-runner-fixture-awake.service' "$FIXTURE/systemctl-calls"
+assert test ! -e "$FIXTURE/unit-awake.service"
 trap cleanup EXIT
 assert test ! -e "$FIXTURE/commands/ghr"
 assert test ! -d "$ROOT/conf"

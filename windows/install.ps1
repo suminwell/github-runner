@@ -221,12 +221,21 @@ if (-not $settings.ContainsKey('work_dir')) { $settings.work_dir = $defaultWork 
 if (-not $settings.ContainsKey('poll_seconds')) { $settings.poll_seconds = 300 }
 if (-not $settings.ContainsKey('restart_seconds')) { $settings.restart_seconds = 30 }
 if (-not $settings.ContainsKey('organizations')) { $settings.organizations = @() }
+# Keeping Windows awake (also with the lid closed) while the manager runs is on by default;
+# LOCAL_RUNNER_PREVENT_SLEEP=no turns it off, and a re-run keeps the choice.
+switch -Regex ("$env:LOCAL_RUNNER_PREVENT_SLEEP") {
+    '^(yes|true|1)$' { $settings.prevent_sleep = $true; break }
+    '^(no|false|0)$' { $settings.prevent_sleep = $false; break }
+    '^$' { $settings.prevent_sleep = -not ($settings.ContainsKey('prevent_sleep') -and $settings.prevent_sleep -eq $false); break }
+    default { throw 'LOCAL_RUNNER_PREVENT_SLEEP must be yes or no.' }
+}
 [IO.File]::WriteAllText($settingsPath, ($settings | ConvertTo-Json -Depth 20), (New-Object Text.UTF8Encoding($false)))
 foreach ($trusted in @('github-token','settings.json')) { Protect-AdminFile (Join-Path $state $trusted) }
 Get-SourceFile 'windows/install.ps1' (Join-Path $bin 'install.ps1')
 Get-SourceFile 'windows/service.ps1' (Join-Path $bin 'service.ps1')
 Get-SourceFile 'windows/ghr.ps1' (Join-Path $bin 'ghr.ps1')
 Get-SourceFile 'windows/runner.ps1' (Join-Path $bin 'runner.ps1')
+Get-SourceFile 'windows/awake.ps1' (Join-Path $bin 'awake.ps1')
 & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'service.ps1') -Mode Prepare
 if ($LASTEXITCODE -ne 0) { throw 'Runner preparation failed.' }
 & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'ghr.ps1') install-command
@@ -236,7 +245,7 @@ $action = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument "-NoProf
 $boot = New-ScheduledTaskTrigger -AtStartup
 # Indefinite repetition also recovers clean exits; IgnoreNew keeps only one manager.
 $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
-$taskSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+$taskSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd -Priority 4
 $taskSettings.Enabled = -not (Test-Path (Join-Path $state 'stopped'))
 $localService = (New-Object Security.Principal.SecurityIdentifier('S-1-5-19')).Translate([Security.Principal.NTAccount]).Value
 $taskPrincipal = New-ScheduledTaskPrincipal -UserId $localService -LogonType ServiceAccount
@@ -244,6 +253,25 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($boot,$wat
 if (Test-Path (Join-Path $state 'stopped')) { Disable-ScheduledTask -TaskName $taskName | Out-Null }
 else { Enable-ScheduledTask -TaskName $taskName | Out-Null; Start-ScheduledTask -TaskName $taskName }
 foreach ($old in @('manager.py','windows-service.cs','LocalGitHubRunner.exe')) { Remove-Item (Join-Path $bin $old) -Force -ErrorAction SilentlyContinue }
+# A SYSTEM task keeps the machine awake while the manager runs (windows/awake.ps1). It runs
+# from an Administrator-only copy, also while the runner is stopped, so ghr start needs nothing else.
+$awakeTask = "$taskName-Awake"; $awakeStore = if ($env:LOCAL_RUNNER_AWAKE_STORE) { $env:LOCAL_RUNNER_AWAKE_STORE } else { Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'github-runner\awake' }
+$awakeScript = Join-Path (Join-Path $awakeStore 'bin') "$awakeTask.ps1"
+if (Get-ScheduledTask -TaskName $awakeTask -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $awakeTask -ErrorAction SilentlyContinue }
+if ($settings.prevent_sleep) {
+    & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $bin 'awake.ps1') -Action Prepare
+    if ($LASTEXITCODE -ne 0) { throw 'Sleep prevention setup failed.' }
+    Copy-Item -LiteralPath (Join-Path $bin 'awake.ps1') -Destination $awakeScript -Force
+    $awakeAction = New-ScheduledTaskAction -Execute $windowsPowerShell -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$awakeScript`" -Name $awakeTask -Record `"$(Join-Path $state 'manager.json')`""
+    $awakeSettings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -DontStopOnIdleEnd
+    $awakePrincipal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $awakeTask -Action $awakeAction -Trigger @($boot,$watchdog) -Settings $awakeSettings -Principal $awakePrincipal -Force | Out-Null
+    Start-ScheduledTask -TaskName $awakeTask
+    Write-Host 'Sleep prevention: on; Windows stays awake, also with the lid closed, while the runner service runs.'
+} else {
+    Unregister-ScheduledTask -TaskName $awakeTask -Confirm:$false -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $awakeScript) { & $windowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $awakeScript -Action Release -Name $awakeTask; Remove-Item -LiteralPath $awakeScript -Force }
+}
 Remove-Item (Join-Path $state 'python') -Recurse -Force -ErrorAction SilentlyContinue
 foreach ($file in @('install.ps1','service.ps1','ghr.ps1')) { Remove-Item (Join-Path $installRoot $file) -Force -ErrorAction SilentlyContinue }
 Write-Host "Installed $taskName in $installRoot"

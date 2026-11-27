@@ -5,6 +5,11 @@ set -o pipefail
 OS=macos
 SERVICE_FILE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 ROOT=${LOCAL_RUNNER_ROOT:-$(cd "$(dirname "$SERVICE_FILE")/.." && pwd)}
+# Where the installer puts launchd definitions and the root sleep guard (see sleep.sh).
+LAUNCH_DAEMONS=${LOCAL_RUNNER_LAUNCH_DAEMONS:-/Library/LaunchDaemons}
+SLEEP_HELPERS=${LOCAL_RUNNER_SLEEP_HELPERS:-/Library/PrivilegedHelperTools}
+SLEEP_OWNERS=${LOCAL_RUNNER_SLEEP_OWNERS:-/Library/Application Support/com.suminwell.github-runner/sleep}
+PMSET=${LOCAL_RUNNER_PMSET:-pmset}
 atomic() { local target=$1; cat > "$target.tmp.$$" && chmod 600 "$target.tmp.$$" && mv -f "$target.tmp.$$" "$target"; }
 # Rewrite JSON in place only when jq succeeds; a failed or truncated run keeps the original.
 jq_update() {
@@ -419,6 +424,20 @@ serve() {
         sleep 5 & wait $! || :
     done
 }
+# What the sleep guard is doing for this installation, for ghr status.
+sleep_prevention() {
+    local name owner
+    if [ "$("$JQ" -r '.prevent_sleep != false' "$ROOT/conf/settings.json")" = false ]; then
+        printf 'off (LOCAL_RUNNER_PREVENT_SLEEP=no)'; return 0
+    fi
+    owner=$("$JQ" -r '.owner_uid // empty' "$ROOT/conf/settings.json")
+    name=com.suminwell.github-runner.$owner.$ARCH
+    if [ ! -f "$LAUNCH_DAEMONS/$name.sleep.plist" ]; then printf 'not set up; run the installer again'
+    elif [ -f "$SLEEP_OWNERS/$name" ]; then printf 'on; stays awake with the lid closed'
+    elif [ "$( ("$PMSET" -g 2>/dev/null || :) | awk '$1=="SleepDisabled" {print $2}')" = 1 ]; then printf 'on; sleep is already disabled on this Mac'
+    elif [ "$1" = running ]; then printf 'starting'
+    else printf 'released while the manager is stopped'; fi
+}
 status() {
     local id login runner_id name active remote row local_status local_pid remote_name remote_status busy
     local failed=0 count=0 online=0 offline=0 missing=0 unknown=0 jobs=0 listening=0 restarting=0
@@ -432,6 +451,7 @@ status() {
     if [ "$manager" = running ]; then item Manager "running (PID $(head -n 1 "$ROOT/conf/manager.pid"))"
     elif [ -f "$ROOT/conf/stopped" ]; then item Manager 'stopped (run ghr start to resume)'
     else item Manager stopped; fi
+    item 'Sleep prevention' "$(sleep_prevention "$manager")"
     item 'Install directory' "$ROOT"
     item 'Runner directory' "$ROOT/runner"
     if [ -s "$ROOT/conf/active-work-dir" ]; then

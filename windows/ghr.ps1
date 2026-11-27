@@ -84,6 +84,7 @@ function Show-Status {
     if ($manager) { $items.Add(@('Manager', "running (PID $($manager.Id))")) }
     elseif (Test-Path (Join-Path $script:Root 'conf\stopped')) { $items.Add(@('Manager', 'stopped (run ghr start to resume)')) }
     else { $items.Add(@('Manager', 'stopped')) }
+    $items.Add(@('Sleep prevention', (Get-SleepPrevention ([bool]$manager))))
     $items.Add(@('Install directory', $script:Root))
     $items.Add(@('Runner directory', (Join-Path $script:Root 'runner')))
     $work = $script:WorkDir; $directoryState = 'configured; not started yet'
@@ -282,11 +283,37 @@ function Remove-InstallationTree([string]$Directory) {
         [IO.Directory]::Delete($Directory)
     } else { Remove-Item -LiteralPath $Directory -Force }
 }
+function Get-AwakeTaskName { return "LocalGitHubRunner-$($script:Settings.arch)-Awake" }
+function Get-AwakeStore { if ($env:LOCAL_RUNNER_AWAKE_STORE) { return $env:LOCAL_RUNNER_AWAKE_STORE }; return (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'github-runner\awake') }
+# Stop the guard, give the lid setting back unless another installation still holds it,
+# and delete the guard.
+function Remove-AwakeGuard {
+    $name = Get-AwakeTaskName; $script = Join-Path (Join-Path (Get-AwakeStore) 'bin') "$name.ps1"
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false
+    }
+    if (Test-Path -LiteralPath $script) {
+        & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoProfile -ExecutionPolicy Bypass -File $script -Action Release -Name $name
+        if ($LASTEXITCODE -ne 0) { throw 'Could not restore the lid setting; run ghr uninstall again.' }
+        Remove-Item -LiteralPath $script -Force
+    }
+}
+function Get-SleepPrevention([bool]$Running) {
+    if ($script:Settings.prevent_sleep -eq $false) { return 'off (LOCAL_RUNNER_PREVENT_SLEEP=no)' }
+    $name = Get-AwakeTaskName
+    $task = try { Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue } catch { $null }
+    if (-not $task) { return 'not set up; run the installer again' }
+    if (Test-Path -LiteralPath (Join-Path (Join-Path (Get-AwakeStore) 'owners') $name)) { return 'on; stays awake with the lid closed' }
+    if ($Running) { return 'starting' }
+    return 'released while the manager is stopped'
+}
 function Uninstall-Runner {
     Stop-Installation
     Unregister-Runners
     $task = Get-OwnedTask
     if ($task) { Unregister-ScheduledTask -TaskName $task.TaskName -Confirm:$false }
+    Remove-AwakeGuard
     $bin = Join-Path $script:Root 'bin'; $launcher = Join-Path $bin 'ghr.cmd'
     if ((Test-Path $launcher) -and (Get-Content -Raw -LiteralPath $launcher) -cne (Get-CommandText)) { throw 'Command ownership changed; refusing removal.' }
     if ($script:Settings.command_path_added) {

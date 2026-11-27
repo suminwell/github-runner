@@ -45,6 +45,7 @@ jobs:
           bash .test/systemd-control.sh
           bash .test/uninstall-recovery.sh
           bash .test/status.sh
+          bash .test/sleep.sh
       - name: Check PowerShell syntax
         if: runner.os == 'Windows'
         shell: powershell
@@ -69,3 +70,4 @@ jobs:
           ./.test/install-retry.ps1
           ./.test/uninstall-recovery.ps1
           ./.test/status.ps1
+          ./.test/awake.ps1

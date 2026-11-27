@@ -72,6 +72,36 @@ try {
             Assert ($script:RegisteredEnabled -eq (-not $stopped) -and $script:Enabled -eq (-not $stopped) -and $script:Started -eq (-not $stopped)) 'upgrade preserves stopped state at registration and startup'
         }
     }
+    # The SYSTEM sleep guard runs from an Administrator-only copy when prevent_sleep is on,
+    # and is removed, giving the lid setting back, when it is turned off.
+    $awake = Get-InstallerStage '$awakeTask = ' "Remove-Item (Join-Path `$state 'python')"
+    $env:LOCAL_RUNNER_AWAKE_STORE = Join-Path $fixture 'awake'
+    New-Item -ItemType Directory -Force -Path (Join-Path $env:LOCAL_RUNNER_AWAKE_STORE 'bin') | Out-Null
+    $bin = Join-Path $fixture 'awake-bin'; $state = Join-Path $fixture 'awake-state'
+    New-Item -ItemType Directory -Force -Path $bin | Out-Null; Copy-Item (Join-Path $repo 'windows/awake.ps1') (Join-Path $bin 'awake.ps1')
+    $script:Calls = @(); $script:Task = $null
+    function Invoke-FakePowerShell { $script:Calls += ,($args -join ' '); $global:LASTEXITCODE = 0 }
+    $windowsPowerShell = 'Invoke-FakePowerShell'
+    function Get-ScheduledTask { param($TaskName,$ErrorAction); return $script:Task }
+    function Stop-ScheduledTask { param($TaskName,$ErrorAction) }
+    function Unregister-ScheduledTask { param($TaskName,[switch]$Confirm,$ErrorAction); $script:Task = $null; $script:Unregistered = $TaskName }
+    function New-ScheduledTaskAction { param($Execute,$Argument); return [pscustomobject]@{Execute=$Execute;Arguments=$Argument} }
+    function New-ScheduledTaskSettingsSet { return [pscustomobject]@{} }
+    function New-TimeSpan { return [TimeSpan]::Zero }
+    function New-ScheduledTaskPrincipal { param($UserId,$LogonType,$RunLevel); return [pscustomobject]@{UserId=$UserId;RunLevel=$RunLevel} }
+    function Register-ScheduledTask { param($TaskName,$Action,$Trigger,$Settings,$Principal,[switch]$Force); $script:Task = [pscustomobject]@{TaskName=$TaskName;Action=$Action;Principal=$Principal} }
+    function Start-ScheduledTask { param($TaskName) }
+    $taskName = 'LocalGitHubRunner-x64'; $boot = $null; $watchdog = $null
+    $settings = @{prevent_sleep=$true}
+    . $awake
+    $copy = Join-Path (Join-Path $env:LOCAL_RUNNER_AWAKE_STORE 'bin') 'LocalGitHubRunner-x64-Awake.ps1'
+    Assert ($script:Task.TaskName -eq 'LocalGitHubRunner-x64-Awake' -and $script:Task.Principal.UserId -eq 'S-1-5-18') 'guard registered as SYSTEM'
+    Assert ($script:Task.Action.Arguments.Contains("-File `"$copy`"") -and $script:Task.Action.Arguments.Contains((Join-Path $state 'manager.json'))) 'guard runs the protected copy against the manager record'
+    Assert ((Test-Path $copy) -and ($script:Calls[0] -match '-Action Prepare')) 'store prepared before the copy'
+    $settings = @{prevent_sleep=$false}; $script:Calls = @()
+    . $awake
+    Assert ($script:Unregistered -eq 'LocalGitHubRunner-x64-Awake' -and -not (Test-Path $copy) -and ($script:Calls[0] -match '-Action Release -Name LocalGitHubRunner-x64-Awake')) 'turning it off releases and removes the guard'
+    Remove-Item Env:LOCAL_RUNNER_AWAKE_STORE
     $arch = 'x64'
     foreach ($oldState in @('.state','conf')) {
         $installRoot = Join-Path $fixture "legacy-$oldState"

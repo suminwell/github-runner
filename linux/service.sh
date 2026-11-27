@@ -6,6 +6,7 @@ OS=linux
 SERVICE_FILE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 ROOT=${LOCAL_RUNNER_ROOT:-$(cd "$(dirname "$SERVICE_FILE")/.." && pwd)}
 STATE=$ROOT/conf
+SYSTEMD_UNITS=${LOCAL_RUNNER_SYSTEMD_UNITS:-/etc/systemd/system}
 [ ! -f "$ROOT/conf/account.json" ] || STATE=$ROOT/conf/runtime
 atomic() { local target=$1; cat > "$target.tmp.$$" && chmod 600 "$target.tmp.$$" && mv -f "$target.tmp.$$" "$target"; }
 # Rewrite JSON in place only when jq succeeds; a failed or truncated run keeps the original.
@@ -478,6 +479,20 @@ serve() {
         sleep 5 & wait $! || :
     done
 }
+# What keeps this machine awake for the installation, for ghr status.
+sleep_prevention() {
+    local unit
+    if [ "$("$JQ" -r '.prevent_sleep != false' "$ROOT/conf/settings.json")" = false ]; then printf 'off (LOCAL_RUNNER_PREVENT_SLEEP=no)'; return 0; fi
+    if [ -n "${WSL_DISTRO_NAME:-}${WSL_INTEROP:-}" ] || grep -qi microsoft /proc/sys/kernel/osrelease 2>/dev/null; then
+        printf 'kept by the Windows host task (see WSL host task)'; return 0
+    fi
+    unit=local-github-runner-$("$JQ" -r '.owner_uid // empty' "$ROOT/conf/settings.json")-$ARCH-awake.service
+    if [ ! -f "$SYSTEMD_UNITS/$unit" ]; then
+        if command -v systemd-inhibit >/dev/null 2>&1; then printf 'not set up; run the installer again'; else printf 'unavailable (no systemd-inhibit)'; fi
+    elif systemctl is-active --quiet "$unit" 2>/dev/null; then printf 'on; sleep and lid-close suspend are blocked'
+    elif [ "$1" = running ]; then printf 'starting'
+    else printf 'released while the manager is stopped'; fi
+}
 status() {
     local id login runner_id name active remote row local_status local_pid remote_name remote_status busy
     local failed=0 count=0 online=0 offline=0 missing=0 unknown=0 jobs=0 listening=0 restarting=0
@@ -495,6 +510,7 @@ status() {
         item Runtime "Docker ($("$JQ" -r '.docker_image // "image not built"' "$ROOT/conf/settings.json")); jobs can control the host Docker daemon"
     fi
     [ ! -f "$ROOT/conf/account.json" ] || item 'Runner account' "ghrunner (UID $("$JQ" -r .owner_uid "$ROOT/conf/settings.json"))"
+    item 'Sleep prevention' "$(sleep_prevention "$manager")"
     item 'Install directory' "$ROOT"
     item 'Runner directory' "$ROOT/runner"
     if [ -s "$STATE/active-work-dir" ]; then

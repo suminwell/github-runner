@@ -63,6 +63,25 @@ Docker 需要 20.10.10 或更高版本。安装器在改动任何内容之前完
 
 `ghr status` 的第一个表格会显示 `Runtime  Docker (...)`。`ghr uninstall` 保留 Docker 和镜像，因为同一主机上的其他安装可能还在使用；确认不再需要后自行执行 `docker rmi local-github-runner:<架构>`。
 
+## 随时待命：不休眠、合盖继续运行
+
+安装后 Runner 随时在线等待派活。默认在管理服务运行期间阻止系统休眠，笔记本合上盖子也照常接活、网络不断开；服务停止后立即恢复原来的休眠设置，`ghr stop`、异常退出、强制结束、关机都适用，卸载或重装时同样恢复。`ghr status` 第一个表格的 `Sleep prevention` 一行显示当前状态。
+
+| 平台 | 做法 |
+| --- | --- |
+| macOS | root 守护进程 `com.suminwell.github-runner.<UID>.<架构>.sleep`（脚本 `macos/sleep.sh`，复制到 `/Library/PrivilegedHelperTools/` 并归 root 所有），管理进程运行时执行 `pmset disablesleep 1`。只有这个系统设置能在合盖后保持运行，`caffeinate` 这类断言合盖即失效 |
+| Linux | 与主服务绑定的 `<服务名>-awake.service`，以 root 持有 logind 的 `sleep:idle:handle-lid-switch` 阻止锁，随主服务启停；没有 systemd-logind 的系统（多数容器）不需要也不安装 |
+| Windows | SYSTEM 计划任务 `LocalGitHubRunner-<架构>-Awake`（脚本 `windows/awake.ps1`，复制到仅管理员可写的 `%ProgramData%\github-runner\awake\`），阻止空闲休眠，并把当前电源计划的合盖动作设为“不采取任何操作” |
+| WSL | `ghr wsl setup` 在 Windows 上安装同样的 SYSTEM 任务，跟随 WSL 宿主任务；宿主任务被移除后，它会自行恢复设置并删除自己 |
+
+- 如果机器原本就设置了不休眠（macOS 的 `SleepDisabled 1`、Windows 原本的合盖动作），停止后恢复为原值，不会被改掉。
+- 同一台机器上有多个安装时，只有最后一个停止的安装才恢复设置。
+- Runner 不会因空闲、改用电池或运行时间过长而被系统停止。Windows 计划任务改用普通优先级（默认的 7 会拖慢编译），macOS 的 launchd 不再对 Runner 做后台限流。
+
+合盖期间屏幕会关闭，但系统和网络保持运行。用电池时电量会持续消耗；装进包里时散热不好，可能过热，建议合盖跑任务时接上电源并保持通风。不需要这个功能时，用 `LOCAL_RUNNER_PREVENT_SLEEP=no` 重新执行安装命令即可关闭，之后重复安装会沿用这个选择，设为 `yes` 可重新开启；WSL 修改后还需执行一次 `ghr wsl setup`。
+
+不在此范围内：Windows 更新的自动重启（请在 Windows 更新里设置活动时间）、Linux 内存耗尽时内核的 OOM 终止（服务会自动重启，但不调整 OOM 优先级，以免与同机的数据库等服务争抢）。
+
 ## WSL2 安装与 Windows 未登录时启动
 
 支持 **WSL2 + systemd**，Runner 名称仍为 `local-linux-<架构>-<序号>`。WSL1 不支持。安装器会在申请 sudo、安装依赖和修改服务之前检查运行条件；不会自动覆盖 `/etc/wsl.conf` 或关闭其他 WSL 任务。
@@ -88,7 +107,7 @@ ghr wsl setup
 
 配置完成后仍在 WSL 内使用 `ghr`：`status` 显示 Windows 任务状态，`stop` 禁用该任务并停止 runner，`start`/`restart` 重新启用，`uninstall` 删除本安装拥有的任务。保活进程看到停止标记或安装被删除时自行退出，不调用 `wsl --shutdown`，不停止其他发行版。需要启用 WSL 的 Windows 程序互操作，首次设置时 `powershell.exe` 应在 WSL 的 PATH 中；若关闭了互操作或从缺少互操作环境的 SSH 会话执行，命令会明确报错供重试。
 
-只有 Linux 安装完成、尚未完成 Windows 配合设置时，安装命令会报告未完成，保留 Linux 安装供 `ghr wsl setup` 重试。Windows 密码变更后也使用此命令更新；仅有 PIN、没有可用账户密码，或组织策略禁止批处理登录时，应先处理账户条件。这里的自启不能恢复关机前被中断的 job，也不能让已关机或睡眠的主机继续接活。
+只有 Linux 安装完成、尚未完成 Windows 配合设置时，安装命令会报告未完成，保留 Linux 安装供 `ghr wsl setup` 重试。Windows 密码变更后也使用此命令更新；仅有 PIN、没有可用账户密码，或组织策略禁止批处理登录（“作为批处理作业登录”权限）时，应先处理账户条件。提权窗口内的失败原因会显示在 WSL 终端，提权窗口也会停住等待回车，便于对照。这里的自启不能恢复关机前被中断的 job，也不能让已关机的主机接活；休眠由上面的“随时待命”处理。
 
 **安全边界：**保活依赖 WSL 互操作，而互操作开启时，发行版内任何进程都能启动 `powershell.exe`、`cmd.exe` 等 Windows 程序，并以拥有该发行版的 Windows 账户身份运行，可访问该账户的 Windows 文件、凭据和网络权限。workflow job 也不例外，root 安装的专用账户 `ghrunner` 同样如此；保活任务还会让这一能力在 Windows 用户未登录时持续可用。因此 WSL runner 的隔离程度低于原生 Linux，只应运行受信任仓库的 workflow，并为该 Windows 账户只授予必要权限。WSL 默认追加到 PATH 的 `/mnt/...` Windows 目录不会写入 runner 服务的 PATH，避免 job 误用 Windows 版 `node`、`npm`、`git` 等工具；这只影响命令查找，不构成隔离。
 
@@ -199,7 +218,9 @@ linux/                          # macos 同结构；windows 对应 .ps1
 ├── install.sh                  # 安装、更新、开机托管
 ├── service.sh                  # 发现组织、注册、管理各组织进程
 ├── runner.sh                   # 单个组织的监听与退出重试
-└── ghr.sh                      # 用户管理命令
+├── ghr.sh                      # 用户管理命令
+└── sleep.sh                    # 仅 macOS：服务运行期间阻止休眠（root 守护进程）
+windows/awake.ps1               # Windows 和 WSL 宿主：服务运行期间阻止休眠（SYSTEM 任务）
 .test/                          # Shell / PowerShell 测试
 ```
 
@@ -280,6 +301,7 @@ bash .test/linux-compatibility.sh
 bash .test/systemd-control.sh
 bash .test/uninstall-recovery.sh
 bash .test/status.sh
+bash .test/sleep.sh
 # 需要 Docker；只在一次性 Linux 容器内创建账户并验证 root 安装
 bash .test/root-install.sh
 ```
@@ -290,6 +312,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .test/wsl.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .test/install-retry.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .test/uninstall-recovery.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .test/status.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .test/awake.ps1
 ```
 
 测试使用临时目录、假 GitHub API 和系统服务接口，验证注册编号、目录升级、真实子进程恢复、启停、配置生效、日志跟踪和卸载；不安装本机服务，不注册真实 Runner。CI 在 Linux、macOS、Windows 上运行，分别模拟 x64/arm64 配置。root 安装测试在一次性 Debian 容器内使用真实 UID、ACL 和进程，模拟 GitHub、官方 Runner 下载内容及 systemd 接口，覆盖中断重试、普通账户接活、配置保护、启停、重装和卸载。真实组织接单、两种原生硬件及系统重启恢复仍需集成验收。

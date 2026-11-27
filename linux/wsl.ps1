@@ -3,7 +3,8 @@ param(
     [string]$Distribution,
     [string]$LinuxUser,
     [string]$InstallRoot,
-    [string]$ExpectedWindowsSid
+    [string]$ExpectedWindowsSid,
+    [string]$ResultFile
 )
 $ErrorActionPreference = 'Stop'
 function Get-WindowsOwner {
@@ -106,7 +107,46 @@ function New-WslTaskDefinition($Scheduler) {
     $settings.RestartCount = 999; $settings.RestartInterval = 'PT1M'
     $settings.StartWhenAvailable = $true
     $settings.DisallowStartIfOnBatteries = $false; $settings.StopIfGoingOnBatteries = $false
+    $settings.Priority = 4 # normal; the Task Scheduler default (7) slows builds down
     return $definition
+}
+function Get-AwakeStore { return (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'github-runner\awake') }
+# A SYSTEM task (awake.ps1) keeps Windows awake, also with the lid closed, while the hold
+# task runs. It removes itself, restoring the lid setting, once the hold task is gone.
+function Register-WslAwake($Scheduler) {
+    $name = "$script:TaskName-Awake"
+    & $script:HostPowerShell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'awake.ps1') -Action Prepare
+    if ($LASTEXITCODE -ne 0) { throw 'Sleep prevention setup failed.' }
+    $copy = Join-Path (Join-Path (Get-AwakeStore) 'bin') "$name.ps1"
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'awake.ps1') -Destination $copy -Force
+    $definition = $Scheduler.NewTask(0)
+    $definition.RegistrationInfo.Description = "$script:TaskDescription (sleep prevention)"
+    $definition.Principal.UserId = 'S-1-5-18'
+    $definition.Principal.LogonType = 5 # TASK_LOGON_SERVICE_ACCOUNT
+    $definition.Principal.RunLevel = 1 # TASK_RUNLEVEL_HIGHEST
+    $action = $definition.Actions.Create(0)
+    $action.Path = $script:HostPowerShell
+    $action.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $copy + '" -Name ' + $name + ' -HoldTask ' + $script:TaskName
+    $boot = $definition.Triggers.Create(8); $boot.Enabled = $true
+    $watchdog = $definition.Triggers.Create(1)
+    $watchdog.StartBoundary = (Get-Date).AddMinutes(1).ToString('yyyy-MM-ddTHH:mm:ss')
+    $watchdog.Repetition.Interval = 'PT1M'; $watchdog.Enabled = $true
+    $settings = $definition.Settings
+    $settings.MultipleInstances = 2; $settings.ExecutionTimeLimit = 'PT0S'
+    $settings.RestartCount = 999; $settings.RestartInterval = 'PT1M'; $settings.StartWhenAvailable = $true
+    $settings.DisallowStartIfOnBatteries = $false; $settings.StopIfGoingOnBatteries = $false
+    # The owning account may read the task for ghr status in WSL.
+    $sddl = 'D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;GR;;;' + $script:Owner.Sid + ')'
+    $null = $Scheduler.GetFolder('\').RegisterTaskDefinition($name, $definition, 6, 'SYSTEM', $null, 5, $sddl)
+    Start-ScheduledTask -TaskName $name
+}
+function Unregister-WslAwake {
+    $name = "$script:TaskName-Awake"; $copy = Join-Path (Join-Path (Get-AwakeStore) 'bin') "$name.ps1"
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) { Stop-ScheduledTask -TaskName $name; Unregister-ScheduledTask -TaskName $name -Confirm:$false }
+    if (Test-Path -LiteralPath $copy) {
+        & $script:HostPowerShell -NoProfile -ExecutionPolicy Bypass -File $copy -Action Release -Name $name
+        Remove-Item -LiteralPath $copy -Force
+    }
 }
 function Register-WslTask([pscredential]$Credential, [bool]$Stopped) {
     $scheduler = Connect-WslScheduler
@@ -120,8 +160,19 @@ function Install-WslHost {
     if (-not (Test-HostAdministrator)) {
         # Enter from WSL; Windows UAC and account-password prompts stay on this machine.
         $arguments = @('-NoProfile','-ExecutionPolicy','Bypass','-File',$PSCommandPath,'-Action','Install','-Distribution',$Distribution,'-LinuxUser',$LinuxUser,'-InstallRoot',$script:InstallRoot,'-ExpectedWindowsSid',$script:Owner.Sid)
-        $process = Start-Process -FilePath $script:HostPowerShell -Verb RunAs -ArgumentList (($arguments | ForEach-Object { Quote-WslArgument $_ }) -join ' ') -Wait -PassThru
-        if ($process.ExitCode -ne 0) { throw 'Windows host setup failed or was cancelled. Run ghr wsl setup to retry.' }
+        # The elevated window reports back through this file; otherwise its error closes with it.
+        $result = Join-Path ([IO.Path]::GetTempPath()) ('ghr-wsl-setup-' + [Guid]::NewGuid().ToString('N') + '.txt')
+        $arguments += @('-ResultFile',$result)
+        try {
+            try { $process = Start-Process -FilePath $script:HostPowerShell -Verb RunAs -ArgumentList (($arguments | ForEach-Object { Quote-WslArgument $_ }) -join ' ') -Wait -PassThru }
+            catch { throw "Windows elevation was declined or failed: $($_.Exception.Message) Run ghr wsl setup to retry." }
+            $detail = if (Test-Path -LiteralPath $result) { (Get-Content -Raw -Encoding UTF8 -LiteralPath $result).Trim() } else { '' }
+            if ($process.ExitCode -ne 0) {
+                if (-not $detail) { $detail = 'the elevated window closed before reporting a result' }
+                throw "Windows host setup failed: $detail Run ghr wsl setup to retry."
+            }
+            if ($detail) { Write-Host $detail }
+        } finally { Remove-Item -LiteralPath $result -Force -ErrorAction SilentlyContinue }
         Write-Host 'Windows host setup finished. Run ghr status in WSL to check the task.'
         return
     }
@@ -141,11 +192,13 @@ function Install-WslHost {
         $null = Invoke-WslHelper @('link',$Distribution,$LinuxUser,$script:HostPowerShell,$script:TaskName)
         if ($description.stopped) { Disable-ScheduledTask -TaskName $script:TaskName | Out-Null }
         else { Start-ScheduledTask -TaskName $script:TaskName }
+        if ($description.prevent_sleep -eq $false) { Unregister-WslAwake } else { Register-WslAwake (Connect-WslScheduler) }
     } catch {
         if ($registered -and -not $existing) { Unregister-ScheduledTask -TaskName $script:TaskName -Confirm:$false }
         throw
     } finally { $credential = $null }
     Write-Host "WSL boot task installed: $script:TaskName"
+    if ($description.prevent_sleep -ne $false) { Write-Host 'Sleep prevention: on; Windows stays awake, also with the lid closed, while the runner runs.' }
     Write-Host 'Runs as the distribution owner before Windows login. Use ghr status/start/stop/restart/uninstall inside WSL.'
     Write-Host 'If the Windows password changes, run this setup again. Passwordless/PIN-only accounts need a usable account password.'
 }
@@ -156,7 +209,14 @@ function Invoke-WslHostAction([string]$RequestedAction) {
         throw 'WSL host task is missing. Run ghr wsl setup inside the owning distribution.'
     }
     switch ($RequestedAction) {
-        'Status' { Write-Host "WSL host task: $($task.State) ($script:TaskName)" }
+        'Status' {
+            Write-Host "WSL host task: $($task.State) ($script:TaskName)"
+            $awake = Get-ScheduledTask -TaskName "$script:TaskName-Awake" -ErrorAction SilentlyContinue
+            $held = Test-Path -LiteralPath (Join-Path (Join-Path (Get-AwakeStore) 'owners') "$script:TaskName-Awake")
+            if (-not $awake) { Write-Host 'Windows sleep prevention: off (run ghr wsl setup to turn it on)' }
+            elseif ($held) { Write-Host 'Windows sleep prevention: on; stays awake with the lid closed' }
+            else { Write-Host "Windows sleep prevention: $($awake.State); released while the runner is stopped" }
+        }
         'Start' { Enable-ScheduledTask -TaskName $script:TaskName | Out-Null; Start-ScheduledTask -TaskName $script:TaskName }
         # Linux writes conf/stopped before this call. The hold process exits on its own,
         # without terminating the distribution or other WSL sessions.
@@ -168,5 +228,20 @@ function Invoke-WslHostAction([string]$RequestedAction) {
 if ($Action -ne 'Library') {
     if ($env:OS -ne 'Windows_NT') { throw 'Run this helper in Windows PowerShell.' }
     Initialize-WslHost
-    if ($Action -eq 'Install') { Install-WslHost } else { Invoke-WslHostAction $Action }
+    if ($Action -ne 'Install') { Invoke-WslHostAction $Action }
+    elseif (-not $ResultFile) { Install-WslHost }
+    else {
+        # This is the elevated window: report the outcome to the WSL terminal, and keep the
+        # window open on failure so the message can be read here as well.
+        try {
+            Install-WslHost
+            [IO.File]::WriteAllText($ResultFile, '', (New-Object Text.UTF8Encoding($false)))
+        } catch {
+            $message = $_.Exception.Message
+            try { [IO.File]::WriteAllText($ResultFile, $message, (New-Object Text.UTF8Encoding($false))) } catch { }
+            Write-Host "Windows host setup failed: $message" -ForegroundColor Red
+            Read-Host 'Press Enter to close this window' | Out-Null
+            exit 1
+        }
+    }
 }

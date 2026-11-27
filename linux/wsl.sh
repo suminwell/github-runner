@@ -57,7 +57,7 @@ case "$command" in
         [ "$#" -eq 0 ] || exit 2
         stopped=false; [ ! -f "$ROOT/conf/stopped" ] || stopped=true
         "$JQ" -e --arg root "$ROOT" --arg user "$(id -un)" --argjson uid "$(id -u)" --argjson stopped "$stopped" \
-            'select(.platform=="linux" and .owner_uid==$uid) | {root:$root,user:$user,uid:$uid,arch:.arch,stopped:$stopped}' "$ROOT/conf/settings.json"
+            'select(.platform=="linux" and .owner_uid==$uid) | {root:$root,user:$user,uid:$uid,arch:.arch,stopped:$stopped,prevent_sleep:(.prevent_sleep != false)}' "$ROOT/conf/settings.json"
         ;;
     link)
         [ "$#" -eq 4 ] || exit 2

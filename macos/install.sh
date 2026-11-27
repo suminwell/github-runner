@@ -37,6 +37,7 @@ UMask=0077
 WantedBy=multi-user.target
 UNIT
 }
+# Interactive: launchd applies no background CPU/IO throttling to the runner and its jobs.
 launchd_plist() {
     cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -47,11 +48,44 @@ launchd_plist() {
 <key>ProgramArguments</key><array><string>/bin/bash</string><string>$(xml "$5/bin/service.sh")</string></array>
 <key>WorkingDirectory</key><string>$(xml "$5")</string>
 <key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><false/>
+<key>ProcessType</key><string>Interactive</string>
 <key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>90</integer>
 <key>EnvironmentVariables</key><dict><key>HOME</key><string>$(xml "$3")</string><key>PATH</key><string>$(xml "$4")</string></dict>
 <key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string>
 </dict></plist>
 PLIST
+}
+# The root daemon that keeps the Mac awake while the manager runs (macos/sleep.sh).
+sleep_plist() {
+    cat <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$(xml "$1")</string>
+<key>ProgramArguments</key><array><string>/bin/bash</string><string>$(xml "$2")</string><string>run</string><string>$(xml "$3")</string><string>$(xml "$4")</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>ThrottleInterval</key><integer>10</integer>
+<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string>
+</dict></plist>
+PLIST
+}
+# install: (re)start the guard from a root-owned copy; remove: let go of sleep and delete it.
+sleep_guard() {
+    guard_name=$service_name.sleep
+    guard_script=/Library/PrivilegedHelperTools/$guard_name.sh
+    guard_definition=/Library/LaunchDaemons/$guard_name.plist
+    # Booting the guard out releases sleep; its replacement takes it again within seconds.
+    sudo launchctl bootout "system/$guard_name" 2>/dev/null || :
+    if [ "$1" = install ]; then
+        sleep_plist "$guard_name" "$guard_script" "$root/conf/manager.pid" "$service_name" > "$definition"
+        sudo mkdir -p /Library/PrivilegedHelperTools
+        sudo install -o root -g wheel -m 755 "$root/bin/sleep.sh" "$guard_script"
+        sudo install -o root -g wheel -m 644 "$definition" "$guard_definition"
+        sudo launchctl enable "system/$guard_name"
+        sudo launchctl bootstrap system "$guard_definition"
+    else
+        if [ -f "$guard_script" ]; then sudo /bin/bash "$guard_script" release "$service_name"; fi
+        sudo rm -f "$guard_script" "$guard_definition"
+    fi
 }
 fetch() {
     if [ -n "${LOCAL_RUNNER_SOURCE_DIR:-}" ]; then cp "$LOCAL_RUNNER_SOURCE_DIR/$1" "$2.new";
@@ -227,20 +261,29 @@ install_main() {
         echo 'The GitHub token lacks the admin:org scope required to register organization runners. Use a token with admin:org and run the installer again.' >&2; exit 1;
     }
     chmod 600 "$root/conf/github-token"
+    # Keeping the Mac awake (also with the lid closed) while the manager runs is on by
+    # default; LOCAL_RUNNER_PREVENT_SLEEP=no turns it off, and a re-run keeps the choice.
+    case "${LOCAL_RUNNER_PREVENT_SLEEP:-}" in
+        yes|true|1) prevent_sleep=true ;; no|false|0) prevent_sleep=false ;;
+        '') prevent_sleep=$("$jq_path" -r 'if .prevent_sleep == false then "false" else "true" end' "$root/conf/settings.json" 2>/dev/null || echo true) ;;
+        *) echo 'LOCAL_RUNNER_PREVENT_SLEEP must be yes or no.' >&2; exit 1 ;;
+    esac
     printf '%s\n' "$gh_path" > "$root/conf/gh-path"
     printf '%s\n' "$jq_path" > "$root/conf/jq-path"
     default_work=$(pwd -P)
     [ ! -f "$root/conf/settings.json" ] || default_work=$root
     [ -f "$root/conf/settings.json" ] || printf '{}\n' > "$root/conf/settings.json"
     "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" --argjson owner_uid "$(id -u)" --arg default_work "$default_work" \
-        '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
+        --argjson prevent_sleep "$prevent_sleep" \
+        '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.prevent_sleep=$prevent_sleep|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
         "$root/conf/settings.json" > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
     fetch "$platform/install.sh" "$root/bin/install.sh"
     fetch "$platform/service.sh" "$root/bin/service.sh"
     fetch "$platform/ghr.sh" "$root/bin/ghr.sh"
     fetch "$platform/runner.sh" "$root/bin/runner.sh"
-    chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh"
+    fetch "$platform/sleep.sh" "$root/bin/sleep.sh"
+    chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh" "$root/bin/sleep.sh"
     /bin/bash "$root/bin/service.sh" prepare
     if [ "$platform" = linux ]; then sudo /bin/bash "$root/bin/.cache/package/bin/installdependencies.sh"; fi
     /bin/bash "$root/bin/ghr.sh" --install-command
@@ -272,6 +315,11 @@ install_main() {
             sudo launchctl bootstrap system "/Library/LaunchDaemons/$service_name.plist"
             sudo launchctl print "system/$service_name" >/dev/null
         fi
+        # The guard runs even while the service is stopped, so ghr start needs no sudo for it.
+        if [ "$prevent_sleep" = true ]; then
+            sleep_guard install
+            printf 'Sleep prevention: on; this Mac stays awake, also with the lid closed, while the runner service runs.\n'
+        else sleep_guard remove; fi
     fi
     rm -f "$definition" "$root/install.sh" "$root/service.sh" "$root/ghr.sh"
     printf '\nInstalled %s\n\n' "$service_name"

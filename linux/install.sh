@@ -59,6 +59,23 @@ UMask=0077
 WantedBy=multi-user.target
 UNIT
 }
+# Bound to the supervisor unit: holds a logind inhibitor (sleep, idle and lid-close
+# suspend) while it runs, and stops with it. It runs as root, which logind always allows.
+awake_unit() {
+    cat <<UNIT
+[Unit]
+Description=Keep this machine awake while $1 runs
+BindsTo=$1
+After=$1
+[Service]
+Type=simple
+ExecStart=$2 --what=sleep:idle:handle-lid-switch --who=github-runner "--why=GitHub runner is waiting for jobs" --mode=block $3 infinity
+Restart=on-failure
+RestartSec=60
+[Install]
+WantedBy=$1
+UNIT
+}
 launchd_plist() {
     cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -412,13 +429,20 @@ install_main() {
         echo 'The GitHub token lacks the admin:org scope required to register organization runners. Use a token with admin:org and run the installer again.' >&2; exit 1;
     }
     chmod 600 "$root/conf/github-token"
+    # Keeping the machine awake (also with the lid closed) while the supervisor runs is on by
+    # default; LOCAL_RUNNER_PREVENT_SLEEP=no turns it off, and a re-run keeps the choice.
+    case "${LOCAL_RUNNER_PREVENT_SLEEP:-}" in
+        yes|true|1) prevent_sleep=true ;; no|false|0) prevent_sleep=false ;;
+        '') prevent_sleep=$("$jq_path" -r 'if .prevent_sleep == false then "false" else "true" end' "$root/conf/settings.json" 2>/dev/null || echo true) ;;
+        *) echo 'LOCAL_RUNNER_PREVENT_SLEEP must be yes or no.' >&2; exit 1 ;;
+    esac
     printf '%s\n' "$gh_path" > "$root/conf/gh-path"
     printf '%s\n' "$jq_path" > "$root/conf/jq-path"
     default_work=$(pwd -P)
     [ ! -f "$root/conf/settings.json" ] || default_work=$root
     [ -f "$root/conf/settings.json" ] || printf '{}\n' > "$root/conf/settings.json"
-    "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" --argjson owner_uid "${runtime_uid:-$(id -u)}" --arg default_work "$default_work" --arg runtime "$runtime" \
-        '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.runtime=$runtime|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
+    "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" --argjson owner_uid "${runtime_uid:-$(id -u)}" --arg default_work "$default_work" --arg runtime "$runtime" --argjson prevent_sleep "$prevent_sleep" \
+        '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.runtime=$runtime|.prevent_sleep=$prevent_sleep|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
         "$root/conf/settings.json" > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
     if $root_install; then fetch linux/account.sh "$root/bin/account.sh"; fi
@@ -428,6 +452,8 @@ install_main() {
     fetch "$platform/runner.sh" "$root/bin/runner.sh"
     fetch 'linux/wsl.sh' "$root/bin/wsl.sh"
     fetch 'linux/wsl.ps1' "$root/bin/wsl.ps1"
+    # The Windows side of sleep prevention for WSL hosts, shared with native Windows.
+    fetch 'windows/awake.ps1' "$root/bin/awake.ps1"
     fetch linux/docker.sh "$root/bin/docker.sh"
     fetch linux/Dockerfile "$root/bin/Dockerfile"
     chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh" "$root/bin/docker.sh"
@@ -484,6 +510,21 @@ install_main() {
             privileged systemctl enable "$service_name"
             privileged systemctl restart "$service_name"
             privileged systemctl is-active --quiet "$service_name"
+        fi
+        # WSL is kept awake by its Windows host task instead (ghr wsl setup).
+        awake_name=${service_name%.service}-awake.service
+        inhibit_path=$(command -v systemd-inhibit || :); sleep_path=$(command -v sleep || :)
+        if [ "$prevent_sleep" = true ] && ! is_wsl && [ -n "$inhibit_path" ] && [ -n "$sleep_path" ] && [ -S /run/dbus/system_bus_socket ]; then
+            awake_unit "$service_name" "$inhibit_path" "$sleep_path" > "$definition"
+            privileged install -m 644 "$definition" "/etc/systemd/system/$awake_name"
+            privileged systemctl daemon-reload
+            privileged systemctl enable "$awake_name"
+            [ -f "$root/conf/stopped" ] || privileged systemctl restart "$awake_name"
+            printf 'Sleep prevention: on; this machine stays awake, also with the lid closed, while the runner service runs.\n'
+        elif [ -f "/etc/systemd/system/$awake_name" ]; then
+            privileged systemctl disable "$awake_name" || :; privileged systemctl stop "$awake_name" || :
+            privileged rm -f "/etc/systemd/system/$awake_name"
+            privileged systemctl daemon-reload
         fi
     else
         service_name=com.suminwell.github-runner.$user_id.$arch

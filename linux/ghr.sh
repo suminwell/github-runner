@@ -40,7 +40,7 @@ install_cli() {
 service_identity() {
     OWNER_UID=$("$JQ" -er '.owner_uid' "$ROOT/conf/settings.json") || return 1
     safe_id "$OWNER_UID" || return 1
-    if [ "$OS" = linux ]; then SERVICE_NAME=local-github-runner-$OWNER_UID-$ARCH.service; DEFINITION=/etc/systemd/system/$SERVICE_NAME;
+    if [ "$OS" = linux ]; then SERVICE_NAME=local-github-runner-$OWNER_UID-$ARCH.service; DEFINITION=$SYSTEMD_UNITS/$SERVICE_NAME;
     else SERVICE_NAME=com.suminwell.github-runner.$OWNER_UID.$ARCH; DEFINITION=/Library/LaunchDaemons/$SERVICE_NAME.plist; fi
 }
 systemd_property() (
@@ -69,7 +69,14 @@ native_service() {
         elif [ "$action" = start ]; then printf 'Service definition missing; re-run the installer.\n' >&2; return 1
         elif systemctl is-active --quiet "$SERVICE_NAME"; then printf 'Service ownership cannot be verified.\n' >&2; return 1
         fi
-        if [ "$action" = remove ]; then privileged rm -f "$DEFINITION" && privileged systemctl daemon-reload || return 1; fi
+        if [ "$action" = remove ]; then
+            # The sleep inhibitor unit is bound to the supervisor and is removed with it.
+            if [ -f "${DEFINITION%.service}-awake.service" ]; then
+                privileged systemctl disable "${SERVICE_NAME%.service}-awake.service" || :; privileged systemctl stop "${SERVICE_NAME%.service}-awake.service" || :
+                privileged rm -f "${DEFINITION%.service}-awake.service" || return 1
+            fi
+            privileged rm -f "$DEFINITION" && privileged systemctl daemon-reload || return 1
+        fi
     else
         if [ -f "$DEFINITION" ]; then
             command_path=$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$DEFINITION") || return 1

@@ -21,7 +21,13 @@ flock() { return 99; }
 sudo() { printf '%s\n' "$*" >> "$INSTALL_HOME/host-calls"; }
 stop_installed_service() { printf 'stop\n' >> "$INSTALL_HOME/host-calls"; }
 # Only the systemd-presence predicate is simulated; no host service is touched.
-[() { if builtin [ "$#" -eq 3 ] && builtin [ "$1" = -d ] && builtin [ "$2" = /run/systemd/system ]; then return 0; fi; builtin [ "$@"; }
+[() {
+    if builtin [ "$#" -eq 3 ] && builtin [ "$1" = -d ] && builtin [ "$2" = /run/systemd/system ]; then return 0; fi
+    if builtin [ "$#" -eq 3 ] && builtin [ "$1" = -S ] && builtin [ "$2" = /run/dbus/system_bus_socket ]; then builtin [ -n "${INSTALL_LOGIND:-}" ]; return; fi
+    builtin [ "$@"
+}
+# A logind inhibitor is offered only where a scenario says logind exists.
+systemd-inhibit() { :; }
 gh() {
     case "$1 ${2:-}" in
         '--version ') if [ "$INSTALL_FAILURE" = download ]; then echo 'gh version 1.0.0'; else echo 'gh version 2.70.0'; fi ;;
@@ -72,7 +78,7 @@ for target in linux macos; do
         : > "$home/host-calls"
         run_install "$target" none "$home" "$second" 0
         assert test -f "$home/$target/conf/stopped"
-        if grep -Eq 'systemctl (enable|restart)|launchctl (enable|bootstrap|print)' "$home/host-calls"; then echo 'Stopped installation resumed during upgrade' >&2; exit 1; fi
+        if grep -v '\.sleep' "$home/host-calls" | grep -Eq 'systemctl (enable|restart)|launchctl (enable|bootstrap|print)'; then echo 'Stopped installation resumed during upgrade' >&2; exit 1; fi
     done
     for legacy_state in .state conf; do
         home=$FIXTURE/$target-legacy-$legacy_state
@@ -82,7 +88,7 @@ for target in linux macos; do
         run_install "$target" none "$home" "$FIXTURE" 0
         assert test -f "$home/$target/conf/stopped"
         assert jq -e --arg work "$home/work" '.work_dir==$work' "$home/$target/conf/settings.json"
-        if grep -Eq 'systemctl (enable|restart)|launchctl (enable|bootstrap|print)' "$home/host-calls"; then echo 'Stopped legacy installation resumed during upgrade' >&2; exit 1; fi
+        if grep -v '\.sleep' "$home/host-calls" | grep -Eq 'systemctl (enable|restart)|launchctl (enable|bootstrap|print)'; then echo 'Stopped legacy installation resumed during upgrade' >&2; exit 1; fi
     done
     home=$FIXTURE/$target-unrelated
     mkdir -p "$home/$target/bin"
@@ -125,6 +131,35 @@ for target in linux macos; do
     run_install "$target" none "$home" "$FIXTURE/scope-$target" 0
     assert test ! -e "$home/$target/conf/backoff/42"
 done
+# macOS installs the root sleep guard from a root-owned copy by default, keeps the choice
+# on re-runs, and removes it (releasing sleep) when LOCAL_RUNNER_PREVENT_SLEEP=no.
+home=$FIXTURE/macos-scope-ok; guard=com.suminwell.github-runner.1001.x64.sleep
+assert grep -q "^install -o root -g wheel -m 755 $home/macos/bin/sleep.sh /Library/PrivilegedHelperTools/$guard.sh$" "$home/host-calls"
+assert grep -q "^launchctl bootstrap system /Library/LaunchDaemons/$guard.plist$" "$home/host-calls"
+assert jq -e '.prevent_sleep == true' "$home/macos/conf/settings.json"
+: > "$home/host-calls"
+LOCAL_RUNNER_PREVENT_SLEEP=no run_install macos none "$home" "$FIXTURE/scope-macos" 0
+assert jq -e '.prevent_sleep == false' "$home/macos/conf/settings.json"
+assert grep -q "^rm -f /Library/PrivilegedHelperTools/$guard.sh /Library/LaunchDaemons/$guard.plist$" "$home/host-calls"
+if grep -q "launchctl bootstrap system /Library/LaunchDaemons/$guard.plist" "$home/host-calls"; then echo 'Started the sleep guard after it was turned off' >&2; exit 1; fi
+: > "$home/host-calls"
+run_install macos none "$home" "$FIXTURE/scope-macos" 0
+assert jq -e '.prevent_sleep == false' "$home/macos/conf/settings.json"
+LOCAL_RUNNER_PREVENT_SLEEP=maybe run_install macos none "$home" "$FIXTURE/scope-macos" 1
+assert grep -q 'LOCAL_RUNNER_PREVENT_SLEEP must be yes or no' "$home/output"
+# Linux binds a root logind inhibitor unit to the supervisor where logind is available.
+home=$FIXTURE/linux-scope-ok; : > "$home/host-calls"
+INSTALL_LOGIND=1 run_install linux none "$home" "$FIXTURE/scope-linux" 0
+assert grep -q '^install -m 644 .* /etc/systemd/system/local-github-runner-1001-x64-awake.service$' "$home/host-calls"
+assert grep -q '^systemctl enable local-github-runner-1001-x64-awake.service$' "$home/host-calls"
+assert jq -e '.prevent_sleep == true' "$home/linux/conf/settings.json"
+: > "$home/host-calls"
+INSTALL_LOGIND=1 LOCAL_RUNNER_PREVENT_SLEEP=no run_install linux none "$home" "$FIXTURE/scope-linux" 0
+if grep -q 'awake' "$home/host-calls"; then echo 'Installed the inhibitor after it was turned off' >&2; exit 1; fi
+assert jq -e '.prevent_sleep == false' "$home/linux/conf/settings.json"
+: > "$home/host-calls"
+LOCAL_RUNNER_PREVENT_SLEEP=yes run_install linux none "$home" "$FIXTURE/scope-linux" 0
+if grep -q 'awake' "$home/host-calls"; then echo 'Installed the inhibitor without logind' >&2; exit 1; fi
 # A dropped GitHub connection is retried; a persistent failure explains how to resume.
 (
     sed '/^if \[ -t 0 \]/,$d' "$REPO/linux/install.sh" > "$FIXTURE/helpers.sh"

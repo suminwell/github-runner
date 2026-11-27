@@ -13,6 +13,7 @@ if ($env:OS -eq 'Windows_NT') {
     Assert ($definition.Triggers.Item(1).Type -eq 8 -and $definition.Triggers.Item(2).Repetition.Interval -eq 'PT1M') 'native boot trigger and minute watchdog'
     Assert (-not $definition.Triggers.Item(2).Repetition.Duration) 'native watchdog repeats indefinitely'
     Assert ($definition.Settings.MultipleInstances -eq 2 -and $definition.Settings.ExecutionTimeLimit -eq 'PT0S') 'native instance and duration settings'
+    Assert ($definition.Settings.Priority -eq 4 -and -not $definition.Settings.StopIfGoingOnBatteries) 'normal priority, kept on battery'
     $name = 'LocalGitHubRunner-WSL-Test-' + [Guid]::NewGuid().ToString('N')
     $definition.Settings.Enabled = $false
     foreach ($trigger in $definition.Triggers) { $trigger.Enabled = $false }
@@ -55,22 +56,31 @@ function Register-WslTask([pscredential]$Credential, [bool]$Stopped) {
     $script:Enabled = -not $Stopped
 }
 function Invoke-WslHelper([string[]]$Arguments) {
-    if ($Arguments[0] -eq 'describe') { return (@{root='/home/runner/Runner Work';user='runner';uid=1000;arch='arm64';stopped=$script:LinuxStopped} | ConvertTo-Json) }
+    if ($Arguments[0] -eq 'describe') { return (@{root='/home/runner/Runner Work';user='runner';uid=1000;arch='arm64';stopped=$script:LinuxStopped;prevent_sleep=$script:PreventSleep} | ConvertTo-Json) }
     Assert ($Arguments[0] -eq 'link' -and $Arguments[1] -eq 'Ubuntu Work' -and $Arguments[4] -eq $script:TaskName) 'task metadata linked without password'
     Assert (-not (($Arguments -join ' ') -match 'fake-password')) 'no password sent into Linux'
     $script:Linked = $true
 }
 function Start-ScheduledTask { param($TaskName); $script:Started = $true }
+# The SYSTEM sleep guard follows the Linux prevent_sleep setting.
+$script:PreventSleep = $true; $script:Awake = $null
+function Connect-WslScheduler { return $null }
+function Register-WslAwake($Scheduler) { $script:Awake = 'registered' }
+function Unregister-WslAwake { $script:Awake = 'removed' }
 function Enable-ScheduledTask { param($TaskName); $script:Enabled = $true }
 function Disable-ScheduledTask { param($TaskName); $script:Enabled = $false }
 function Unregister-ScheduledTask { param($TaskName,[switch]$Confirm); $script:SavedTask = $null }
 Install-WslHost
 Assert ($script:Linked -and $script:Started) 'setup links and starts task'
+Assert ($script:Awake -eq 'registered') 'sleep guard registered by default'
 Assert ($script:SavedTask.Principal.LogonType -eq 'Password' -and $script:SavedTask.Principal.RunLevel -eq 'Limited') 'before-login startup with limited privileges'
 Invoke-WslHostAction Stop
 $script:LinuxStopped = $true; $script:Started = $false
 Install-WslHost
 Assert (-not $script:Enabled -and -not $script:Started) 'credential refresh preserves stopped state'
+$script:PreventSleep = $false; Install-WslHost
+Assert ($script:Awake -eq 'removed') 'sleep guard removed when prevent_sleep is off'
+$script:PreventSleep = $true
 $script:LinuxStopped = $false
 Invoke-WslHostAction Stop; Assert (-not $script:Enabled) 'stop disables startup'
 Invoke-WslHostAction Start; Assert $script:Enabled 'start restores startup'
@@ -90,6 +100,19 @@ function Start-Process {
     return [pscustomobject]@{ExitCode=0}
 }
 Install-WslHost
+# A failure inside the elevated window reaches the WSL terminal with its message.
+function Start-Process {
+    param($FilePath,$Verb,$ArgumentList,[switch]$Wait,[switch]$PassThru)
+    $file = [regex]::Match($ArgumentList, '"-ResultFile" "([^"]+)"').Groups[1].Value
+    Assert $file 'elevated window receives a result file'
+    [IO.File]::WriteAllText($file, 'The user name or password is incorrect.')
+    return [pscustomobject]@{ExitCode=1}
+}
+$message = ''; try { Install-WslHost } catch { $message = $_.Exception.Message }
+Assert ($message -match 'The user name or password is incorrect\.' -and $message -match 'ghr wsl setup') "elevated error reported: $message"
+function Start-Process { param($FilePath,$Verb,$ArgumentList,[switch]$Wait,[switch]$PassThru); throw 'The operation was canceled by the user.' }
+$message = ''; try { Install-WslHost } catch { $message = $_.Exception.Message }
+Assert ($message -match 'declined' -and $message -match 'canceled by the user') "declined elevation reported: $message"
 $ExpectedWindowsSid = 'S-1-5-21-1-2-3-1002'
 $failed = $false; try { Initialize-WslHost } catch { $failed = $true }
 Assert $failed 'elevation must not switch the Windows distribution owner'

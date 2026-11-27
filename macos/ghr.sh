@@ -33,7 +33,7 @@ service_identity() {
     OWNER_UID=$("$JQ" -er '.owner_uid' "$ROOT/conf/settings.json") || return 1
     safe_id "$OWNER_UID" || return 1
     if [ "$OS" = linux ]; then SERVICE_NAME=local-github-runner-$OWNER_UID-$ARCH.service; DEFINITION=/etc/systemd/system/$SERVICE_NAME;
-    else SERVICE_NAME=com.suminwell.github-runner.$OWNER_UID.$ARCH; DEFINITION=/Library/LaunchDaemons/$SERVICE_NAME.plist; fi
+    else SERVICE_NAME=com.suminwell.github-runner.$OWNER_UID.$ARCH; DEFINITION=$LAUNCH_DAEMONS/$SERVICE_NAME.plist; fi
 }
 native_service() {
     local action=$1 installed_root command_path
@@ -60,8 +60,19 @@ native_service() {
             privileged launchctl disable "system/$SERVICE_NAME" || return 1
             if privileged launchctl print "system/$SERVICE_NAME" >/dev/null 2>&1; then privileged launchctl bootout "system/$SERVICE_NAME" || return 1; fi
         elif [ "$action" = start ]; then printf 'Service definition missing; re-run the installer.\n' >&2; return 1; fi
-        if [ "$action" = remove ]; then privileged rm -f "$DEFINITION" || return 1; fi
+        if [ "$action" = remove ]; then privileged rm -f "$DEFINITION" && remove_sleep_guard || return 1; fi
     fi
+}
+# Stop the sleep guard, give sleep back unless another installation still holds it, and
+# delete the guard. Its own TERM handler releases too; the explicit release covers a guard
+# that had already exited.
+remove_sleep_guard() {
+    local name=$SERVICE_NAME.sleep
+    local script=$SLEEP_HELPERS/$name.sh definition=$LAUNCH_DAEMONS/$name.plist
+    [ -f "$definition" ] || [ -f "$script" ] || return 0
+    if privileged launchctl print "system/$name" >/dev/null 2>&1; then privileged launchctl bootout "system/$name" || return 1; fi
+    if [ -f "$script" ]; then privileged /bin/bash "$script" release "$SERVICE_NAME" || return 1; fi
+    privileged rm -f "$script" "$definition"
 }
 stop_processes() {
     stop_record "$ROOT/conf/manager.pid"
