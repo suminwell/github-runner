@@ -218,7 +218,9 @@ RUN
         mkdir -p "$FIXTURE/watchdog-bin" "$FAKE_WATCHDOG_DIR"
         cat > "$FIXTURE/watchdog-bin/sleep" <<'SLEEP'
 #!/bin/sh
-mark=$(ps -p "$$" -o lstart= | awk '{$1=$1; print}')
+# The same identity the platform's service.sh records: Linux boot ticks, macOS lstart.
+if [ -r "/proc/$$/stat" ]; then stat=$(cat "/proc/$$/stat"); stat=${stat##*) }; set -- $stat; mark=${20}
+else mark=$(ps -p "$$" -o lstart= | awk '{$1=$1; print}'); fi
 printf '%s\n%s\n' "$$" "$mark" > "$FAKE_WATCHDOG_DIR/$$.pid"
 exec "$REAL_SLEEP" "$@"
 SLEEP
@@ -361,6 +363,15 @@ SLEEP
     assert test "$(wc -l < "$FIXTURE/listener-runs")" -ge 2
     assert record_alive "$ROOT/conf/workers/1.pid"
     stop_worker 1
+    assert test ! -f "$ROOT/conf/workers/1.pid"
+    # A one-shot reconcile never launches workers; the supervisor starts each organization
+    # as soon as it is reconciled instead of after the whole pass.
+    rm -f "$ROOT/conf/retry/1"
+    reconcile
+    assert test ! -f "$ROOT/conf/workers/1.pid"
+    SUPERVISING=1 reconcile
+    assert record_alive "$ROOT/conf/workers/1.pid"
+    stop_worker 1; rm -f "$ROOT/conf/retry/1"
     assert test ! -f "$ROOT/conf/workers/1.pid"
     # An organization without runner permission backs off instead of failing every poll.
     printf '[[{"state":"active","organization":{"id":1,"login":"renamed"}},{"state":"active","organization":{"id":8,"login":"denied"}}]]\n' > "$FIXTURE/memberships.json"

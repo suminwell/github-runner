@@ -99,8 +99,13 @@ for platform in linux macos; do
 printf '%s\n' "${LC_ALL-unset}"
 PS
     chmod +x "$fixture/ps"
-    stamp_out=$(PATH="$fixture:$PATH" stamp 123) || :
-    assert test "$stamp_out" = C
+    if [ "$platform" = linux ] && [ -r /proc/self/stat ]; then
+        # Linux reads boot-relative ticks from procfs, which no locale can change.
+        assert test "$(LC_ALL=C stamp "$$")" = "$(LC_ALL=zh_CN.UTF-8 stamp "$$" 2>/dev/null)"
+    else
+        stamp_out=$(PATH="$fixture:$PATH" stamp 123) || :
+        assert test "$stamp_out" = C
+    fi
     rm -f "$fixture/ps"
     printf 'PASS %s status: directories, pending config, process states, GitHub results and locale-stable stamp\n' "$platform"
 done

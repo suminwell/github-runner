@@ -139,8 +139,21 @@ api() {
 clean_exec() { env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u GH_CONFIG_DIR -u RUNNER_MANUALLY_TRAP_SIG "$@"; }
 safe_org() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]; }
 safe_id() { [[ $1 =~ ^[0-9]+$ ]]; }
-# UTC and the C locale, so a record written inside the Docker mode container matches the host's view.
-stamp() { TZ=UTC LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || :; }
+# Process start time in clock ticks since boot (/proc/<pid>/stat field 22). ps lstart is
+# derived from the wall clock, so a clock step (NTP, VM time correction) changed it by a
+# second and made live processes look gone: timeouts did not fire, workers were started
+# twice and stops skipped them. This value never moves, and the Docker mode container
+# reads the same one because it shares the host kernel and PID namespace.
+stamp() {
+    local stat
+    # Without procfs (only the cross-platform tests run this file elsewhere) use ps lstart.
+    [ -r /proc/self/stat ] || { TZ=UTC LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || :; return 0; }
+    stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
+    # The command name may contain spaces or parentheses; fields resume after the last ")".
+    stat=${stat##*) }
+    set -f; set -- $stat; set +f
+    printf '%s\n' "${20:-}"
+}
 record_pid() { local mark; mark=$(stamp "$2"); [ -n "$mark" ] || return 1; printf '%s\n%s\n' "$2" "$mark" | atomic "$1"; }
 record_alive() {
     [ -f "$1" ] || return 1
@@ -409,6 +422,9 @@ reconcile() {
         backoff_due "$id" || continue
         if reconcile_one "$id" "$login"; then
             if [ -f "$STATE/backoff/$id" ]; then rm -f "$STATE/backoff/$id"; log "Organization $login: reconciliation recovered"; fi
+            # Start this organization now; with many organizations and a slow network, waiting
+            # for the whole pass would leave registered runners offline for minutes.
+            [ -z "${SUPERVISING:-}" ] || ensure_worker "$id" "$login" || :
         else backoff_failure "$id" "$login"; fi
     done < <(printf '%s' "$desired" | "$JQ" -r '.[] | [.id,.login] | @tsv')
     while IFS=$'\t' read -r id login; do
@@ -451,6 +467,7 @@ serve() {
     printf '%s\n' "$WORK_DIR" | atomic "$STATE/active-work-dir" || return 1
     stop_records "$STATE"/workers/*.pid "$STATE"/children/*.pid "$STATE"/timeouts/*.pid
     log "Started Shell supervisor $PREFIX"
+    SUPERVISING=1
     while [ ! -f "$ROOT/conf/stopped" ]; do
         # Reopen after log rotation so diagnostics land in the current file.
         exec 2>> "$LOG_DIR/service.log"

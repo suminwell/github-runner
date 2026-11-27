@@ -189,7 +189,7 @@ assert grep -q 'Manager: stopped' /fixture/stopped-status
 assert test ! -f /fixture/active
 # A forged PID file must never let root management signal an unrelated root process.
 sleep 120 & unrelated=$!
-mark=$(ps -p "$unrelated" -o lstart= | awk '{$1=$1; print}')
+stat=$(cat "/proc/$unrelated/stat"); stat=${stat##*) }; mark=$(printf '%s\n' "$stat" | awk '{print $20}')
 printf '%s\n%s\n' "$unrelated" "$mark" | runuser -u ghrunner -- tee "$root/conf/runtime/manager.pid" >/dev/null
 ghr stop
 assert kill -0 "$unrelated"
