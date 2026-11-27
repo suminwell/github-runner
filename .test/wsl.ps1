@@ -113,7 +113,9 @@ Install-WslHost
 # A failure inside the elevated window reaches the WSL terminal with its message.
 function Start-Process {
     param($FilePath,$Verb,$ArgumentList,[switch]$Wait,[switch]$PassThru)
-    $file = [regex]::Match($ArgumentList, '"-ResultFile" "([^"]+)"').Groups[1].Value
+    # Options are unquoted; the path is quoted only when it contains spaces.
+    $match = [regex]::Match($ArgumentList, '(?:^| )-ResultFile (?:"([^"]+)"|(\S+))')
+    $file = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
     Assert $file 'elevated window receives a result file'
     [IO.File]::WriteAllText($file, 'The user name or password is incorrect.')
     return [pscustomobject]@{ExitCode=1}
