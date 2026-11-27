@@ -39,9 +39,9 @@ for platform in linux macos; do
     assert test "$result" = 1
     assert grep -Fxq "$(field Manager "running (PID $$)")" "$fixture/report"
     assert grep -Fxq "$(field 'Install directory' "$ROOT")" "$fixture/report"
-    assert grep -Fxq "$(field 'Data directory' "$old_work/data")" "$fixture/report"
+    assert grep -Fxq "$(field 'Jobs directory' "$old_work/jobs")" "$fixture/report"
     assert grep -Fxq "$(field 'Logs directory' "$old_work/logs")" "$fixture/report"
-    assert grep -Fq "$(field Configuration "pending; next start uses $new_work/data")" "$fixture/report"
+    assert grep -Fq "$(field Configuration "pending; next start uses $new_work/jobs")" "$fixture/report"
     assert grep -Eq '^ITEM +VALUE$' "$fixture/report"
     # Three tables: overview, runners, then counts.
     assert test "$(grep -n '^ITEM' "$fixture/report" | cut -d: -f1)" -lt "$(grep -n '^ORGANIZATION' "$fixture/report" | cut -d: -f1)"
@@ -84,7 +84,7 @@ for platform in linux macos; do
     rm "$ROOT/conf/stopped"
     printf '%s\n' "$new_work" > "$ROOT/conf/active-work-dir"
     status > "$fixture/report"
-    assert grep -Fxq "$(field 'Data directory' "$new_work/data")" "$fixture/report"
+    assert grep -Fxq "$(field 'Jobs directory' "$new_work/jobs")" "$fixture/report"
     assert grep -Fxq "$(field Configuration 'no pending directory change')" "$fixture/report"
     printf '{}\n' > "$ROOT/conf/organizations.json"
     rm "$ROOT/conf/manager.pid" "$ROOT/conf/active-work-dir"

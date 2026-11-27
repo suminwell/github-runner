@@ -9,7 +9,7 @@ for platform in linux macos; do
     setup_case() {
         export LOCAL_RUNNER_ROOT=$fixture/$platform-$1
         ROOT=$LOCAL_RUNNER_ROOT
-        mkdir -p "$ROOT/bin" "$ROOT/conf" "$ROOT/runner/directory-is-not-identity/app"
+        mkdir -p "$ROOT/bin" "$ROOT/conf" "$ROOT/runner/directory-is-not-identity/runner/app"
         cp "$repo/$platform/service.sh" "$repo/$platform/ghr.sh" "$ROOT/bin/"
         command -v jq > "$ROOT/conf/jq-path"
         printf '/bin/false\n' > "$ROOT/conf/gh-path"
@@ -19,7 +19,7 @@ for platform in linux macos; do
         . "$ROOT/bin/ghr.sh"
         init control
         api() { fake_api "$@"; }
-        metadata=$ROOT/runner/directory-is-not-identity/app/.runner
+        metadata=$ROOT/runner/directory-is-not-identity/runner/app/.runner
         jq -n --arg name "$PREFIX-1" '{agentId:42,agentName:$name,gitHubUrl:"https://github.com/alpha"}' > "$metadata"
         fixture_remote=$ROOT/conf/fake-remote.json
         jq -n --arg name "$PREFIX-1" '[{id:42,name:$name},{id:43,name:"unrelated-runner"}]' > "$fixture_remote"
@@ -40,8 +40,8 @@ for platform in linux macos; do
         esac
     }
     setup_case fresh
-    mkdir -p "$ROOT/runner/duplicate-local-copy/app"
-    cp "$metadata" "$ROOT/runner/duplicate-local-copy/app/.runner"
+    mkdir -p "$ROOT/runner/duplicate-local-copy/runner/app"
+    cp "$metadata" "$ROOT/runner/duplicate-local-copy/runner/app/.runner"
     unregister_runners
     assert jq -e 'length==1 and .[0].id==43' "$fixture_remote" >/dev/null
     assert grep -Fxq 42 "$delete_log"
@@ -104,6 +104,6 @@ for platform in linux macos; do
     mkdir "$ROOT/bin/empty"
     if env -u LOCAL_RUNNER_ROOT /bin/bash "$ROOT-alias/bin/ghr.sh" config --data-dir "$ROOT-alias/bin/empty" 2> "$ROOT-alias.err"; then echo 'Allowed program data through an installation alias' >&2; exit 1; fi
     assert grep -q 'outside the program and state directories' "$ROOT-alias.err"
-    assert test ! -d "$ROOT/bin/empty/data"
+    assert test ! -d "$ROOT/bin/empty/jobs"
     printf 'PASS %s uninstall recovery, identity validation, retry and physical directory guard\n' "$platform"
 done

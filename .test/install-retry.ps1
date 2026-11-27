@@ -14,7 +14,7 @@ try {
     $tokens = $null; $errors = $null
     $installer = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'windows/install.ps1'), [ref]$tokens, [ref]$errors)
     Assert ($errors.Count -eq 0) 'installer syntax'
-    foreach ($name in @('Move-PreviousLayout','Initialize-InstallSettings')) {
+    foreach ($name in @('Initialize-InstallSettings')) {
         $definition = $installer.Find({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name}, $false)
         . ([scriptblock]::Create($definition.Extent.Text))
     }
@@ -31,10 +31,9 @@ try {
         Assert ($selected.Count -gt 0) "stage found: $First"
         return [scriptblock]::Create(($selected -join "`n"))
     }
-    $preflight = Get-InstallerStage '$knownInstallation = ' '$bin = Join-Path $installRoot'
-    $prepare = Get-InstallerStage 'Move-PreviousLayout $installRoot' '$existing = Get-Command gh'
-    $otherArchCheck = Get-InstallerStage 'if ((Test-Path (Join-Path $installRoot "$otherArch' '$migrate = '
-    $startup = Get-InstallerStage '$taskSettings.Enabled = ' 'foreach ($old in '
+    $preflight = Get-InstallerStage '$settingsFile = ' '$bin = Join-Path $installRoot'
+    $prepare = Get-InstallerStage 'Initialize-InstallSettings $installRoot' '$existing = Get-Command gh'
+    $startup = Get-InstallerStage '$taskSettings.Enabled = ' '$awakeTask = '
     function Protect-AdminFile([string]$Path) {}
     function Grant-ServiceWrite([string]$Directory) {}
     foreach ($arch in @('x64','arm64')) {
@@ -49,7 +48,7 @@ try {
         $settings = Get-Content -Raw -LiteralPath $settingsPath | ConvertFrom-Json
         Assert ($settings.platform -eq 'windows' -and $settings.arch -eq $arch -and $settings.work_dir -eq $first) 'fresh settings precede external failure boundaries'
         Push-Location $second
-        try { . $preflight; Assert $knownInstallation 'retry recognizes its own partial install'; . $prepare } finally { Pop-Location }
+        try { . $preflight; . $prepare } finally { Pop-Location }
         Assert ((Get-Content -Raw -LiteralPath $settingsPath | ConvertFrom-Json).work_dir -eq $first) 'retry preserves original working directory'
         $before = Get-Content -Raw -LiteralPath $settingsPath
         Initialize-InstallSettings $installRoot $arch
@@ -74,7 +73,7 @@ try {
     }
     # The SYSTEM sleep guard runs from an Administrator-only copy when prevent_sleep is on,
     # and is removed, giving the lid setting back, when it is turned off.
-    $awake = Get-InstallerStage '$awakeTask = ' "Remove-Item (Join-Path `$state 'python')"
+    $awake = Get-InstallerStage '$awakeTask = ' 'Write-Host "Installed $taskName'
     $env:LOCAL_RUNNER_AWAKE_STORE = Join-Path $fixture 'awake'
     New-Item -ItemType Directory -Force -Path (Join-Path $env:LOCAL_RUNNER_AWAKE_STORE 'bin') | Out-Null
     $bin = Join-Path $fixture 'awake-bin'; $state = Join-Path $fixture 'awake-state'
@@ -102,31 +101,15 @@ try {
     . $awake
     Assert ($script:Unregistered -eq 'LocalGitHubRunner-x64-Awake' -and -not (Test-Path $copy) -and ($script:Calls[0] -match '-Action Release -Name LocalGitHubRunner-x64-Awake')) 'turning it off releases and removes the guard'
     Remove-Item Env:LOCAL_RUNNER_AWAKE_STORE
-    $arch = 'x64'
-    foreach ($oldState in @('.state','conf')) {
-        $installRoot = Join-Path $fixture "legacy-$oldState"
-        $legacyState = Join-Path $installRoot "x64/$oldState"
-        New-Item -ItemType Directory -Path $legacyState -Force | Out-Null
-        Set-Content -LiteralPath (Join-Path $legacyState 'settings.json') -Value '{"platform":"windows","work_dir":"preserved"}'
-        Set-Content -LiteralPath (Join-Path $legacyState 'stopped') -Value stopped
-        $bin = Join-Path $installRoot 'bin'; $state = Join-Path $installRoot 'conf'
-        . $preflight; . $prepare
-        Assert ((Test-Path (Join-Path $state 'stopped')) -and (Get-Content -Raw -LiteralPath (Join-Path $state 'settings.json') | ConvertFrom-Json).work_dir -eq 'preserved') 'legacy migration retains stopped marker and configuration'
-    }
     $installRoot = Join-Path $fixture 'unrelated'
     New-Item -ItemType Directory -Path (Join-Path $installRoot 'bin') -Force | Out-Null
     $failed = $false; try { . $preflight } catch { $failed = $true }
     Assert ($failed -and -not (Test-Path (Join-Path $installRoot 'conf'))) 'unrelated program directory refused'
     $installRoot = Join-Path $fixture 'foreign-platform'
-    New-Item -ItemType Directory -Path (Join-Path $installRoot 'x64/conf') -Force | Out-Null
-    Set-Content -LiteralPath (Join-Path $installRoot 'x64/conf/settings.json') -Value '{"platform":"linux"}'
+    New-Item -ItemType Directory -Path (Join-Path $installRoot 'conf') -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $installRoot 'conf/settings.json') -Value '{"platform":"linux"}'
     $failed = $false; try { . $preflight } catch { $failed = $true }
-    Assert $failed 'legacy architecture/conf platform validated'
-    $installRoot = Join-Path $fixture 'foreign-architecture'; $otherArch = 'arm64'
-    New-Item -ItemType Directory -Path (Join-Path $installRoot 'arm64/conf') -Force | Out-Null
-    Set-Content -LiteralPath (Join-Path $installRoot 'arm64/conf/settings.json') -Value '{"platform":"windows"}'
-    $failed = $false; try { . $otherArchCheck } catch { $failed = $true }
-    Assert $failed 'legacy architecture/conf mismatch refused'
+    Assert $failed 'configuration of another platform refused'
     $success = $true
     Write-Host 'PASS Windows installer retry, original data directory, stopped upgrade and layout ownership'
 } finally {

@@ -68,15 +68,15 @@ run_install() {
 for target in linux macos; do
     for failure in login download; do
         home=$FIXTURE/$target-$failure; first=$FIXTURE/first-$target-$failure; second=$FIXTURE/second-$target-$failure
-        # Linux retries the download and then reports failure itself; macOS returns curl's status.
-        expected=41; [ "$failure" != download ] || { expected=42; [ "$target" != linux ] || expected=1; }
+        # Downloads are retried, then the installer reports the failure itself.
+        expected=41; [ "$failure" != download ] || expected=1
         run_install "$target" "$failure" "$home" "$first" "$expected"
         assert jq -e --arg p "$target" --arg work "$first" '.platform==$p and .arch=="x64" and .work_dir==$work' "$home/$target/conf/settings.json"
         run_install "$target" "$failure" "$home" "$second" "$expected"
         assert jq -e --arg work "$first" '.work_dir==$work' "$home/$target/conf/settings.json"
         run_install "$target" none "$home" "$second" 0
         assert jq -e --arg work "$first" '.work_dir==$work' "$home/$target/conf/settings.json"
-        assert test -d "$first/data"
+        assert test -d "$first/jobs"
         if [ "$target" = linux ]; then assert grep -q 'systemctl restart' "$home/host-calls";
         else assert grep -q 'launchctl bootstrap' "$home/host-calls"; fi
         printf stopped > "$home/$target/conf/stopped"
@@ -85,34 +85,17 @@ for target in linux macos; do
         assert test -f "$home/$target/conf/stopped"
         if grep -v '\.awake' "$home/host-calls" | grep -Eq 'systemctl (enable|restart)|launchctl (enable|bootstrap|print)'; then echo 'Stopped installation resumed during upgrade' >&2; exit 1; fi
     done
-    for legacy_state in .state conf; do
-        home=$FIXTURE/$target-legacy-$legacy_state
-        mkdir -p "$home/$target/x64/$legacy_state"
-        printf '{"platform":"%s","work_dir":"%s"}\n' "$target" "$home/work" > "$home/$target/x64/$legacy_state/settings.json"
-        printf stopped > "$home/$target/x64/$legacy_state/stopped"
-        run_install "$target" none "$home" "$FIXTURE" 0
-        assert test -f "$home/$target/conf/stopped"
-        assert jq -e --arg work "$home/work" '.work_dir==$work' "$home/$target/conf/settings.json"
-        if grep -v '\.awake' "$home/host-calls" | grep -Eq 'systemctl (enable|restart)|launchctl (enable|bootstrap|print)'; then echo 'Stopped legacy installation resumed during upgrade' >&2; exit 1; fi
-    done
     home=$FIXTURE/$target-unrelated
     mkdir -p "$home/$target/bin"
     printf keep > "$home/$target/bin/keep"
     run_install "$target" login "$home" "$FIXTURE" 1
     assert test "$(cat "$home/$target/bin/keep")" = keep
     assert test ! -e "$home/$target/conf/settings.json"
-    # A legacy conf layout is subject to platform and architecture validation too.
     home=$FIXTURE/$target-foreign
-    mkdir -p "$home/$target/x64/conf"
-    printf '{"platform":"windows"}\n' > "$home/$target/x64/conf/settings.json"
+    mkdir -p "$home/$target/conf"
+    printf '{"platform":"windows"}\n' > "$home/$target/conf/settings.json"
     run_install "$target" login "$home" "$FIXTURE" 1
-    assert test -f "$home/$target/x64/conf/settings.json"
-    assert test ! -e "$home/$target/conf"
-    home=$FIXTURE/$target-other-arch
-    mkdir -p "$home/$target/arm64/conf"
-    printf '{"platform":"%s"}\n' "$target" > "$home/$target/arm64/conf/settings.json"
-    run_install "$target" login "$home" "$FIXTURE" 1
-    assert test -f "$home/$target/arm64/conf/settings.json"
+    assert grep -q 'belongs to a different platform' "$home/output"
 done
 # An existing gh login without admin:org is refreshed before its token is saved; a
 # supplied token without it is refused instead of producing an idle service.

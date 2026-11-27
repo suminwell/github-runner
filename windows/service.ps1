@@ -1,7 +1,6 @@
 param(
     [ValidateSet('Serve','Worker','Prepare','Stop','Once','Library')][string]$Mode = 'Serve',
     [string]$OrgId,
-    [string]$StateDir,
     [string]$Root = $(if ($env:LOCAL_RUNNER_ROOT) { $env:LOCAL_RUNNER_ROOT } else { Split-Path $PSScriptRoot -Parent })
 )
 $ErrorActionPreference = 'Stop'
@@ -49,7 +48,7 @@ function Initialize-Manager([switch]$Control) {
     if ($script:Settings.arch -notin @('x64','arm64')) { throw 'Unsupported architecture.' }
     $script:Prefix = 'local-windows-' + $script:Settings.arch
     $script:WorkDir = if ($script:Settings.work_dir) { $script:Settings.work_dir } else { $script:Root }
-    $script:DataDir = Join-Path $script:WorkDir 'data'; $script:LogDir = Join-Path $script:WorkDir 'logs'
+    $script:JobsDir = Join-Path $script:WorkDir 'jobs'; $script:LogDir = Join-Path $script:WorkDir 'logs'
     if (-not $Control) { New-Item -ItemType Directory -Force -Path $script:LogDir | Out-Null }
     # Administrator commands run this binary, so it must come from read-only bin\, not writable conf\.
     $script:Gh = Join-Path $script:Root 'bin\tools\gh.exe'
@@ -118,11 +117,12 @@ function Invoke-GitHubApi([string]$Endpoint, [string]$Method = 'GET', [switch]$P
     return $null
 }
 function Test-Organization([string]$Login) { return $Login -cmatch '^[A-Za-z0-9][A-Za-z0-9-]{0,38}$' }
-# Each organization runs runner_count runners. The first keeps the organization ID as its
-# state key and runner\<login>, data\<login> as its directories; runner N (N >= 2) is
-# keyed <ID>.N and uses <login>.N, which no organization login can be (logins have no dot).
+# Each organization runs runner_count runners. Runner N of an organization is keyed by the
+# organization ID (N = 1) or <ID>.N in the state; its program lives in
+# runner\<login>\<runner name>\app and its jobs in jobs\<login>\<runner name>.
 function Test-RunnerKey([string]$Key) { return $Key -cmatch '^\d+(\.([2-9]|[1-9]\d+))?$' }
-function Get-KeySuffix([string]$Key) { if ($Key.Contains('.')) { return '.' + $Key.Split('.')[1] }; return '' }
+function Get-RunnerHome([string]$Login, [string]$Name) { return (Join-Path (Join-Path (Join-Path $script:Root 'runner') $Login) $Name) }
+function Get-RunnerJobs([string]$Login, [string]$Name) { return (Join-Path (Join-Path $script:JobsDir $Login) $Name) }
 # At most half the logical CPUs (at least 1), so an organization's runners leave room for
 # each other; a count saved on a larger machine is capped here. LOCAL_RUNNER_CPU_COUNT
 # stands in for the machine in tests.
@@ -191,29 +191,29 @@ function Stop-Worker([string]$Id) {
     Stop-Record (Join-Path $script:Root "conf\workers\$Id.json")
     Stop-Record (Join-Path $script:Root "conf\children\$Id.json")
 }
-function Write-RunnerWrapper([string]$Id, [string]$Login) {
-    $directory = Join-Path $script:Root "runner\$Login"
-    New-Item -ItemType Directory -Force -Path $directory | Out-Null
-    Copy-Item -LiteralPath (Join-Path $script:Root 'bin\runner.ps1') -Destination (Join-Path $directory 'runner.ps1') -Force
-    Write-AtomicText (Join-Path $directory 'listener.ps1') "Set-Location (Join-Path `$PSScriptRoot 'app')`n& .\run.cmd`nexit `$LASTEXITCODE`n"
+function Write-RunnerWrapper([string]$Directory) {
+    New-Item -ItemType Directory -Force -Path $Directory | Out-Null
+    Copy-Item -LiteralPath (Join-Path $script:Root 'bin\runner.ps1') -Destination (Join-Path $Directory 'runner.ps1') -Force
+    Write-AtomicText (Join-Path $Directory 'listener.ps1') "Set-Location (Join-Path `$PSScriptRoot 'app')`n& .\run.cmd`nexit `$LASTEXITCODE`n"
 }
 function Start-Worker([string]$Id, [string]$Login) {
-    $entry = (Get-State)[$Id]; $folder = $Login + (Get-KeySuffix $Id)
-    if ($entry.active -eq $false -or $entry.relocated -or -not (Test-IndexedName $entry.runner_name) -or (Test-Path (Join-Path $script:Root 'conf\stopped'))) { return }
+    $entry = (Get-State)[$Id]
+    if ($entry.active -eq $false -or -not (Test-IndexedName $entry.runner_name) -or (Test-Path (Join-Path $script:Root 'conf\stopped'))) { return }
     if (Test-Path (Join-Path $script:Root "conf\paused\$Id")) { return }
-    if (-not (Test-Path (Join-Path $script:Root "runner\$folder\app\.runner"))) { return }
+    $name = $entry.runner_name; $directory = Get-RunnerHome $Login $name
+    if (-not (Test-Path (Join-Path $directory 'app\.runner'))) { return }
     $record = Join-Path $script:Root "conf\workers\$Id.json"
     if ($null -ne (Get-RecordedProcess $record)) { return }
     $retry = Read-Json (Join-Path $script:Root "conf\retry\$Id.json")
     if ($null -ne $retry -and [DateTime]::UtcNow.Ticks -lt [long]$retry.after) { return }
     Stop-Worker $Id
-    Set-RunnerWorkspace $Login (Get-KeySuffix $Id)
-    Write-RunnerWrapper $Id $folder
-    $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $script:Root "runner\$folder\runner.ps1"),'-Root',$script:Root,'-OrgId',$Id)
+    Set-RunnerWorkspace $Login $name
+    Write-RunnerWrapper $directory
+    $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $directory 'runner.ps1'),'-Root',$script:Root,'-OrgId',$Id)
     $process = [Diagnostics.Process]::Start($info)
     Record-Process $record $process
     Write-Json (Join-Path $script:Root "conf\retry\$Id.json") @{ after=[DateTime]::UtcNow.AddSeconds($script:RestartSeconds).Ticks }
-    Write-Log "Started $((Get-State)[$Id].runner_name) for $Login (pid $($process.Id))"
+    Write-Log "Started $name for $Login (pid $($process.Id))"
 }
 function Ensure-Workers {
     $state = Get-State
@@ -242,18 +242,18 @@ function Ensure-Package {
     } finally { Remove-Item -LiteralPath $temporary -Recurse -Force }
     Write-Log "Downloaded official Runner $version"
 }
-function Set-RunnerWorkspace([string]$Login, [string]$Suffix = '') {
-    if (-not (Test-Organization $Login)) { throw 'Invalid organization.' }
-    $work = Join-Path $script:DataDir "$Login$Suffix"
+function Set-RunnerWorkspace([string]$Login, [string]$Name) {
+    if (-not (Test-Organization $Login) -or -not (Test-IndexedName $Name)) { throw 'Invalid runner.' }
+    $work = Get-RunnerJobs $Login $Name
     New-Item -ItemType Directory -Force -Path $work | Out-Null
-    $configuration = Join-Path $script:Root "runner\$Login$Suffix\app\.runner"
+    $configuration = Join-Path (Get-RunnerHome $Login $Name) 'app\.runner'
     $runner = Read-Json $configuration
     $runner | Add-Member -NotePropertyName workFolder -NotePropertyValue $work -Force
     Write-Json $configuration $runner
 }
-function Register-Runner([string]$Login, [string]$Name, [string]$Suffix = '') {
+function Register-Runner([string]$Login, [string]$Name) {
     Ensure-Package
-    $directory = Join-Path $script:Root "runner\$Login$Suffix\app"
+    $directory = Join-Path (Get-RunnerHome $Login $Name) 'app'
     if (-not (Test-Path (Join-Path $directory 'run.cmd'))) {
         if (Test-Path "$directory.staging") { Remove-Item "$directory.staging" -Recurse -Force }
         New-Item -ItemType Directory -Force -Path (Split-Path $directory -Parent) | Out-Null
@@ -261,7 +261,7 @@ function Register-Runner([string]$Login, [string]$Name, [string]$Suffix = '') {
         if (Test-Path $directory) { Remove-Item $directory -Recurse -Force }
         Move-Item "$directory.staging" $directory
     }
-    $work = Join-Path $script:DataDir "$Login$Suffix"
+    $work = Get-RunnerJobs $Login $Name
     New-Item -ItemType Directory -Force -Path $work | Out-Null
     $token = (Invoke-GitHubApi "orgs/$Login/actions/runners/registration-token" -Method POST).token
     $wrapper = Join-Path $directory 'configure.ps1'
@@ -286,35 +286,48 @@ function Get-NextName($Remote) {
     }
     return "$script:Prefix-$($maximum+1)"
 }
+# A registration that finished before the state was saved: a local runner directory that
+# no state entry claims and whose ID and name GitHub still reports.
+function Find-UnclaimedRegistration([string]$Login, $Remote, $State) {
+    $parent = Join-Path (Join-Path $script:Root 'runner') $Login
+    foreach ($directory in @(Get-ChildItem -Directory -LiteralPath $parent -ErrorAction SilentlyContinue)) {
+        if (-not (Test-IndexedName $directory.Name)) { continue }
+        if (@($State.Values | Where-Object { $_.login -ceq $Login -and $_.runner_name -ceq $directory.Name }).Count) { continue }
+        $local = Read-Json (Join-Path $directory.FullName 'app\.runner')
+        if ($null -eq $local) { continue }
+        $owned = @($Remote | Where-Object { $_.id -eq $local.agentId -and $_.name -ceq $directory.Name }) | Select-Object -First 1
+        if ($null -ne $owned) { return @{login=$Login;runner_id=$owned.id;runner_name=$owned.name} }
+    }
+    return $null
+}
 function Reconcile-Organization([string]$Id, [string]$Login) {
     if (-not (Test-RunnerKey $Id) -or -not (Test-Organization $Login)) { throw 'Invalid organization.' }
-    $suffix = Get-KeySuffix $Id
     $remote = @(Get-RemoteRunners $Login)
     $state = Get-State; $entry = $state[$Id]
-    $directory = Join-Path $script:Root "runner\$Login$suffix\app"
-    $local = Read-Json (Join-Path $directory '.runner')
     # Recover ownership when registration succeeded before state was saved.
-    if ($null -eq $entry -and $null -ne $local) {
-        $owned = $remote | Where-Object { $_.id -eq $local.agentId -and ($_.name -ceq $script:Prefix -or (Test-IndexedName $_.name)) } | Select-Object -First 1
-        if ($null -ne $owned) { $entry = @{login=$Login;runner_id=$owned.id;runner_name=$owned.name} }
-    }
-    $registered = @($remote | Where-Object { $null -ne $entry -and $_.id -eq $entry.runner_id }) | Select-Object -First 1
+    if ($null -eq $entry) { $entry = Find-UnclaimedRegistration $Login $remote $state }
     $preferred = $entry.runner_name
+    $local = if ($null -ne $entry -and (Test-IndexedName $preferred)) { Read-Json (Join-Path (Get-RunnerHome $entry.login $preferred) 'app\.runner') } else { $null }
+    $registered = @($remote | Where-Object { $null -ne $entry -and $_.id -eq $entry.runner_id }) | Select-Object -First 1
     if ($null -ne $registered -and (Test-IndexedName $registered.name)) { $preferred = $registered.name }
     $pause = Join-Path $script:Root "conf\paused\$Id"
-    if ($null -ne $entry -and ($entry.login -cne $Login -or $null -eq $registered -or $local.agentId -ne $entry.runner_id -or -not (Test-IndexedName $registered.name) -or $entry.relocated)) {
+    if ($null -ne $entry -and ($entry.login -cne $Login -or $null -eq $registered -or $local.agentId -ne $entry.runner_id -or -not (Test-IndexedName $registered.name))) {
         if ($null -ne $registered -and $registered.busy) { return }
         Write-AtomicText $pause 'paused'; Stop-Worker $Id
         if ($null -ne $registered) {
             $null = Invoke-GitHubApi "orgs/$Login/actions/runners/$($registered.id)" -Method DELETE
             $remote = @($remote | Where-Object id -ne $registered.id)
         }
-        # A renamed organization keeps its program directory; old work data stays in place.
-        $oldDirectory = Join-Path $script:Root "runner\$($entry.login)$suffix"
-        $newDirectory = Join-Path $script:Root "runner\$Login$suffix"
-        if ($entry.login -cne $Login -and (Test-Organization $entry.login) -and (Test-Path -LiteralPath $oldDirectory) -and -not (Test-Path -LiteralPath $newDirectory)) {
-            Move-Item -LiteralPath $oldDirectory -Destination $newDirectory
-            Write-Log "Moved runner directory of $($entry.login)$suffix to $Login$suffix"
+        # A renamed organization keeps its program directory; old jobs stay in place.
+        if ($entry.login -cne $Login -and (Test-Organization $entry.login) -and (Test-IndexedName $preferred)) {
+            $oldDirectory = Get-RunnerHome $entry.login $preferred; $newDirectory = Get-RunnerHome $Login $preferred
+            if ((Test-Path -LiteralPath $oldDirectory) -and -not (Test-Path -LiteralPath $newDirectory)) {
+                New-Item -ItemType Directory -Force -Path (Split-Path $newDirectory -Parent) | Out-Null
+                Move-Item -LiteralPath $oldDirectory -Destination $newDirectory
+                $oldParent = Split-Path $oldDirectory -Parent
+                if (-not @(Get-ChildItem -Force -LiteralPath $oldParent).Count) { Remove-Item -LiteralPath $oldParent }
+                Write-Log "Moved runner directory $($entry.login)\$preferred to $Login\$preferred"
+            }
         }
         $registered = $null
     }
@@ -323,42 +336,50 @@ function Reconcile-Organization([string]$Id, [string]$Login) {
         $runnerId = $null
         for ($attempt = 0; $attempt -lt 5; $attempt++) {
             $name = if ((Test-IndexedName $preferred) -and -not @($remote | Where-Object name -eq $preferred).Count) { $preferred } else { Get-NextName $remote }
-            New-Item -ItemType Directory -Force -Path (Split-Path $directory -Parent) | Out-Null
-            foreach ($file in @('.runner','.credentials','.credentials_rsaparams')) { Remove-Item (Join-Path $directory $file) -Force -ErrorAction SilentlyContinue }
-            try { $runnerId = Register-Runner $Login $name $suffix; break }
+            $directory = Get-RunnerHome $Login $name
+            # A new number reuses the previous program directory instead of copying the Runner again.
+            if ($name -cne $preferred -and (Test-IndexedName $preferred)) {
+                $previousDirectory = Get-RunnerHome $Login $preferred
+                if ((Test-Path -LiteralPath $previousDirectory) -and -not (Test-Path -LiteralPath $directory)) { Move-Item -LiteralPath $previousDirectory -Destination $directory }
+            }
+            foreach ($file in @('.runner','.credentials','.credentials_rsaparams')) { Remove-Item (Join-Path $directory "app\$file") -Force -ErrorAction SilentlyContinue }
+            try { $runnerId = Register-Runner $Login $name; break }
             catch {
                 # Refresh after a collision; never replace another machine's runner.
                 $failure = $_
                 $remote = @(Get-RemoteRunners $Login)
-                $local = Read-Json (Join-Path $directory '.runner')
+                $local = Read-Json (Join-Path $directory 'app\.runner')
                 if (@($remote | Where-Object { $null -ne $local -and $_.id -eq $local.agentId -and $_.name -ceq $name }).Count) { $runnerId = $local.agentId; break }
                 if (-not @($remote | Where-Object name -eq $name).Count) { throw $failure }
+                # The name belongs to another machine now; this directory never registered.
+                Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
     }
     if ("$runnerId" -notmatch '^\d+$') { throw 'Invalid registration ID.' }
+    $state = Get-State
     $state[$Id] = @{ login=$Login; runner_id=$runnerId; runner_name=$name }
     Save-State $state
     Remove-Item $pause -Force -ErrorAction SilentlyContinue
 }
-# A runner beyond runner_count leaves once it is idle, so a running job is never cut off.
-# Its registration and program directory go; its work data stays.
+# A runner beyond runner_count leaves once it is idle, so a running job is never cut off;
+# its registration, program directory and jobs directory are removed.
 function Remove-ExtraRunner([string]$Key, [string]$Login) {
-    $suffix = Get-KeySuffix $Key
-    if (-not (Test-RunnerKey $Key) -or -not $suffix -or -not (Test-Organization $Login)) { throw 'Invalid runner.' }
+    if (-not (Test-RunnerKey $Key) -or -not $Key.Contains('.') -or -not (Test-Organization $Login)) { throw 'Invalid runner.' }
     $state = Get-State; $entry = $state[$Key]
     if ("$($entry.runner_id)" -notmatch '^\d+$') { throw 'Invalid registration ID.' }
     $registered = @(Get-RemoteRunners $Login | Where-Object id -eq $entry.runner_id) | Select-Object -First 1
     if ($null -ne $registered -and $registered.busy) { return }
     Write-AtomicText (Join-Path $script:Root "conf\paused\$Key") 'paused'; Stop-Worker $Key
     if ($null -ne $registered) { $null = Invoke-GitHubApi "orgs/$Login/actions/runners/$($registered.id)" -Method DELETE }
-    foreach ($owner in @($Login, $entry.login) | Select-Object -Unique) {
-        $directory = Join-Path $script:Root "runner\$owner$suffix"
-        if ((Test-Organization $owner) -and (Test-Path -LiteralPath $directory)) { Remove-Item -LiteralPath $directory -Recurse -Force }
+    if (Test-IndexedName $entry.runner_name) {
+        $directories = @((Get-RunnerHome $Login $entry.runner_name), (Get-RunnerJobs $Login $entry.runner_name))
+        if ((Test-Organization $entry.login) -and $entry.login -cne $Login) { $directories += Get-RunnerHome $entry.login $entry.runner_name }
+        foreach ($directory in $directories) { if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force } }
     }
     $state = Get-State; $state.Remove($Key); Save-State $state
     foreach ($file in @("conf\paused\$Key", "conf\retry\$Key.json")) { Remove-Item -LiteralPath (Join-Path $script:Root $file) -Force -ErrorAction SilentlyContinue }
-    Write-Log "Removed $($entry.runner_name) from $Login (runner count lowered); work data retained in $(Join-Path $script:DataDir "$Login$suffix")"
+    Write-Log "Removed $($entry.runner_name) from $Login (runner count lowered)"
 }
 # Register, start and retire this organization's runners to match runner_count.
 function Reconcile-Runners([string]$Id, [string]$Login, [int]$Count) {
@@ -385,13 +406,13 @@ function Invoke-Reconcile {
             $desired["$($member.organization.id)"] = $login
         }
     }
-    $count = Get-RunnerCount
+    $runnerCount = Get-RunnerCount
     foreach ($id in @($desired.Keys)) {
         $backoff = Join-Path $script:Root "conf\backoff\$id.json"
         $previous = Read-Json $backoff
         if ($null -ne $previous -and [DateTime]::UtcNow.Ticks -lt [long]$previous.after) { continue }
         try {
-            Reconcile-Runners $id $desired[$id] $count
+            Reconcile-Runners $id $desired[$id] $runnerCount
             if ($null -ne $previous) { Remove-Item -LiteralPath $backoff -Force; Write-Log "Organization $($desired[$id]): reconciliation recovered" }
         } catch {
             # Organizations without runner permission (or with persistent errors) back off
@@ -445,9 +466,9 @@ function Invoke-Supervisor {
     }
 }
 if ($Mode -eq 'Stop') {
-    # Needs only the PID records, so the installer can stop any earlier state layout with
-    # this (trusted) script instead of executing the previously installed copy.
-    Stop-StateProcesses $(if ($StateDir) { $StateDir } else { Join-Path $script:Root 'conf' })
+    # Needs only the PID records, so the installer can stop the processes with this new
+    # script instead of executing the installed copy.
+    Stop-StateProcesses (Join-Path $script:Root 'conf')
 } elseif ($Mode -ne 'Library') {
     Initialize-Manager
     switch ($Mode) {

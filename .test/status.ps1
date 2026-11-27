@@ -59,8 +59,8 @@ try {
     Assert $script:StatusFailed 'API failure preserved'
     Assert ((Has-Line $report (Field 'Manager' "running (PID $PID)"))) 'manager and PID'
     Assert ((Has-Line $report (Field 'Install directory' $fixture))) 'installation directory'
-    Assert ((Has-Line $report (Field 'Data directory' (Join-Path $oldWork 'data'))) -and (Has-Line $report (Field 'Logs directory' (Join-Path $oldWork 'logs')))) 'current data and log paths'
-    Assert ($report.Contains((Field 'Configuration' "pending; next start uses $(Join-Path $newWork 'data')"))) 'pending data directory explicit'
+    Assert ((Has-Line $report (Field 'Jobs directory' (Join-Path $oldWork 'jobs'))) -and (Has-Line $report (Field 'Logs directory' (Join-Path $oldWork 'logs')))) 'current data and log paths'
+    Assert ($report.Contains((Field 'Configuration' "pending; next start uses $(Join-Path $newWork 'jobs')"))) 'pending jobs directory explicit'
     Assert ($report -match '(?m)^ITEM +VALUE\s*$') 'overview table header'
     $tables = @('ITEM ', "`nConfiguration ", 'ORGANIZATION / RUNNER', "`nSUMMARY ", "`nOrganizations ", "`nLocal ") | ForEach-Object { $report.IndexOf($_) }
     Assert (-not ($tables -contains -1) -and (($tables | Sort-Object) -join ',') -eq ($tables -join ',')) 'overview, runner and summary tables in order'
@@ -91,7 +91,7 @@ try {
     Remove-Item -LiteralPath (Join-Path $fixture 'conf/stopped')
     Write-AtomicText (Join-Path $fixture 'conf/active-work-dir') $newWork
     $report = Capture-Status
-    Assert ((Has-Line $report (Field 'Data directory' (Join-Path $newWork 'data'))) -and (Has-Line $report (Field 'Configuration' 'no pending directory change'))) 'applied directory reflected'
+    Assert ((Has-Line $report (Field 'Jobs directory' (Join-Path $newWork 'jobs'))) -and (Has-Line $report (Field 'Configuration' 'no pending directory change'))) 'applied directory reflected'
     Save-State @{}
     Remove-Item -LiteralPath (Join-Path $fixture 'conf/manager.json'),(Join-Path $fixture 'conf/active-work-dir')
     $report = Capture-Status

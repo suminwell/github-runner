@@ -110,12 +110,6 @@ assert grep -qx "bootout system/$name.awake" "$FIXTURE/launchctl"
 assert test "$(state)" = 0
 assert test ! -e "$FIXTURE/owners/$name" -a ! -e "$LOCAL_RUNNER_AWAKE_HELPERS/$name.awake.sh" -a ! -e "$LOCAL_RUNNER_LAUNCH_DAEMONS/$name.awake.plist"
 remove_awake_guard
-# A guard installed by an earlier version under the .sleep name is released and removed too.
-cp "$GUARD" "$LOCAL_RUNNER_AWAKE_HELPERS/$name.sleep.sh"; : > "$LOCAL_RUNNER_LAUNCH_DAEMONS/$name.sleep.plist"
-: > "$FIXTURE/owners/$name"; printf '1\n' > "$PMSET_STATE"
-remove_awake_guard
-assert test "$(state)" = 0
-assert test ! -e "$LOCAL_RUNNER_AWAKE_HELPERS/$name.sleep.sh" -a ! -e "$LOCAL_RUNNER_LAUNCH_DAEMONS/$name.sleep.plist"
 remove_awake_guard
 success=true
 printf 'PASS macOS awake guard: lifecycle-bound, owner setting kept, shared between installations, status\n'

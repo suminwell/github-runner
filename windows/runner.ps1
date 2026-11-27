@@ -3,15 +3,15 @@ $WorkerOrganizationId = $OrgId
 . (Join-Path $Root 'bin\service.ps1') -Mode Library -Root $Root
 function Invoke-Worker([string]$Id) {
     if (-not (Test-RunnerKey $Id)) { throw 'Invalid runner key.' }
-    $login = (Get-State)[$Id].login
-    if (-not (Test-Organization $login)) { throw 'Invalid organization.' }
-    $folder = $login + (Get-KeySuffix $Id)
+    $entry = (Get-State)[$Id]
+    if (-not (Test-Organization $entry.login) -or -not (Test-IndexedName $entry.runner_name)) { throw 'Invalid runner.' }
+    $directory = Get-RunnerHome $entry.login $entry.runner_name
     $record = Join-Path $script:Root "conf\children\$Id.json"
     $lock = [IO.File]::Open((Join-Path $script:Root "conf\worker-$Id.lock"), 'OpenOrCreate', 'ReadWrite', 'None')
     try {
         Stop-Record $record
         while (-not (Test-Path (Join-Path $script:Root 'conf\stopped'))) {
-            $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $script:Root "runner\$folder\listener.ps1"))
+            $info = New-ProcessInfo $script:PowerShell @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $directory 'listener.ps1'))
             $process = [Diagnostics.Process]::Start($info)
             Record-Process $record $process
             $process.WaitForExit(); $process.Dispose()

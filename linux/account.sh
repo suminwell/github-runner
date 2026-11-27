@@ -87,17 +87,17 @@ account_work_directory() (
         account_validate_path "$ancestor" || exit 1
         mkdir -p "$requested" || exit 1
     fi
-    for directory in "$requested/data" "$requested/logs"; do
+    for directory in "$requested/jobs" "$requested/logs"; do
         [ ! -L "$directory" ] || { echo "Refusing a symlink: $directory" >&2; exit 1; }
     done
     # On a user-writable path, do everything as that user. Only grant permissions
     # as root when no unprivileged process can replace any parent during the change.
-    if account_run mkdir -p "$requested/data" "$requested/logs" 2>/dev/null && \
-        account_run test -w "$requested/data" && account_run test -x "$requested/data" && \
+    if account_run mkdir -p "$requested/jobs" "$requested/logs" 2>/dev/null && \
+        account_run test -w "$requested/jobs" && account_run test -x "$requested/jobs" && \
         account_run test -w "$requested/logs" && account_run test -x "$requested/logs"; then exit 0; fi
     account_validate_path "$requested" || exit 1
     account_traverse "$requested" || exit 1
-    for directory in "$requested/data" "$requested/logs"; do
+    for directory in "$requested/jobs" "$requested/logs"; do
         [ ! -L "$directory" ] || { echo "Refusing a symlink: $directory" >&2; exit 1; }
         if [ ! -e "$directory" ]; then
             mkdir "$directory" && chown "$account_uid:$account_gid" "$directory" && chmod 700 "$directory" || exit 1
@@ -187,7 +187,7 @@ account_command() {
                         [ ! -L "$command_path" ] && grep -Fqx "# ghr: $ROOT" "$command_path" || return 1
                         rm -f "$command_path" || return 1
                     fi
-                    rm -rf "$ROOT/bin" "$ROOT/conf" "$ROOT/runner" || return 1
+                    rm -rf "${ROOT:?}/bin" "${ROOT:?}/conf" "${ROOT:?}/runner" || return 1
                     echo 'Runner uninstalled. Data, logs and the locked ghrunner account/home are retained.'
                     [ -z "$hint" ] || printf '%s\n' "$hint" ;;
                 *) usage ;;
@@ -197,11 +197,10 @@ account_command() {
 }
 # settings.json stays root-owned and readable by the runner account.
 account_settings() {
-    local temporary
-    temporary=$(mktemp "$ROOT/conf/settings.XXXXXX") || return 1
-    if ! "$JQ" "$@" "$ROOT/conf/settings.json" > "$temporary" || \
-        ! chgrp "$account_gid" "$temporary" || ! chmod 640 "$temporary" || ! mv -f "$temporary" "$ROOT/conf/settings.json"; then
-        rm -f "$temporary"; return 1
+    settings_temporary=$(mktemp "$ROOT/conf/settings.XXXXXX") || return 1
+    if ! "$JQ" "$@" "$ROOT/conf/settings.json" > "$settings_temporary" || \
+        ! chgrp "$account_gid" "$settings_temporary" || ! chmod 640 "$settings_temporary" || ! mv -f "$settings_temporary" "$ROOT/conf/settings.json"; then
+        rm -f "$settings_temporary"; return 1
     fi
 }
 account_stop() {

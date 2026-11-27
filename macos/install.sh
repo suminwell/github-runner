@@ -9,34 +9,8 @@ token_has_admin_org() {
     [ -n "$token_scopes" ] || return 0
     case ", $token_scopes," in *", admin:org,"*) return 0 ;; *) return 1 ;; esac
 }
-sha256_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
+sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
 xml() { printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
-unit_quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; }
-# systemd unquotes Environment= and ExecStart=, but rejects a quoted WorkingDirectory=.
-systemd_unit() {
-    exec_path=$(unit_quote "$4/bin/service.sh" | sed 's/\$/$$/g')
-    cat <<UNIT
-[Unit]
-Description=GitHub organization runner supervisor
-Wants=network-online.target
-After=network-online.target
-StartLimitIntervalSec=0
-[Service]
-Type=simple
-User=$1
-WorkingDirectory=$(printf '%s' "$4" | sed 's/%/%%/g')
-Environment="HOME=$(unit_quote "$2")"
-Environment="PATH=$(unit_quote "$3")"
-ExecStart=/bin/bash "$exec_path"
-Restart=always
-RestartSec=10
-KillMode=control-group
-TimeoutStopSec=90
-UMask=0077
-[Install]
-WantedBy=multi-user.target
-UNIT
-}
 # Interactive: launchd applies no background CPU/IO throttling to the runner and its jobs.
 launchd_plist() {
     cat <<PLIST
@@ -69,79 +43,51 @@ awake_plist() {
 PLIST
 }
 # install: (re)start the guard from a root-owned copy; remove: let go of sleep and delete it.
-# Earlier versions named the guard <service>.sleep; it is released and removed either way.
 awake_guard() {
-    local name script
-    for name in "$service_name.sleep" "$service_name.awake"; do
-        script=/Library/PrivilegedHelperTools/$name.sh
-        # Booting the guard out releases sleep; its replacement takes it again within seconds.
-        sudo launchctl bootout "system/$name" 2>/dev/null || :
-        if [ -f "$script" ]; then sudo /bin/bash "$script" release "$service_name"; fi
-        sudo rm -f "$script" "/Library/LaunchDaemons/$name.plist"
+    guard_name=$service_name.awake
+    guard_script=/Library/PrivilegedHelperTools/$guard_name.sh
+    guard_definition=/Library/LaunchDaemons/$guard_name.plist
+    # Booting the guard out releases sleep; its replacement takes it again within seconds.
+    sudo launchctl bootout "system/$guard_name" 2>/dev/null || :
+    if [ "$1" = install ]; then
+        awake_plist "$guard_name" "$guard_script" "$root/conf/manager.pid" "$service_name" > "$definition"
+        sudo mkdir -p /Library/PrivilegedHelperTools
+        sudo install -o root -g wheel -m 755 "$root/bin/awake.sh" "$guard_script"
+        sudo install -o root -g wheel -m 644 "$definition" "$guard_definition"
+        sudo launchctl enable "system/$guard_name"
+        sudo launchctl bootstrap system "$guard_definition"
+    else
+        if [ -f "$guard_script" ]; then sudo /bin/bash "$guard_script" release "$service_name"; fi
+        sudo rm -f "$guard_script" "$guard_definition"
+    fi
+}
+# Connections to GitHub can drop mid-handshake (curl 35, "EOF"); retry before failing.
+download() {
+    download_attempt=1
+    while ! curl -fsSL --connect-timeout 15 --max-time "${3:-600}" "$1" -o "$2"; do
+        [ "$download_attempt" -lt 4 ] || { printf 'Download failed after 4 attempts: %s\nCheck the network to GitHub and run the same install command again; completed steps are kept.\n' "$1" >&2; return 1; }
+        printf 'Download attempt %s failed; retrying in %ss: %s\n' "$download_attempt" "$((download_attempt * 5))" "$1" >&2
+        sleep "$((download_attempt * 5))"
+        download_attempt=$((download_attempt + 1))
     done
-    [ "$1" = install ] || return 0
-    name=$service_name.awake; script=/Library/PrivilegedHelperTools/$name.sh
-    awake_plist "$name" "$script" "$root/conf/manager.pid" "$service_name" > "$definition"
-    sudo mkdir -p /Library/PrivilegedHelperTools
-    sudo install -o root -g wheel -m 755 "$root/bin/awake.sh" "$script"
-    sudo install -o root -g wheel -m 644 "$definition" "/Library/LaunchDaemons/$name.plist"
-    sudo launchctl enable "system/$name"
-    sudo launchctl bootstrap system "/Library/LaunchDaemons/$name.plist"
 }
 fetch() {
     if [ -n "${LOCAL_RUNNER_SOURCE_DIR:-}" ]; then cp "$LOCAL_RUNNER_SOURCE_DIR/$1" "$2.new";
-    else curl -fsSL --connect-timeout 15 --max-time 120 "$base/$1" -o "$2.new"; fi
+    else download "$base/$1" "$2.new" 120; fi
     mv -f "$2.new" "$2"
 }
 detect_architecture() {
     case "$(uname -m)" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) echo 'Only x64/arm64 are supported.' >&2; return 1 ;; esac
-    if [ "$platform" = macos ] && [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || :)" = 1 ]; then arch=arm64; fi
+    # A Rosetta shell reports x86_64 on Apple silicon.
+    if [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || :)" = 1 ]; then arch=arm64; fi
 }
 stop_installed_service() {
-    user_id=$(id -u)
-    if [ "$platform" = linux ]; then
-        service_name=local-github-runner-$user_id-$arch.service
-        definition_path=$(sudo systemctl show "$service_name" -p FragmentPath --value 2>/dev/null || :)
-        if [ -n "$definition_path" ]; then
-            installed_root=$(sudo systemctl show "$service_name" -p WorkingDirectory --value)
-            case "$installed_root" in "$root"|"$root/$arch") ;; *) echo 'Another installation owns this service name.' >&2; exit 1 ;; esac
-            sudo systemctl disable --now "$service_name"
-        fi
-    else
-        service_name=com.suminwell.github-runner.$user_id.$arch
-        definition_path=/Library/LaunchDaemons/$service_name.plist
-        if [ -f "$definition_path" ]; then
-            command_path=$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$definition_path")
-            case "$command_path" in "$root/bin/service.sh"|"$root/service.sh"|"$root/$arch/bin/service.sh") ;; *) echo 'Another installation owns this service name.' >&2; exit 1 ;; esac
-            sudo launchctl bootout "system/$service_name" 2>/dev/null || :
-            sudo launchctl disable "system/$service_name"
-        fi
-    fi
-}
-migrate_layout() {
-    legacy=$root/$arch
-    if [ -f "$legacy/.state/settings.json" ] || [ -f "$legacy/conf/settings.json" ]; then
-        for part in bin data logs conf; do [ ! -e "$root/$part" ] || { echo "Both layouts exist at $root; resolve them before upgrading." >&2; exit 1; }; done
-        for part in bin data logs; do [ ! -d "$legacy/$part" ] || mv "$legacy/$part" "$root/$part"; done
-        if [ -d "$legacy/.state" ]; then mv "$legacy/.state" "$root/conf"; else mv "$legacy/conf" "$root/conf"; fi
-        rmdir "$legacy" 2>/dev/null || :
-    fi
-    if [ -d "$root/.state" ]; then
-        [ ! -e "$root/conf" ] || { echo 'Both .state and conf exist; resolve them before upgrading.' >&2; exit 1; }
-        mv "$root/.state" "$root/conf"
-    fi
-    if [ -d "$root/conf/package" ]; then mkdir -p "$root/bin/.cache"; [ ! -e "$root/bin/.cache/package" ] || { echo 'Both package caches exist.' >&2; exit 1; }; mv "$root/conf/package" "$root/bin/.cache/package"; fi
-    if [ -d "$root/conf/tools" ]; then mkdir -p "$root/bin"; [ ! -e "$root/bin/tools" ] || { echo 'Both tool directories exist.' >&2; exit 1; }; mv "$root/conf/tools" "$root/bin/tools"; fi
-    for organization in "$root"/bin/*; do
-        [ -f "$organization/runner/.runner" ] || continue
-        login=${organization##*/}
-        destination=$root/runner/$login
-        [ ! -e "$destination" ] || { echo 'Both organization runner layouts exist.' >&2; exit 1; }
-        mkdir -p "$destination"
-        mv "$organization/runner" "$destination/app"
-        rm -f "$organization/runner.sh"
-        rmdir "$organization" 2>/dev/null || :
-    done
+    service_name=com.suminwell.github-runner.$(id -u).$arch
+    definition_path=/Library/LaunchDaemons/$service_name.plist
+    [ -f "$definition_path" ] || return 0
+    [ "$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$definition_path")" = "$root/bin/service.sh" ] || { echo 'Another installation owns this service name.' >&2; exit 1; }
+    sudo launchctl bootout "system/$service_name" 2>/dev/null || :
+    sudo launchctl disable "system/$service_name"
 }
 initialize_install_settings() {
     [ ! -f "$root/conf/settings.json" ] || return 0
@@ -155,31 +101,22 @@ initialize_install_settings() {
 install_main() {
     umask 077
     platform=macos
-    case "$platform:$(uname -s)" in linux:Linux|macos:Darwin) ;; *) echo 'Incorrect platform installer' >&2; exit 1 ;; esac
+    [ "$(uname -s)" = Darwin ] || { echo 'Incorrect platform installer' >&2; exit 1; }
     detect_architecture
     if [ "${1:-auto}" != auto ] && [ "$1" != "$arch" ]; then echo "Architecture mismatch: requested $1, host $arch" >&2; exit 1; fi
     [ "$(id -u)" -ne 0 ] || { echo 'Use a normal user; sudo is used for system setup.' >&2; exit 1; }
     sudo -v
     if ! command -v jq >/dev/null 2>&1; then
-        if [ "$platform" = macos ]; then
-            if ! command -v brew >/dev/null 2>&1; then
-                setup=$(mktemp)
-                curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$setup"
-                /bin/bash "$setup"; rm -f "$setup"
-                if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"; else eval "$(/usr/local/bin/brew shellenv)"; fi
-            fi
-            brew install jq
-        elif command -v apt-get >/dev/null; then sudo apt-get update; sudo apt-get install -y jq ca-certificates;
-        elif command -v dnf >/dev/null; then sudo dnf install -y jq ca-certificates;
-        elif command -v zypper >/dev/null; then sudo zypper --non-interactive install jq ca-certificates;
-        elif command -v pacman >/dev/null; then sudo pacman -S --needed --noconfirm jq ca-certificates;
-        else echo 'Install jq before running this installer.' >&2; exit 1; fi
+        if ! command -v brew >/dev/null 2>&1; then
+            setup=$(mktemp)
+            download https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh "$setup" 120
+            /bin/bash "$setup"; rm -f "$setup"
+            if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"; else eval "$(/usr/local/bin/brew shellenv)"; fi
+        fi
+        brew install jq
     fi
-    if [ "$platform" = linux ]; then command -v flock >/dev/null || { echo 'Install util-linux (flock) first.' >&2; exit 1; }; fi
     base=${LOCAL_RUNNER_BASE_URL:-https://raw.githubusercontent.com/suminwell/github-runner/main}
     default_root=${LOCAL_RUNNER_HOME:-"$HOME/.local/share/github-runner"}/$platform
-    previous_root=$HOME/.local/share/github-runner/$platform
-    if [ -z "${LOCAL_RUNNER_HOME:-}" ] && { [ -d "$previous_root/.state" ] || [ -d "$previous_root/$arch/.state" ]; }; then default_root=$previous_root; fi
     installed_command=$(command -v ghr || :)
     if [ -z "${LOCAL_RUNNER_HOME:-}" ] && [ -f "$installed_command" ]; then
         installed_root=$(sed -n 's/^# ghr: //p' "$installed_command")
@@ -195,25 +132,12 @@ install_main() {
 '*) echo 'Newlines are not supported in installation paths.' >&2; exit 1 ;; esac
     mkdir -p "$root"
     root=$(cd "$root" && pwd)
-    known_installation=false
-    for settings_file in "$root/conf/settings.json" "$root/.state/settings.json" "$root/$arch/.state/settings.json" "$root/$arch/conf/settings.json"; do
-        if [ -f "$settings_file" ]; then
-            jq -e --arg platform "$platform" '.platform==$platform' "$settings_file" >/dev/null || { echo 'Installation configuration belongs to a different platform.' >&2; exit 1; }
-            known_installation=true
-        fi
-    done
-    if [ "$known_installation" = false ]; then
+    if [ -f "$root/conf/settings.json" ]; then
+        jq -e --arg platform "$platform" '.platform==$platform' "$root/conf/settings.json" >/dev/null || { echo 'Installation configuration belongs to a different platform.' >&2; exit 1; }
+    else
         for part in bin conf runner; do [ ! -e "$root/$part" ] || { echo "Refusing to reuse unrelated directory $root/$part; choose another installation directory." >&2; exit 1; }; done
     fi
-    other_arch=x64; [ "$arch" != x64 ] || other_arch=arm64
-    { [ ! -f "$root/$other_arch/.state/settings.json" ] && [ ! -f "$root/$other_arch/conf/settings.json" ]; } || { echo 'An installation for another architecture exists; stop it and move it aside before upgrading.' >&2; exit 1; }
-    if [ -f "$root/$arch/.state/settings.json" ] || [ -f "$root/$arch/conf/settings.json" ]; then
-        for part in bin data logs .state; do
-            [ ! -e "$root/$part" ] || { echo "Both layouts exist at $root; resolve them before upgrading." >&2; exit 1; }
-        done
-    fi
     stop_installed_service
-    migrate_layout
     initialize_install_settings
     # Re-running the installer usually repairs credentials or configuration, so every
     # organization is retried at once instead of after its backoff (up to an hour).
@@ -229,20 +153,17 @@ install_main() {
     fi
     if [ -z "$gh_path" ]; then
         temporary=$(mktemp -d "$root/bin/.cache/gh.XXXXXX")
-        curl -fsSL --max-time 120 https://api.github.com/repos/cli/cli/releases/latest -o "$temporary/release.json"
+        download https://api.github.com/repos/cli/cli/releases/latest "$temporary/release.json" 120
         version=$("$jq_path" -r '.tag_name|ltrimstr("v")' "$temporary/release.json")
         cli_arch=$arch; [ "$arch" != x64 ] || cli_arch=amd64
-        cli_os=linux; extension=tar.gz
-        if [ "$platform" = macos ]; then cli_os=macOS; extension=zip; fi
-        filename=gh_${version}_${cli_os}_${cli_arch}.${extension}
+        filename=gh_${version}_macOS_${cli_arch}.zip
         url=$("$jq_path" -r --arg name "$filename" '.assets[]|select(.name==$name)|.browser_download_url' "$temporary/release.json")
         digest=$("$jq_path" -r --arg name "$filename" '.assets[]|select(.name==$name)|.digest' "$temporary/release.json")
         printf '%s' "$digest" | grep -Eq '^sha256:[a-fA-F0-9]{64}$' || { echo 'Missing gh asset digest.' >&2; exit 1; }
-        curl -fsSL --max-time 600 "$url" -o "$temporary/$filename"
+        download "$url" "$temporary/$filename"
         [ "$(sha256_file "$temporary/$filename")" = "${digest#sha256:}" ] || { echo 'gh SHA-256 mismatch.' >&2; exit 1; }
         mkdir "$temporary/unpacked"
-        if [ "$extension" = zip ]; then unzip -q "$temporary/$filename" -d "$temporary/unpacked";
-        else tar -xzf "$temporary/$filename" -C "$temporary/unpacked"; fi
+        unzip -q "$temporary/$filename" -d "$temporary/unpacked"
         downloaded_gh=$(find "$temporary/unpacked" -type f -name gh -print | head -n 1)
         cp "$downloaded_gh" "$root/bin/tools/gh"; chmod 700 "$root/bin/tools/gh"
         gh_path=$root/bin/tools/gh
@@ -274,9 +195,9 @@ install_main() {
     default_work=$(pwd -P)
     [ ! -f "$root/conf/settings.json" ] || default_work=$root
     [ -f "$root/conf/settings.json" ] || printf '{}\n' > "$root/conf/settings.json"
-    "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" --argjson owner_uid "$(id -u)" --arg default_work "$default_work" \
+    "$jq_path" --arg platform "$platform" --arg arch "$arch" --argjson owner_uid "$(id -u)" --arg default_work "$default_work" \
         --argjson prevent_sleep "$prevent_sleep" \
-        '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.prevent_sleep=$prevent_sleep|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
+        '.platform=$platform|.arch=$arch|.owner_uid=$owner_uid|.prevent_sleep=$prevent_sleep|.work_dir //= $default_work|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
         "$root/conf/settings.json" > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
     fetch "$platform/install.sh" "$root/bin/install.sh"
@@ -284,46 +205,30 @@ install_main() {
     fetch "$platform/ghr.sh" "$root/bin/ghr.sh"
     fetch "$platform/runner.sh" "$root/bin/runner.sh"
     fetch "$platform/awake.sh" "$root/bin/awake.sh"
-    rm -f "$root/bin/sleep.sh"
     chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh" "$root/bin/awake.sh"
-    /bin/bash "$root/bin/service.sh" prepare
-    if [ "$platform" = linux ]; then sudo /bin/bash "$root/bin/.cache/package/bin/installdependencies.sh"; fi
+    /bin/bash "$root/bin/service.sh" prepare || { echo 'Preparing the official Runner failed (see the error above). Run the same install command again to retry.' >&2; exit 1; }
     /bin/bash "$root/bin/ghr.sh" --install-command
     work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
-    mkdir -p "$work_dir/data" "$work_dir/logs"
+    mkdir -p "$work_dir/jobs" "$work_dir/logs"
     printf 'Data/logs directory: %s\n' "$work_dir"
     user=$(id -un); user_id=$(id -u)
     definition=$(mktemp)
-    if [ "$platform" = linux ]; then
-        [ -d /run/systemd/system ] || { echo 'Linux must be booted with systemd.' >&2; rm -f "$definition"; exit 1; }
-        service_name=local-github-runner-$user_id-$arch.service
-        systemd_unit "$user" "$HOME" "$PATH" "$root" > "$definition"
-        sudo install -m 644 "$definition" "/etc/systemd/system/$service_name"
-        sudo systemctl daemon-reload
-        if [ -f "$root/conf/stopped" ]; then sudo systemctl disable "$service_name";
-        else
-            sudo systemctl enable "$service_name"
-            sudo systemctl restart "$service_name"
-            sudo systemctl is-active --quiet "$service_name"
-        fi
+    service_name=com.suminwell.github-runner.$user_id.$arch
+    launchd_plist "$service_name" "$user" "$HOME" "$PATH" "$root" > "$definition"
+    sudo launchctl bootout "system/$service_name" 2>/dev/null || :
+    sudo install -o root -g wheel -m 644 "$definition" "/Library/LaunchDaemons/$service_name.plist"
+    if [ -f "$root/conf/stopped" ]; then sudo launchctl disable "system/$service_name";
     else
-        service_name=com.suminwell.github-runner.$user_id.$arch
-        launchd_plist "$service_name" "$user" "$HOME" "$PATH" "$root" > "$definition"
-        sudo launchctl bootout "system/$service_name" 2>/dev/null || :
-        sudo install -o root -g wheel -m 644 "$definition" "/Library/LaunchDaemons/$service_name.plist"
-        if [ -f "$root/conf/stopped" ]; then sudo launchctl disable "system/$service_name";
-        else
-            sudo launchctl enable "system/$service_name"
-            sudo launchctl bootstrap system "/Library/LaunchDaemons/$service_name.plist"
-            sudo launchctl print "system/$service_name" >/dev/null
-        fi
-        # The guard runs even while the service is stopped, so ghr start needs no sudo for it.
-        if [ "$prevent_sleep" = true ]; then
-            awake_guard install
-            printf 'Sleep prevention: on; this Mac stays awake, also with the lid closed, while the runner service runs.\n'
-        else awake_guard remove; fi
+        sudo launchctl enable "system/$service_name"
+        sudo launchctl bootstrap system "/Library/LaunchDaemons/$service_name.plist"
+        sudo launchctl print "system/$service_name" >/dev/null
     fi
-    rm -f "$definition" "$root/install.sh" "$root/service.sh" "$root/ghr.sh"
+    # The guard runs even while the service is stopped, so ghr start needs no sudo for it.
+    if [ "$prevent_sleep" = true ]; then
+        awake_guard install
+        printf 'Sleep prevention: on; this Mac stays awake, also with the lid closed, while the runner service runs.\n'
+    else awake_guard remove; fi
+    rm -f "$definition"
     printf '\nInstalled %s\n\n' "$service_name"
     /bin/bash "$root/bin/ghr.sh" help
     case ":$PATH:" in *:/usr/local/bin:*) ;; *) printf '\nAdd /usr/local/bin to PATH: export PATH="/usr/local/bin:$PATH"\n' ;; esac

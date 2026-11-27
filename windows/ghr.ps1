@@ -8,8 +8,8 @@ ghr start: 启动runner
 ghr stop: 停止runner
 ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
-ghr config [--data-dir]: 显示data和logs的父目录
-ghr config --data-dir <PATH>: 设置data和logs的父目录，路径必须是已存在的空目录，重启后生效
+ghr config [--data-dir]: 显示jobs和logs的父目录
+ghr config --data-dir <PATH>: 设置jobs和logs的父目录，路径必须是已存在的空目录，重启后生效
 ghr runner: 显示每个组织的runner个数及本机上限（CPU核数的一半）
 ghr runner -a|--add: 每个组织增加一个runner，无需重启，超过上限时报错
 ghr runner -s|--sub: 每个组织减少一个runner，最少保留1个，多出的runner空闲后移除
@@ -99,11 +99,11 @@ function Show-Status {
         $directoryState = if ($manager) { 'active' } else { 'last run; manager stopped' }
     }
     $items.Add(@('Work directory', "$work ($directoryState)"))
-    $items.Add(@('Data directory', (Join-Path $work 'data')))
+    $items.Add(@('Jobs directory', (Join-Path $work 'jobs')))
     $items.Add(@('Logs directory', (Join-Path $work 'logs')))
     $items.Add(@('Configured work directory', $script:WorkDir))
     if ($work -ne $script:WorkDir) {
-        $items.Add(@('Configuration', "pending; next start uses $(Join-Path $script:WorkDir 'data') and $(Join-Path $script:WorkDir 'logs')"))
+        $items.Add(@('Configuration', "pending; next start uses $(Join-Path $script:WorkDir 'jobs') and $(Join-Path $script:WorkDir 'logs')"))
         $notes += 'Run ghr restart (or stop then start) to apply the pending directory change.'
     } else { $items.Add(@('Configuration', 'no pending directory change')) }
     Write-Host 'GitHub Runner status'; Write-Host ''
@@ -213,7 +213,7 @@ function Show-Logs([switch]$Track) {
         }
     } finally { if ($reader) { $reader.Dispose() } }
 }
-function Grant-DataDirectory([string]$Directory) {
+function Grant-WorkDirectory([string]$Directory) {
     New-Item -ItemType Directory -Force -Path $Directory | Out-Null
     $acl = Get-Acl -LiteralPath $Directory
     $sid = New-Object Security.Principal.SecurityIdentifier('S-1-5-19')
@@ -233,8 +233,8 @@ function Set-WorkDirectory([string]$Directory) {
     foreach ($reserved in @((Join-Path $script:Root 'bin'), (Join-Path $script:Root 'conf'), (Join-Path $script:Root 'runner'))) {
         if ($absolute -eq $reserved -or ($reserved -ne $script:Root -and $absolute.StartsWith($reserved + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase))) { throw 'Data must be outside the program and state directories.' }
     }
-    Grant-DataDirectory (Join-Path $absolute 'data')
-    Grant-DataDirectory (Join-Path $absolute 'logs')
+    Grant-WorkDirectory (Join-Path $absolute 'jobs')
+    Grant-WorkDirectory (Join-Path $absolute 'logs')
     Save-Setting 'work_dir' $absolute
     Write-Host "Data directory saved: $absolute"
     Write-Host 'Run ghr restart (or stop then start) to apply. Existing data and logs are not moved.'
@@ -281,7 +281,11 @@ function Unregister-UntrackedRunners($State) {
     $runners = Join-Path $script:Root 'runner'
     if (-not (Test-Path -LiteralPath $runners)) { return }
     if ((Get-Item -Force -LiteralPath $runners).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing registration recovery through a linked runner directory.' }
-    foreach ($directory in @(Get-ChildItem -Force -LiteralPath $runners | Where-Object PSIsContainer)) {
+    $directories = @(Get-ChildItem -Force -LiteralPath $runners | Where-Object PSIsContainer | ForEach-Object {
+        if ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing registration recovery through a linked organization directory.' }
+        Get-ChildItem -Force -LiteralPath $_.FullName | Where-Object PSIsContainer
+    })
+    foreach ($directory in $directories) {
         $app = Join-Path $directory.FullName 'app'
         $path = Join-Path $app '.runner'
         if (-not (Test-Path -LiteralPath $path)) { continue }
@@ -290,10 +294,8 @@ function Unregister-UntrackedRunners($State) {
         }
         $local = Read-Json $path
         if ($null -eq $local -or "$($local.agentId)" -notmatch '^[1-9][0-9]*$') { throw 'Invalid local registration; retained metadata for repair.' }
-        # Existing directory/state pairs support older metadata, but an ID alone
-        # never identifies a registration in another organization.
-        if ($null -eq $local.gitHubUrl -and @($State.Keys | Where-Object { $State[$_].runner_id -eq $local.agentId -and ($State[$_].login + (Get-KeySuffix $_)) -ceq $directory.Name }).Count) { continue }
-        if ($local.agentName -cne $script:Prefix -and -not (Test-IndexedName $local.agentName)) { throw 'Local runner name does not identify this installation.' }
+        # A runner ID is scoped to its organization, which the official URL identifies.
+        if (-not (Test-IndexedName $local.agentName)) { throw 'Local runner name does not identify this installation.' }
         if ($local.gitHubUrl -notmatch '^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/?$') { throw 'Local registration does not identify a GitHub organization URL.' }
         $organization = Invoke-GitHubApi "orgs/$($Matches[1])"
         if ("$($organization.id)" -notmatch '^[1-9][0-9]*$' -or -not (Test-Organization $organization.login)) { throw 'Invalid organization identity.' }
@@ -372,7 +374,7 @@ function Uninstall-Runner {
     Remove-InstallationTree $bin
     Remove-InstallationTree (Join-Path $script:Root 'conf')
     foreach ($file in @('install.ps1','service.ps1','ghr.ps1')) { Remove-Item (Join-Path $script:Root $file) -Force -ErrorAction SilentlyContinue }
-    Write-Host "Runner uninstalled. Work data retained: $script:DataDir"
+    Write-Host "Runner uninstalled. Jobs retained: $script:JobsDir"
     Write-Host 'Data and logs remain in their original directories.'
 }
 if ($Command -ne 'library') {
@@ -390,7 +392,7 @@ if ($Command -ne 'library') {
         'config' { Invoke-Config $CommandOptions }
         'runner' { Invoke-RunnerCount $CommandOptions }
         'uninstall' { Uninstall-Runner }
-        'install-command' { Install-Command; Grant-DataDirectory $script:DataDir; Grant-DataDirectory $script:LogDir }
+        'install-command' { Install-Command; Grant-WorkDirectory $script:JobsDir; Grant-WorkDirectory $script:LogDir }
         'help' { Show-Usage }
     }
 }

@@ -2,15 +2,15 @@
 # One persistent runner of an organization, launched by service.sh.
 . "${1:?installation root required}/bin/service.sh"
 worker_loop() {
-    local id=$1 log_file=${2:-} login process_id
+    local id=$1 log_file=${2:-} login name process_id
     safe_key "$id" || return 1
     login=$("$JQ" -r --arg id "$id" '.[$id].login // empty' "$STATE/organizations.json")
-    safe_org "$login" || return 1
-    login=$login$(key_suffix "$id")
+    name=$("$JQ" -r --arg id "$id" '.[$id].runner_name // empty' "$STATE/organizations.json")
+    safe_org "$login" && indexed_name "$name" || return 1
     stop_record "$STATE/children/$id.pid"
     trap 'stop_record "$STATE/children/$id.pid"' EXIT
     trap 'exit 0' TERM INT
-    cd "$ROOT/runner/$login/app" || return 1
+    cd "$ROOT/runner/$login/$name/app" || return 1
     while [ ! -f "$ROOT/conf/stopped" ]; do
         # Reopen the manager's log each round so output follows log rotation.
         [ -z "$log_file" ] || exec >> "$log_file" 2>&1

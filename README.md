@@ -16,7 +16,7 @@ Windows，在管理员 PowerShell 执行：
 irm https://raw.githubusercontent.com/suminwell/github-runner/main/install.ps1 | iex
 ```
 
-安装时会询问**程序安装目录**，直接回车使用默认值。该目录固定维护 `bin/`、`conf/` 和 `runner/`。首次安装的数据和日志默认保存在**执行安装命令时的当前目录**下的 `data/`、`logs/`。
+安装时会询问**程序安装目录**，直接回车使用默认值。该目录固定维护 `bin/`、`conf/` 和 `runner/`。首次安装的 job 工作目录和日志默认保存在**执行安装命令时的当前目录**下的 `jobs/`、`logs/`。
 
 | 平台 | 默认程序安装目录 | 开机托管 |
 | --- | --- | --- |
@@ -105,7 +105,7 @@ Docker 需要 20.10.10 或更高版本。安装器在改动任何内容之前完
 systemd=true
 ```
 
-保存正在进行的工作后，在 Windows 执行 `wsl --terminate <发行版名称>`，重新打开该发行版，并使用上面的 Linux 一行安装命令。建议把安装目录、`data` 和 `logs` 放在 Linux 文件系统，例如 `/home/你的用户/`；`/mnt/c` 等 Windows 挂载目录的权限语义和构建性能不同。
+保存正在进行的工作后，在 Windows 执行 `wsl --terminate <发行版名称>`，重新打开该发行版，并使用上面的 Linux 一行安装命令。建议把安装目录、`jobs` 和 `logs` 放在 Linux 文件系统，例如 `/home/你的用户/`；`/mnt/c` 等 Windows 挂载目录的权限语义和构建性能不同。
 
 **systemd 仅负责发行版启动后的 runner 自启，不能保证 Windows 开机启动发行版，也不能单独保持 WSL 存活。**因此安装器会直接从 WSL 调用 Windows PowerShell，自动带入发行版、Linux 用户和安装目录，并在 Windows 本机弹出 UAC 提权及账户密码提示。root 安装时 Windows 任务使用专用 Linux 账户 `ghrunner` 保活，Windows 账户仍是发行版所属的账户；推荐使用默认 `/opt/github-runner/linux`，确保 Windows 可读取桥接脚本。所有 WSL 支持代码都放在 `linux/`；无需进入 `windows/`，也无需另开 PowerShell 手动执行安装命令。
 
@@ -137,8 +137,8 @@ ghr start: 启动runner
 ghr stop: 停止runner
 ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
-ghr config [--data-dir]: 显示data和logs的父目录
-ghr config --data-dir <PATH>: 设置data和logs的父目录，路径必须是已存在的空目录，重启后生效
+ghr config [--data-dir]: 显示jobs和logs的父目录
+ghr config --data-dir <PATH>: 设置jobs和logs的父目录，路径必须是已存在的空目录，重启后生效
 ghr runner: 显示每个组织的runner个数及本机上限（CPU核数的一半）
 ghr runner -a|--add: 每个组织增加一个runner，无需重启，超过上限时报错
 ghr runner -s|--sub: 每个组织减少一个runner，最少保留1个，多出的runner空闲后移除
@@ -150,7 +150,7 @@ ghr uninstall: 卸载runner
 - `stop`：关闭自动启动，停止管理服务及各组织的 Runner，保留注册和数据。Linux 会核验原生服务已停止；查询或停止失败会显示错误并返回非零退出码。正在运行的 job 会被中断：Linux/macOS 先发送 TERM，等待官方 Runner 取消 job 并上报（最多 `stop_seconds` 秒）后再强制结束；Windows 直接强制结束。
 - `restart`：先停止再启动，并应用保存的目录配置。Runner 个数不需要重启。
 - `logs`：显示管理日志最后 200 行；`logs -f` 持续跟踪新增日志，日志轮换后继续跟踪，按 Ctrl+C 结束。
-- `config`：显示 `data-dir`（数据和日志的父目录）；`config --data-dir` 只输出该路径。`config --data-dir <PATH>` 设置新目录，见[修改数据和日志目录](#修改数据和日志目录)。`config` 只接受完整选项名 `--data-dir`，不支持 `-d` 简写、旧的 `--dir`，也不支持 `--data-dir=<PATH>` 写法；路径包含空格时用引号括起。
+- `config`：显示 `data-dir`（`jobs/` 和 `logs/` 的父目录）；`config --data-dir` 只输出该路径。`config --data-dir <PATH>` 设置新目录，见[修改数据和日志目录](#修改数据和日志目录)。`config` 只接受完整选项名 `--data-dir`，不支持简写或 `--data-dir=<PATH>` 写法；路径包含空格时用引号括起。
 - `runner`：显示每个组织的 Runner 个数和本机上限；`runner -a`/`--add` 加一个，`runner -s`/`--sub` 减一个，见[每个组织多个 Runner](#每个组织多个-runner)。
 - `uninstall`：停止进程，注销本机记录的 GitHub Runner，移除系统服务、命令、脚本和配置；所有工作数据与日志保留。若注册成功后尚未保存组织状态就退出，会从本地官方 `.runner` 元数据补查组织和远端身份。身份无法确认或 GitHub 注销失败时保留凭据和状态，修复后再次执行卸载。其他机器的 Runner 不会被删除。
 
@@ -168,7 +168,7 @@ Runners per organization   2
 Install directory          /home/user/.local/share/github-runner/linux
 Runner directory           /home/user/.local/share/github-runner/linux/runner
 Work directory             /srv/builds (active)
-Data directory             /srv/builds/data
+Jobs directory             /srv/builds/jobs
 Logs directory             /srv/builds/logs
 Configured work directory  /srv/builds
 Configuration              no pending directory change
@@ -213,17 +213,18 @@ ghr config --data-dir "D:\Build Workspace"
 ghr restart
 ```
 
-新目录必须已经存在且为空（包括隐藏文件），否则拒绝设置，避免 Runner 的 `data/`、`logs/` 与其他文件混在一起。当前正在使用的目录也不能再次设置。
+新目录必须已经存在且为空（包括隐藏文件），否则拒绝设置，避免 Runner 的 `jobs/`、`logs/` 与其他文件混在一起。当前正在使用的目录也不能再次设置。
 
 重启后使用：
 
 ```text
 指定目录/
-├── data/
+├── jobs/
 │   └── organization-a/
-│   │   └── repository-one/
-│   │       └── repository-one/  # 官方 checkout / GITHUB_WORKSPACE
-│   └── organization-a.2/       # ghr runner --add 后，第 2 个 Runner 的工作目录
+│       ├── local-linux-x64-1/   # 每个 Runner 一个工作目录，以 Runner 名称命名
+│       │   └── repository-one/
+│       │       └── repository-one/  # 官方 checkout / GITHUB_WORKSPACE
+│       └── local-linux-x64-2/   # ghr runner --add 后新增的 Runner
 └── logs/
     └── service.log
 ```
@@ -267,13 +268,14 @@ windows/awake.ps1               # Windows 和 WSL 宿主：服务运行期间阻
 │   └── ...                     # 进程记录及运行状态
 └── runner/
     └── organization-a/
-        ├── runner.sh           # 本组织的长期运行脚本
-        └── app/                # 官方 Runner 程序、凭据及 _diag 日志
+        └── local-linux-x64-1/  # 每个 Runner 一个程序目录，以 Runner 名称命名
+            ├── runner.sh       # 该 Runner 的长期运行脚本
+            └── app/            # 官方 Runner 程序、凭据及 _diag 日志
 ```
 
-Windows 使用 `.ps1`，并包含 `bin/ghr.cmd` 和组织目录下的 `listener.ps1`。服务持续维护每个组织的 Runner：进程异常退出会恢复，系统重启后重新上线。Windows 使用开机触发、失败重启和每分钟检查的计划任务，文件锁与 `IgnoreNew` 避免重复启动。系统重启不会恢复已经中断的 job 进度；macOS FileVault 仍需先解锁启动磁盘。
+Windows 使用 `.ps1`，并包含 `bin/ghr.cmd` 和每个 Runner 目录下的 `listener.ps1`。服务持续维护每个组织的 Runner：进程异常退出会恢复，系统重启后重新上线。Windows 使用开机触发、失败重启和每分钟检查的计划任务，文件锁与 `IgnoreNew` 避免重复启动。系统重启不会恢复已经中断的 job 进度；macOS FileVault 仍需先解锁启动磁盘。
 
-Linux root 安装另有 `bin/account.sh`（来自 `linux/account.sh`），负责专用账户、目录授权和管理命令的权限切换；可写运行状态位于 `conf/runtime/`。普通用户安装保留原有 `conf/` 布局。Linux 安装还包含 `bin/wsl.sh`（来自 `linux/wsl.sh`，保活与命令桥接）和 `bin/wsl.ps1`（来自 `linux/wsl.ps1`，由 WSL 调用以管理 Windows 宿主任务）。普通 Linux 不配置宿主任务时不会调用 Windows 程序。WSL 完成宿主设置后在 `conf/wsl-host.json`（root 安装为 `conf/runtime/wsl-host.json`）保存非敏感任务信息，切换 `data/logs` 不改变此任务。`windows/` 始终只用于原生 Windows Runner 安装。
+Linux root 安装另有 `bin/account.sh`（来自 `linux/account.sh`），负责专用账户、目录授权和管理命令的权限切换；可写运行状态位于 `conf/runtime/`。普通用户安装保留原有 `conf/` 布局。Linux 安装还包含 `bin/wsl.sh`（来自 `linux/wsl.sh`，保活与命令桥接）和 `bin/wsl.ps1`（来自 `linux/wsl.ps1`，由 WSL 调用以管理 Windows 宿主任务）。普通 Linux 不配置宿主任务时不会调用 Windows 程序。WSL 完成宿主设置后在 `conf/wsl-host.json`（root 安装为 `conf/runtime/wsl-host.json`）保存非敏感任务信息，切换 `jobs/logs` 不改变此任务。`windows/` 始终只用于原生 Windows Runner 安装。
 
 ## Runner 编号与派活
 
@@ -307,11 +309,11 @@ ghr runner --sub    # 每个组织减一个，简写 -s
 - 每个组织最少 1 个，最多为本机逻辑 CPU 数的一半（不足 2 个 CPU 时为 1），例如 4 核最多 2 个、8 线程最多 4 个。已经是 1 个时再减、已到上限时再加，都会提示原因并以非零退出码失败。
 - 个数保存在 `conf/settings.json` 的 `runner_count`，运行中的管理服务几秒内生效，不需要重启，也不会中断正在运行的 job。保存的个数超过本机上限时（例如配置拷到核数更少的机器），按上限运行。Linux root 安装和 Windows 需要以 root / 管理员身份执行。
 - 调大时按编号规则依次注册新的 Runner，例如 `local-linux-x64-4`、`local-linux-x64-5`，它们与第一个 Runner 标签相同，GitHub 会把排队的 job 分给空闲的那个。
-- 每个 Runner 有独立的程序目录和工作目录：第 1 个仍是 `runner/<组织>`、`data/<组织>`，第 N 个是 `runner/<组织>.N`、`data/<组织>.N`，现有安装不需要迁移。
-- 调小时，多出的 Runner 空闲后才从 GitHub 注销并删除程序目录；正在跑 job 的会等 job 结束。它们的工作数据保留原位。
+- 每个 Runner 有独立的程序目录 `runner/<组织>/<Runner 名称>` 和工作目录 `jobs/<组织>/<Runner 名称>`。
+- 调小时，多出的 Runner 空闲后才从 GitHub 注销，并删除它的程序目录和 `jobs/` 下的工作目录；正在跑 job 的会等 job 结束。
 - 多个 Runner 共用这台机器的 CPU、内存、端口和 Docker：同时运行的 job 若使用固定端口、固定的容器名或 compose 项目名会互相冲突，可在 workflow 中改用随机端口或 `docker compose -p <唯一名称>`，必须互斥的 job 用 `concurrency:` 控制。
 
-仓库创建、改名后的工作目录由官方 Runner 按实际任务创建；旧目录保留。同名仓库按组织隔离。官方 Runner 会在 `data/<组织>/<仓库>/` 下再创建同名 checkout 子目录，并在组织工作目录下维护 `_temp`、`_actions`、`_tool` 等目录。组织改名通过稳定的组织 ID 识别，Runner 空闲后以原编号重新注册，并把 `runner/<旧名>` 程序目录迁到新名字；`data/<旧名>` 工作数据保留原位，新任务使用 `data/<新名>`。
+仓库创建、改名后的工作目录由官方 Runner 按实际任务创建；旧目录保留。同名仓库按组织隔离。官方 Runner 会在 `jobs/<组织>/<Runner 名称>/<仓库>/` 下再创建同名 checkout 子目录，并在该 Runner 的工作目录下维护 `_temp`、`_actions`、`_tool` 等目录。组织改名通过稳定的组织 ID 识别，Runner 空闲后以原编号重新注册，并把 `runner/<旧名>/<Runner 名称>` 程序目录迁到新组织名下；`jobs/<旧名>/` 下的工作目录保留原位，新任务使用 `jobs/<新名>/`。编号被其他机器占用而换号时，程序目录随新名称改名。
 
 ## 权限、更新与开发
 
@@ -321,7 +323,7 @@ ghr runner --sub    # 每个组织减一个，简写 -s
 
 凭据保存在受权限保护的 `conf/github-token`，不会传给构建子进程或写入日志。同一 OS 身份的任务仍能读取本机文件，只应接入可信组织和 workflow。Windows 上 LocalService 对 `bin\` 只读，只能写入 `conf\`、`runner\`、`bin\.cache` 和数据、日志目录，且 `conf\settings.json`、`conf\github-token` 仅可读，防止任务篡改管理员执行的脚本和配置。Windows LocalService 不具有管理员权限、交互桌面或个人钥匙串；Java、Docker、Xcode 等构建工具链需自行准备。
 
-再次执行安装命令即可更新，请在没有 job 运行时升级。通过 `ghr stop` 停止的安装在升级后仍保持停止，使用 `ghr start` 恢复。旧版架构目录、`.state` 和组织程序目录会迁移到新布局，保留注册和数据；存在冲突目录时停止，不覆盖。此前安装的工作数据默认保留原位置，新安装默认使用当前目录。
+再次执行安装命令即可更新，请在没有 job 运行时升级。通过 `ghr stop` 停止的安装在升级后仍保持停止，使用 `ghr start` 恢复。重复安装沿用已保存的数据目录，新安装默认使用当前目录。旧版本（`data/` 工作目录、`runner/<组织>/app` 程序目录及更早的布局）不会自动迁移，请先 `ghr uninstall` 再安装；旧的 `data/` 目录保留原位，可自行删除。
 
 本地源码安装：
 
@@ -357,4 +359,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .test/status.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .test/awake.ps1
 ```
 
-测试使用临时目录、假 GitHub API 和系统服务接口，验证注册编号、目录升级、真实子进程恢复、启停、配置生效、日志跟踪和卸载；不安装本机服务，不注册真实 Runner。CI 在 Linux、macOS、Windows 上运行，分别模拟 x64/arm64 配置。root 安装测试在一次性 Debian 容器内使用真实 UID、ACL 和进程，模拟 GitHub、官方 Runner 下载内容及 systemd 接口，覆盖中断重试、普通账户接活、配置保护、启停、重装和卸载。真实组织接单、两种原生硬件及系统重启恢复仍需集成验收。
+测试使用临时目录、假 GitHub API 和系统服务接口，验证注册编号、Runner 个数、真实子进程恢复、启停、配置生效、日志跟踪和卸载；不安装本机服务，不注册真实 Runner。CI 在 Linux、macOS、Windows 上运行，分别模拟 x64/arm64 配置。root 安装测试在一次性 Debian 容器内使用真实 UID、ACL 和进程，模拟 GitHub、官方 Runner 下载内容及 systemd 接口，覆盖中断重试、普通账户接活、配置保护、启停、重装和卸载。真实组织接单、两种原生硬件及系统重启恢复仍需集成验收。

@@ -52,13 +52,6 @@ Assert ($script:HoldArguments.StartsWith('--distribution "Ubuntu Work" --user ')
 Assert ((Quote-WslArgument 'a"b') -ceq '"a\"b"' -and (Quote-WslArgument '') -ceq '""') 'quotes and empty values still quoted'
 $script:SavedTask = $null; $script:Enabled = $false; $script:Started = $false; $script:Linked = $false; $script:LinuxStopped = $false
 function Get-ScheduledTask { param($TaskName,$ErrorAction); return $script:SavedTask }
-# A task registered by an earlier version, with every argument quoted, is still this installation's.
-$script:SavedTask = [pscustomobject]@{Actions=@([pscustomobject]@{Execute=$script:WslExe;Arguments=$script:LegacyHoldArguments});Principal=[pscustomobject]@{UserId='fixture\owner';LogonType='Password';RunLevel='Limited'};Description=$script:TaskDescription;State='Running'}
-Assert ($script:LegacyHoldArguments.StartsWith('"--distribution" ') -and $null -ne (Get-OwnedWslTask)) 'legacy fully quoted task still owned'
-$script:SavedTask.Actions[0].Arguments = '--distribution Other hold'
-$failed = $false; try { $null = Get-OwnedWslTask } catch { $failed = $true }
-Assert $failed 'a changed action is still refused'
-$script:SavedTask = $null
 function Get-Credential { param($UserName,$Message); return [pscredential]::new($UserName,(ConvertTo-SecureString 'fake-password-only' -AsPlainText -Force)) }
 function Register-WslTask([pscredential]$Credential, [bool]$Stopped) {
     Assert ($Credential.GetNetworkCredential().Password -eq 'fake-password-only' -and $Credential.UserName -eq 'fixture\owner') 'credential passed only to registration boundary'

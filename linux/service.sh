@@ -40,7 +40,7 @@ init() {
     case "$ARCH" in x64|arm64) ;; *) return 1 ;; esac
     PREFIX=local-$OS-$ARCH
     WORK_DIR=$("$JQ" -r --arg fallback "$ROOT" '.work_dir // $fallback' "$ROOT/conf/settings.json") || return 1
-    DATA_DIR=$WORK_DIR/data; LOG_DIR=$WORK_DIR/logs
+    JOBS_DIR=$WORK_DIR/jobs; LOG_DIR=$WORK_DIR/logs
     POLL=$("$JQ" -r '.poll_seconds // 300 | if . < 10 then 10 else . end | floor' "$ROOT/conf/settings.json")
     RESTART=$("$JQ" -r '.restart_seconds // 30 | if . < 1 then 1 else . end | floor' "$ROOT/conf/settings.json")
     # Below the 90 s systemd/launchd stop timeout, so a graceful stop is never cut short.
@@ -142,11 +142,10 @@ api() {
 clean_exec() { env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u GH_CONFIG_DIR -u RUNNER_MANUALLY_TRAP_SIG "$@"; }
 safe_org() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]; }
 safe_id() { [[ $1 =~ ^[0-9]+$ ]]; }
-# Each organization runs runner_count runners. The first keeps the organization ID as its
-# state key and runner/<login>, data/<login> as its directories; runner N (N >= 2) is
-# keyed <ID>.N and uses <login>.N, which no organization login can be (logins have no dot).
+# Each organization runs runner_count runners. Runner N of an organization is keyed by the
+# organization ID (N = 1) or <ID>.N in the state; its program lives in
+# runner/<login>/<runner name>/app and its jobs in jobs/<login>/<runner name>.
 safe_key() { [[ $1 =~ ^[0-9]+(\.([2-9]|[1-9][0-9]+))?$ ]]; }
-key_suffix() { case $1 in *.*) printf '.%s' "${1#*.}" ;; esac; }
 # At most half the logical CPUs (at least 1), so an organization's runners leave room for
 # each other; a count saved on a larger machine is capped here.
 cpu_count() {
@@ -233,28 +232,26 @@ stop_records() {
 stop_record() { stop_records "$1"; }
 stop_worker() { stop_records "$STATE/workers/$1.pid" "$STATE/children/$1.pid"; }
 wrapper() {
-    local directory=$ROOT/runner/$2
-    mkdir -p "$directory"
-    cp "$ROOT/bin/runner.sh" "$directory/runner.sh"
-    chmod 700 "$directory/runner.sh"
+    mkdir -p "$1" && cp "$ROOT/bin/runner.sh" "$1/runner.sh" && chmod 700 "$1/runner.sh"
 }
 ensure_worker() {
-    local id=$1 login=$2 suffix now due process_id
-    suffix=$(key_suffix "$id")
-    [ ! -f "$ROOT/conf/stopped" ] || return 0
-    "$JQ" -e --arg id "$id" --arg prefix "$PREFIX" '.[$id] | (.active != false) and (.relocated != true) and ((.runner_name // "") | test("^"+$prefix+"-[1-9][0-9]*$"))' "$STATE/organizations.json" >/dev/null || return 0
-    [ ! -f "$STATE/paused/$id" ] && [ -f "$ROOT/runner/$login$suffix/app/.runner" ] || return 0
+    local id=$1 login=$2 name directory now due process_id
+    [ ! -f "$ROOT/conf/stopped" ] && [ ! -f "$STATE/paused/$id" ] || return 0
+    name=$("$JQ" -r --arg id "$id" '.[$id] | select(.active != false) | .runner_name // empty' "$STATE/organizations.json")
+    indexed_name "$name" || return 0
+    directory=$ROOT/runner/$login/$name
+    [ -f "$directory/app/.runner" ] || return 0
     record_alive "$STATE/workers/$id.pid" && return 0
     now=$(date +%s); due=$(cat "$STATE/retry/$id" 2>/dev/null || printf 0)
     [ "$now" -ge "$due" ] || return 0
     stop_worker "$id"
-    prepare_workspace "$login" "$suffix" || return 1
-    wrapper "$id" "$login$suffix"
-    (exec 9>&-; clean_exec /bin/bash "$ROOT/runner/$login$suffix/runner.sh" "$ROOT" "$id" "$LOG_DIR/service.log") >> "$LOG_DIR/service.log" 2>&1 &
+    prepare_workspace "$login" "$name" || return 1
+    wrapper "$directory" || return 1
+    (exec 9>&-; clean_exec /bin/bash "$directory/runner.sh" "$ROOT" "$id" "$LOG_DIR/service.log") >> "$LOG_DIR/service.log" 2>&1 &
     process_id=$!
     record_pid "$STATE/workers/$id.pid" "$process_id" || :
     printf '%s\n' "$((now + RESTART))" > "$STATE/retry/$id"
-    log "Started $("$JQ" -r '.agentName // "runner"' "$ROOT/runner/$login$suffix/app/.runner") for $login (pid $process_id)"
+    log "Started $name for $login (pid $process_id)"
 }
 ensure_workers() {
     local id login
@@ -263,8 +260,8 @@ ensure_workers() {
         ensure_worker "$id" "$login"
     done < <("$JQ" -r 'to_entries[] | [.key,.value.login] | @tsv' "$STATE/organizations.json")
 }
-sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
-mtime() { if [ "$(uname -s)" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi; }
+sha256() { sha256sum "$1" | awk '{print $1}'; }
+mtime() { stat -c %Y "$1"; }
 # Connections to GitHub can drop mid-handshake (curl 35, "EOF"); retry before failing.
 download() {
     local url=$1 output=$2 attempt
@@ -296,7 +293,7 @@ verify_runtime() {
     printf 'Runtime check passed: Runner.Listener and %s bundled Node.js runtime(s).\n' "$nodes"
 }
 ensure_package() {
-    local release version runner_os filename url digest temporary age
+    local release version filename url digest temporary age
     PACKAGE=$ROOT/bin/.cache/package
     if [ -f "$PACKAGE/.complete" ]; then
         age=$(( $(date +%s) - $(mtime "$PACKAGE/.complete") ))
@@ -304,8 +301,7 @@ ensure_package() {
     fi
     release=$(api repos/actions/runner/releases/latest) || { sleep 5; release=$(api repos/actions/runner/releases/latest); } || { sleep 10; release=$(api repos/actions/runner/releases/latest); } || return 1
     version=$(printf '%s' "$release" | "$JQ" -r '.tag_name | ltrimstr("v")') || return 1
-    runner_os=linux; [ "$OS" != macos ] || runner_os=osx
-    filename=actions-runner-$runner_os-$ARCH-$version.tar.gz
+    filename=actions-runner-linux-$ARCH-$version.tar.gz
     url=$(printf '%s' "$release" | "$JQ" -r --arg name "$filename" '.assets[] | select(.name==$name) | .browser_download_url')
     digest=$(printf '%s' "$release" | "$JQ" -r --arg name "$filename" '.assets[] | select(.name==$name) | .digest')
     [[ $digest =~ ^sha256:[a-fA-F0-9]{64}$ ]] || { log 'Runner release has no SHA-256 digest'; return 1; }
@@ -322,24 +318,24 @@ ensure_package() {
     log "Downloaded official Runner $version for $OS/$ARCH"
 }
 prepare_workspace() {
-    local login=$1 suffix=${2:-} config=$ROOT/runner/$1${2:-}/app/.runner
-    safe_org "$login" || return 1
-    mkdir -p "$DATA_DIR/$login$suffix" || return 1
-    jq_update "$config" --arg work "$DATA_DIR/$login$suffix" '.workFolder=$work'
+    local login=$1 name=$2
+    safe_org "$login" && indexed_name "$name" || return 1
+    mkdir -p "$JOBS_DIR/$login/$name" || return 1
+    jq_update "$ROOT/runner/$login/$name/app/.runner" --arg work "$JOBS_DIR/$login/$name" '.workFolder=$work'
 }
 configure_runner() {
-    local login=$1 name=$2 suffix=${3:-} directory=$ROOT/runner/$1${3:-}/app token output status
+    local login=$1 name=$2 directory=$ROOT/runner/$1/$2/app token output status
     ensure_package || return 1
     if [ ! -f "$directory/run.sh" ]; then
         rm -rf "$directory.staging"
-        mkdir -p "$ROOT/runner/$login$suffix"
+        mkdir -p "${directory%/app}"
         cp -R "$PACKAGE" "$directory.staging" || return 1
         rm -rf "$directory"
         mv "$directory.staging" "$directory" || return 1
     fi
-    mkdir -p "$DATA_DIR/$login$suffix"
+    mkdir -p "$JOBS_DIR/$login/$name"
     token=$(api "orgs/$login/actions/runners/registration-token" --method POST | "$JQ" -er .token) || return 1
-    output=$(cd "$directory" && with_timeout "${RUNNER_CONFIG_TIMEOUT:-180}" clean_exec /bin/bash ./config.sh --unattended --url "https://github.com/$login" --token "$token" --name "$name" --labels "$PREFIX,$name" --work "$DATA_DIR/$login$suffix" 2>&1)
+    output=$(cd "$directory" && with_timeout "${RUNNER_CONFIG_TIMEOUT:-180}" clean_exec /bin/bash ./config.sh --unattended --url "https://github.com/$login" --token "$token" --name "$name" --labels "$PREFIX,$name" --work "$JOBS_DIR/$login/$name" 2>&1)
     status=$?
     if [ "$status" -ne 0 ]; then
         log "Organization $login: runner configuration as $name failed (exit $status): $(redacted_last_line "$output" "$token")"
@@ -360,28 +356,41 @@ next_name() {
         ([.[] | .name | ascii_downcase | capture("^"+$prefix+"-(?<index>[1-9][0-9]*)$")? | .index | tonumber] | max // 0) as $max |
         if $max >= 9007199254740991 then error("Runner index exhausted") else $prefix+"-"+(($max+1)|tostring) end'
 }
+# A registration that finished before save_entry: a local runner directory that no state
+# entry claims and whose ID and name GitHub still reports. Prints "<name> <ID>".
+unclaimed_registration() {
+    local login=$1 remote=$2 config name runner_id
+    for config in "$ROOT/runner/$login"/*/app/.runner; do
+        [ -f "$config" ] || continue
+        name=${config%/app/.runner}; name=${name##*/}
+        indexed_name "$name" || continue
+        ! "$JQ" -e --arg login "$login" --arg name "$name" 'any(.[]; .login==$login and .runner_name==$name)' "$STATE/organizations.json" >/dev/null || continue
+        runner_id=$("$JQ" -r '.agentId // 0' "$config")
+        printf '%s' "$remote" | "$JQ" -e --argjson id "$runner_id" --arg name "$name" 'any(.[]; .id==$id and .name==$name)' >/dev/null || continue
+        printf '%s %s\n' "$name" "$runner_id"; return 0
+    done
+    return 1
+}
 reconcile_one() {
-    local id=$1 login=$2 suffix old_login runner_id remote registered busy local_id directory name preferred relocated attempt recovered
+    local id=$1 login=$2 old_login runner_id remote registered busy local_id name preferred attempt adopted directory
     safe_key "$id" && safe_org "$login" || return 1
-    suffix=$(key_suffix "$id")
     remote=$(list_runners "$login") || return 1
     old_login=$("$JQ" -r --arg id "$id" '.[$id].login // empty' "$STATE/organizations.json")
     runner_id=$("$JQ" -r --arg id "$id" '.[$id].runner_id // 0' "$STATE/organizations.json")
     preferred=$("$JQ" -r --arg id "$id" '.[$id].runner_name // empty' "$STATE/organizations.json")
-    relocated=$("$JQ" -r --arg id "$id" '.[$id].relocated // false' "$STATE/organizations.json")
-    directory=$ROOT/runner/$login$suffix/app
-    local_id=0
-    [ ! -f "$directory/.runner" ] || local_id=$("$JQ" -r '.agentId // 0' "$directory/.runner")
     # A local registration is proof of ownership after a crash before saving state.
-    if [ -z "$old_login" ]; then
-        recovered=$(printf '%s' "$remote" | "$JQ" -r --argjson id "$local_id" '.[]|select(.id==$id)|.name')
-        if [ "$recovered" = "$PREFIX" ] || indexed_name "$recovered"; then runner_id=$local_id; old_login=$login; fi
+    if [ -z "$old_login" ] && adopted=$(unclaimed_registration "$login" "$remote"); then
+        preferred=${adopted% *}; runner_id=${adopted##* }; old_login=$login
+    fi
+    local_id=0
+    if indexed_name "$preferred" && [ -f "$ROOT/runner/$old_login/$preferred/app/.runner" ]; then
+        local_id=$("$JQ" -r '.agentId // 0' "$ROOT/runner/$old_login/$preferred/app/.runner")
     fi
     registered=$(printf '%s' "$remote" | "$JQ" -c --argjson id "$runner_id" '[.[]|select(.id==$id)][0] // null')
     name=$(printf '%s' "$registered" | "$JQ" -r '.name // empty')
     if indexed_name "$name"; then preferred=$name; fi
     busy=$(printf '%s' "$registered" | "$JQ" -r '.busy // false')
-    if [ -n "$old_login" ] && { [ "$old_login" != "$login" ] || [ "$registered" = null ] || [ "$local_id" != "$runner_id" ] || ! indexed_name "$name" || [ "$relocated" = true ]; }; then
+    if [ -n "$old_login" ] && { [ "$old_login" != "$login" ] || [ "$registered" = null ] || [ "$local_id" != "$runner_id" ] || ! indexed_name "$name"; }; then
         [ "$busy" != true ] || return 0
         : > "$STATE/paused/$id"
         stop_worker "$id"
@@ -389,10 +398,11 @@ reconcile_one() {
             api "orgs/$login/actions/runners/$runner_id" --method DELETE >/dev/null || return 1
             remote=$(printf '%s' "$remote" | "$JQ" -c --argjson id "$runner_id" '[.[]|select(.id!=$id)]')
         fi
-        # A renamed organization keeps its program directory; old work data stays in place.
-        if [ "$old_login" != "$login" ] && safe_org "$old_login" && [ -d "$ROOT/runner/$old_login$suffix" ] && [ ! -e "$ROOT/runner/$login$suffix" ]; then
-            mv "$ROOT/runner/$old_login$suffix" "$ROOT/runner/$login$suffix" || return 1
-            log "Moved runner directory of $old_login$suffix to $login$suffix"
+        # A renamed organization keeps its program directory; old jobs stay in place.
+        if [ "$old_login" != "$login" ] && safe_org "$old_login" && indexed_name "$preferred" && [ -d "$ROOT/runner/$old_login/$preferred" ] && [ ! -e "$ROOT/runner/$login/$preferred" ]; then
+            mkdir -p "$ROOT/runner/$login" && mv "$ROOT/runner/$old_login/$preferred" "$ROOT/runner/$login/$preferred" || return 1
+            rmdir "$ROOT/runner/$old_login" 2>/dev/null || :
+            log "Moved runner directory $old_login/$preferred to $login/$preferred"
         fi
         registered=null
     fi
@@ -404,15 +414,21 @@ reconcile_one() {
         # Preserve this installation's number on repair, unless another machine took it.
         if indexed_name "$preferred" && ! printf '%s' "$remote" | "$JQ" -e --arg name "$preferred" 'any(.[]; (.name|ascii_downcase)==$name)' >/dev/null; then name=$preferred;
         else name=$(next_name "$remote") || return 1; fi
-        mkdir -p "$ROOT/runner/$login$suffix"
-        rm -f "$directory/.runner" "$directory/.credentials" "$directory/.credentials_rsaparams"
-        if runner_id=$(configure_runner "$login" "$name" "$suffix"); then break; fi
+        directory=$ROOT/runner/$login/$name
+        # A new number reuses the previous program directory instead of copying the Runner again.
+        if [ "$name" != "$preferred" ] && indexed_name "$preferred" && [ -d "$ROOT/runner/$login/$preferred" ] && [ ! -e "$directory" ]; then
+            mv "$ROOT/runner/$login/$preferred" "$directory" || return 1
+        fi
+        rm -f "$directory/app/.runner" "$directory/app/.credentials" "$directory/app/.credentials_rsaparams"
+        if runner_id=$(configure_runner "$login" "$name"); then break; fi
         # Another installer may win between listing and registration. Never --replace.
         remote=$(list_runners "$login") || return 1
         local_id=0
-        [ ! -f "$directory/.runner" ] || local_id=$("$JQ" -r '.agentId // 0' "$directory/.runner")
+        [ ! -f "$directory/app/.runner" ] || local_id=$("$JQ" -r '.agentId // 0' "$directory/app/.runner")
         if printf '%s' "$remote" | "$JQ" -e --argjson id "$local_id" --arg name "$name" 'any(.[]; .id==$id and .name==$name)' >/dev/null; then runner_id=$local_id; break; fi
         printf '%s' "$remote" | "$JQ" -e --arg name "$name" 'any(.[]; (.name|ascii_downcase)==$name)' >/dev/null || return 1
+        # The name belongs to another machine now; this directory never registered.
+        rm -rf "$directory"
         runner_id=
     done
     safe_id "$runner_id" || return 1
@@ -420,15 +436,14 @@ reconcile_one() {
     log "Registered $name for $login"
     rm -f "$STATE/paused/$id"
 }
-# A runner beyond runner_count leaves once it is idle, so a running job is never cut off.
-# Its registration and program directory go; its work data stays.
+# A runner beyond runner_count leaves once it is idle, so a running job is never cut off;
+# its registration, program directory and jobs directory are removed.
 retire_one() {
-    local id=$1 login=$2 suffix old_login runner_id name remote registered
-    safe_key "$id" && safe_org "$login" || return 1
-    suffix=$(key_suffix "$id"); [ -n "$suffix" ] || return 1
+    local id=$1 login=$2 old_login runner_id name remote registered
+    safe_key "$id" && safe_org "$login" && [[ $id == *.* ]] || return 1
     old_login=$("$JQ" -r --arg id "$id" '.[$id].login // empty' "$STATE/organizations.json")
     runner_id=$("$JQ" -r --arg id "$id" '.[$id].runner_id // 0' "$STATE/organizations.json")
-    name=$("$JQ" -r --arg id "$id" '.[$id].runner_name // "runner"' "$STATE/organizations.json")
+    name=$("$JQ" -r --arg id "$id" '.[$id].runner_name // empty' "$STATE/organizations.json")
     safe_id "$runner_id" || return 1
     remote=$(list_runners "$login") || return 1
     registered=$(printf '%s' "$remote" | "$JQ" -c --argjson id "$runner_id" '[.[]|select(.id==$id)][0] // null')
@@ -436,11 +451,13 @@ retire_one() {
     : > "$STATE/paused/$id"
     stop_worker "$id"
     if [ "$registered" != null ]; then api "orgs/$login/actions/runners/$runner_id" --method DELETE >/dev/null || return 1; fi
-    rm -rf "$ROOT/runner/$login$suffix" || return 1
-    if [ "$old_login" != "$login" ] && safe_org "$old_login"; then rm -rf "$ROOT/runner/$old_login$suffix" || return 1; fi
+    if indexed_name "$name"; then
+        rm -rf "${ROOT:?}/runner/$login/$name" "${JOBS_DIR:?}/$login/$name" || return 1
+        if [ "$old_login" != "$login" ] && safe_org "$old_login"; then rm -rf "${ROOT:?}/runner/$old_login/$name" || return 1; fi
+    fi
     jq_update "$STATE/organizations.json" --arg id "$id" 'del(.[$id])' || return 1
     rm -f "$STATE/paused/$id" "$STATE/retry/$id"
-    log "Removed $name from $login (runner count lowered); work data retained in $DATA_DIR/$login$suffix"
+    log "Removed ${name:-runner} from $login (runner count lowered)"
 }
 # Register, start and retire this organization's runners to match runner_count.
 reconcile_organization() {
@@ -498,8 +515,7 @@ reconcile() {
     done < <("$JQ" -r 'to_entries[] | [.key,.value.login] | @tsv' "$STATE/organizations.json")
 }
 acquire_lock() {
-    if [ "$(uname -s)" = Darwin ]; then /usr/bin/shlock -p $$ -f "$STATE/service.lock" || return 1
-    else exec 9> "$STATE/service.lock"; flock -n 9 || return 1; fi
+    exec 9> "$STATE/service.lock"; flock -n 9
 }
 # A stopping manager's last children can hold the lock briefly after it exits.
 wait_for_lock() {
@@ -508,11 +524,9 @@ wait_for_lock() {
     return 1
 }
 shutdown() {
-    local record
     trap - EXIT TERM INT
     stop_records "$STATE"/workers/*.pid "$STATE"/children/*.pid "$STATE"/timeouts/*.pid
     rm -f "$STATE/manager.pid"
-    if [ "$(uname -s)" = Darwin ]; then rm -f "$STATE/service.lock"; fi
 }
 serve() {
     local next=0 now applied= count
@@ -598,11 +612,11 @@ status() {
     work_prefix=$work; [ "$work" != / ] || work_prefix=
     configured_prefix=$WORK_DIR; [ "$WORK_DIR" != / ] || configured_prefix=
     item 'Work directory' "$work ($directory_state)"
-    item 'Data directory' "$work_prefix/data"
+    item 'Jobs directory' "$work_prefix/jobs"
     item 'Logs directory' "$work_prefix/logs"
     item 'Configured work directory' "$WORK_DIR"
     if [ "$work" != "$WORK_DIR" ]; then
-        item Configuration "pending; next start uses $configured_prefix/data and $configured_prefix/logs"
+        item Configuration "pending; next start uses $configured_prefix/jobs and $configured_prefix/logs"
         notes+=('Run ghr restart (or stop then start) to apply the pending directory change.')
     else item Configuration 'no pending directory change'; fi
     printf 'GitHub Runner status\n\n%-26s %s\n' ITEM VALUE

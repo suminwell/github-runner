@@ -20,8 +20,7 @@ token_has_admin_org() {
     [ -n "$token_scopes" ] || return 0
     case ", $token_scopes," in *", admin:org,"*) return 0 ;; *) return 1 ;; esac
 }
-sha256_file() { if command -v sha256sum >/dev/null; then sha256sum "$1" | awk '{print $1}'; else shasum -a 256 "$1" | awk '{print $1}'; fi; }
-xml() { printf '%s' "$1" | sed -e 's/\&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+sha256_file() { sha256sum "$1" | awk '{print $1}'; }
 unit_quote() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'; }
 # systemd unquotes Environment= and ExecStart=, but rejects a quoted WorkingDirectory=.
 # A fifth argument (the Docker socket group) selects Docker mode: the unit then only
@@ -132,22 +131,6 @@ install_job_sudo() {
     if [ "$1" = native ]; then other_sudo_file=$(job_sudo_path docker "$2"); else other_sudo_file=$(job_sudo_path native "$2"); fi
     if [ -f "$other_sudo_file" ] && [ "$(privileged head -n 1 "$other_sudo_file")" = "$JOB_SUDO_MARK" ]; then privileged rm -f "$other_sudo_file" "$other_sudo_file.shadow"; fi
 }
-launchd_plist() {
-    cat <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-<key>Label</key><string>$(xml "$1")</string>
-<key>UserName</key><string>$(xml "$2")</string>
-<key>ProgramArguments</key><array><string>/bin/bash</string><string>$(xml "$5/bin/service.sh")</string></array>
-<key>WorkingDirectory</key><string>$(xml "$5")</string>
-<key>RunAtLoad</key><true/><key>KeepAlive</key><true/><key>AbandonProcessGroup</key><false/>
-<key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>90</integer>
-<key>EnvironmentVariables</key><dict><key>HOME</key><string>$(xml "$3")</string><key>PATH</key><string>$(xml "$4")</string></dict>
-<key>StandardOutPath</key><string>/dev/null</string><key>StandardErrorPath</key><string>/dev/null</string>
-</dict></plist>
-PLIST
-}
 # Connections to GitHub can drop mid-handshake (curl 35, "EOF"); retry before failing.
 download() {
     download_attempt=1
@@ -165,7 +148,6 @@ fetch() {
 }
 detect_architecture() {
     case "$(uname -m)" in x86_64|amd64) arch=x64 ;; arm64|aarch64) arch=arm64 ;; *) echo 'Only x64/arm64 are supported.' >&2; return 1 ;; esac
-    if [ "$platform" = macos ] && [ "$(/usr/sbin/sysctl -n hw.optional.arm64 2>/dev/null || :)" = 1 ]; then arch=arm64; fi
 }
 is_wsl() {
     [ -n "${WSL_DISTRO_NAME:-}${WSL_INTEROP:-}" ] || uname -r | grep -qi microsoft
@@ -258,53 +240,13 @@ WSL
     fi
 }
 stop_installed_service() {
-    user_id=${runtime_uid:-$(id -u)}
-    if [ "$platform" = linux ]; then
-        service_name=local-github-runner-$user_id-$arch.service
-        definition_path=$(systemd_property "$service_name" FragmentPath)
-        if [ -n "$definition_path" ]; then
-            installed_root=$(systemd_property "$service_name" WorkingDirectory)
-            case "$installed_root" in "$root"|"$root/$arch") ;; *) echo 'Another installation owns this service name.' >&2; exit 1 ;; esac
-            privileged systemctl disable "$service_name"
-            privileged systemctl stop "$service_name"
-            installed_state=$(systemd_property "$service_name" ActiveState)
-            case "$installed_state" in inactive|failed) ;; *) printf 'Service %s did not stop (state: %s).\n' "$service_name" "$installed_state" >&2; exit 1 ;; esac
-        fi
-    else
-        service_name=com.suminwell.github-runner.$user_id.$arch
-        definition_path=/Library/LaunchDaemons/$service_name.plist
-        if [ -f "$definition_path" ]; then
-            command_path=$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$definition_path")
-            case "$command_path" in "$root/bin/service.sh"|"$root/service.sh"|"$root/$arch/bin/service.sh") ;; *) echo 'Another installation owns this service name.' >&2; exit 1 ;; esac
-            privileged launchctl bootout "system/$service_name" 2>/dev/null || :
-            privileged launchctl disable "system/$service_name"
-        fi
-    fi
-}
-migrate_layout() {
-    legacy=$root/$arch
-    if [ -f "$legacy/.state/settings.json" ] || [ -f "$legacy/conf/settings.json" ]; then
-        for part in bin data logs conf; do [ ! -e "$root/$part" ] || { echo "Both layouts exist at $root; resolve them before upgrading." >&2; exit 1; }; done
-        for part in bin data logs; do [ ! -d "$legacy/$part" ] || mv "$legacy/$part" "$root/$part"; done
-        if [ -d "$legacy/.state" ]; then mv "$legacy/.state" "$root/conf"; else mv "$legacy/conf" "$root/conf"; fi
-        rmdir "$legacy" 2>/dev/null || :
-    fi
-    if [ -d "$root/.state" ]; then
-        [ ! -e "$root/conf" ] || { echo 'Both .state and conf exist; resolve them before upgrading.' >&2; exit 1; }
-        mv "$root/.state" "$root/conf"
-    fi
-    if [ -d "$root/conf/package" ]; then mkdir -p "$root/bin/.cache"; [ ! -e "$root/bin/.cache/package" ] || { echo 'Both package caches exist.' >&2; exit 1; }; mv "$root/conf/package" "$root/bin/.cache/package"; fi
-    if [ -d "$root/conf/tools" ]; then mkdir -p "$root/bin"; [ ! -e "$root/bin/tools" ] || { echo 'Both tool directories exist.' >&2; exit 1; }; mv "$root/conf/tools" "$root/bin/tools"; fi
-    for organization in "$root"/bin/*; do
-        [ -f "$organization/runner/.runner" ] || continue
-        login=${organization##*/}
-        destination=$root/runner/$login
-        [ ! -e "$destination" ] || { echo 'Both organization runner layouts exist.' >&2; exit 1; }
-        mkdir -p "$destination"
-        mv "$organization/runner" "$destination/app"
-        rm -f "$organization/runner.sh"
-        rmdir "$organization" 2>/dev/null || :
-    done
+    service_name=local-github-runner-${runtime_uid:-$(id -u)}-$arch.service
+    [ -n "$(systemd_property "$service_name" FragmentPath)" ] || return 0
+    [ "$(systemd_property "$service_name" WorkingDirectory)" = "$root" ] || { echo 'Another installation owns this service name.' >&2; exit 1; }
+    privileged systemctl disable "$service_name"
+    privileged systemctl stop "$service_name"
+    installed_state=$(systemd_property "$service_name" ActiveState)
+    case "$installed_state" in inactive|failed) ;; *) printf 'Service %s did not stop (state: %s).\n' "$service_name" "$installed_state" >&2; exit 1 ;; esac
 }
 initialize_install_settings() {
     [ ! -f "$root/conf/settings.json" ] || return 0
@@ -318,7 +260,7 @@ initialize_install_settings() {
 install_main() {
     umask 077
     platform=linux
-    case "$platform:$(uname -s)" in linux:Linux|macos:Darwin) ;; *) echo 'Incorrect platform installer' >&2; exit 1 ;; esac
+    [ "$(uname -s)" = Linux ] || { echo 'Incorrect platform installer' >&2; exit 1; }
     detect_architecture
     if [ "${1:-auto}" != auto ] && [ "$1" != "$arch" ]; then echo "Architecture mismatch: requested $1, host $arch" >&2; exit 1; fi
     check_linux_host
@@ -343,22 +285,14 @@ install_main() {
         prepare_docker_engine
     fi
     if ! command -v jq >/dev/null 2>&1; then
-        if [ "$platform" = macos ]; then
-            if ! command -v brew >/dev/null 2>&1; then
-                setup=$(mktemp)
-                curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$setup"
-                /bin/bash "$setup"; rm -f "$setup"
-                if [ -x /opt/homebrew/bin/brew ]; then eval "$(/opt/homebrew/bin/brew shellenv)"; else eval "$(/usr/local/bin/brew shellenv)"; fi
-            fi
-            brew install jq
-        elif command -v apt-get >/dev/null; then privileged apt-get update; privileged apt-get install -y jq ca-certificates;
+        if command -v apt-get >/dev/null; then privileged apt-get update; privileged apt-get install -y jq ca-certificates;
         elif command -v dnf >/dev/null; then privileged dnf install -y jq ca-certificates;
         elif command -v zypper >/dev/null; then privileged zypper --non-interactive install jq ca-certificates;
         elif command -v pacman >/dev/null; then privileged pacman -S --needed --noconfirm jq ca-certificates;
         elif command -v yum >/dev/null; then install_static_jq;
         else echo 'Install jq before running this installer.' >&2; exit 1; fi
     fi
-    if [ "$platform" = linux ]; then command -v flock >/dev/null || { echo 'Install util-linux (flock) first.' >&2; exit 1; }; fi
+    command -v flock >/dev/null || { echo 'Install util-linux (flock) first.' >&2; exit 1; }
     if $root_install; then
         if ! command -v setfacl >/dev/null; then
             if command -v apt-get >/dev/null; then apt-get update; apt-get install -y acl;
@@ -375,8 +309,6 @@ install_main() {
         rm -f "$account_helper/account.sh"; rmdir "$account_helper"
         default_root=${LOCAL_RUNNER_HOME:-/opt/github-runner}/$platform
     else default_root=${LOCAL_RUNNER_HOME:-"$HOME/.local/share/github-runner"}/$platform; fi
-    previous_root=$HOME/.local/share/github-runner/$platform
-    if [ -z "${LOCAL_RUNNER_HOME:-}" ] && { [ -d "$previous_root/.state" ] || [ -d "$previous_root/$arch/.state" ]; }; then default_root=$previous_root; fi
     installed_command=$(command -v ghr || :)
     if [ -z "${LOCAL_RUNNER_HOME:-}" ] && [ -f "$installed_command" ]; then
         installed_root=$(sed -n 's/^# ghr: //p' "$installed_command")
@@ -393,13 +325,11 @@ install_main() {
     mkdir -p "$root"
     root=$(cd "$root" && pwd)
     if $root_install; then account_validate_path "$root"; fi
-    known_installation=false
-    for settings_file in "$root/conf/settings.json" "$root/.state/settings.json" "$root/$arch/.state/settings.json" "$root/$arch/conf/settings.json"; do
-        if [ -f "$settings_file" ]; then
-            jq -e --arg platform "$platform" '.platform==$platform' "$settings_file" >/dev/null || { echo 'Installation configuration belongs to a different platform.' >&2; exit 1; }
-            known_installation=true
-        fi
-    done
+    if [ -f "$root/conf/settings.json" ]; then
+        jq -e --arg platform "$platform" '.platform==$platform' "$root/conf/settings.json" >/dev/null || { echo 'Installation configuration belongs to a different platform.' >&2; exit 1; }
+    else
+        for part in bin conf runner; do [ ! -e "$root/$part" ] || { echo "Refusing to reuse unrelated directory $root/$part; choose another installation directory." >&2; exit 1; }; done
+    fi
     # A reinstall keeps Docker mode unless LOCAL_RUNNER_RUNTIME=native switches back.
     if [ "${LOCAL_RUNNER_RUNTIME:-}" != native ] && [ -f "$root/conf/settings.json" ] && jq -e '.runtime=="docker"' "$root/conf/settings.json" >/dev/null 2>&1; then
         runtime=docker
@@ -407,23 +337,12 @@ install_main() {
         check_job_permissions
         prepare_docker_engine
     fi
-    if [ "$known_installation" = false ]; then
-        for part in bin conf runner; do [ ! -e "$root/$part" ] || { echo "Refusing to reuse unrelated directory $root/$part; choose another installation directory." >&2; exit 1; }; done
-    fi
-    other_arch=x64; [ "$arch" != x64 ] || other_arch=arm64
-    { [ ! -f "$root/$other_arch/.state/settings.json" ] && [ ! -f "$root/$other_arch/conf/settings.json" ]; } || { echo 'An installation for another architecture exists; stop it and move it aside before upgrading.' >&2; exit 1; }
-    if [ -f "$root/$arch/.state/settings.json" ] || [ -f "$root/$arch/conf/settings.json" ]; then
-        for part in bin data logs .state; do
-            [ ! -e "$root/$part" ] || { echo "Both layouts exist at $root; resolve them before upgrading." >&2; exit 1; }
-        done
-    fi
     if $root_install; then
         ROOT=$root
         account_setup
         runtime_uid=$account_uid
     fi
     stop_installed_service
-    migrate_layout
     initialize_install_settings
     # Re-running the installer usually repairs credentials or configuration, so every
     # organization is retried at once instead of after its backoff (up to an hour).
@@ -448,17 +367,14 @@ install_main() {
         download https://api.github.com/repos/cli/cli/releases/latest "$temporary/release.json" 120
         version=$("$jq_path" -r '.tag_name|ltrimstr("v")' "$temporary/release.json")
         cli_arch=$arch; [ "$arch" != x64 ] || cli_arch=amd64
-        cli_os=linux; extension=tar.gz
-        if [ "$platform" = macos ]; then cli_os=macOS; extension=zip; fi
-        filename=gh_${version}_${cli_os}_${cli_arch}.${extension}
+        filename=gh_${version}_linux_${cli_arch}.tar.gz
         url=$("$jq_path" -r --arg name "$filename" '.assets[]|select(.name==$name)|.browser_download_url' "$temporary/release.json")
         digest=$("$jq_path" -r --arg name "$filename" '.assets[]|select(.name==$name)|.digest' "$temporary/release.json")
         printf '%s' "$digest" | grep -Eq '^sha256:[a-fA-F0-9]{64}$' || { echo 'Missing gh asset digest.' >&2; exit 1; }
         download "$url" "$temporary/$filename"
         [ "$(sha256_file "$temporary/$filename")" = "${digest#sha256:}" ] || { echo 'gh SHA-256 mismatch.' >&2; exit 1; }
         mkdir "$temporary/unpacked"
-        if [ "$extension" = zip ]; then unzip -q "$temporary/$filename" -d "$temporary/unpacked";
-        else tar -xzf "$temporary/$filename" -C "$temporary/unpacked"; fi
+        tar -xzf "$temporary/$filename" -C "$temporary/unpacked"
         downloaded_gh=$(find "$temporary/unpacked" -type f -name gh -print | head -n 1)
         cp "$downloaded_gh" "$root/bin/tools/gh"; chmod 700 "$root/bin/tools/gh"
         gh_path=$root/bin/tools/gh
@@ -507,9 +423,9 @@ install_main() {
     default_work=$(pwd -P)
     [ ! -f "$root/conf/settings.json" ] || default_work=$root
     [ -f "$root/conf/settings.json" ] || printf '{}\n' > "$root/conf/settings.json"
-    "$jq_path" --arg platform "$platform" --arg arch "$arch" --arg gh "$gh_path" --argjson owner_uid "${runtime_uid:-$(id -u)}" --arg default_work "$default_work" --arg runtime "$runtime" --argjson prevent_sleep "$prevent_sleep" \
+    "$jq_path" --arg platform "$platform" --arg arch "$arch" --argjson owner_uid "${runtime_uid:-$(id -u)}" --arg default_work "$default_work" --arg runtime "$runtime" --argjson prevent_sleep "$prevent_sleep" \
         --argjson docker_access "$docker_access" --argjson job_sudo "$job_sudo" \
-        '.platform=$platform|.arch=$arch|.gh=$gh|.owner_uid=$owner_uid|.runtime=$runtime|.prevent_sleep=$prevent_sleep|.docker_access=$docker_access|.job_sudo=$job_sudo|.work_dir //= $default_work|del(.python)|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
+        '.platform=$platform|.arch=$arch|.owner_uid=$owner_uid|.runtime=$runtime|.prevent_sleep=$prevent_sleep|.docker_access=$docker_access|.job_sudo=$job_sudo|.work_dir //= $default_work|.poll_seconds //= 300|.restart_seconds //= 30|.organizations //= []' \
         "$root/conf/settings.json" > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
     if $root_install; then fetch linux/account.sh "$root/bin/account.sh"; fi
@@ -570,7 +486,7 @@ install_main() {
     fi
     /bin/bash "$root/bin/ghr.sh" --install-command
     work_dir=$("$jq_path" -r .work_dir "$root/conf/settings.json")
-    mkdir -p "$work_dir/data" "$work_dir/logs"
+    mkdir -p "$work_dir/jobs" "$work_dir/logs"
     printf 'Data/logs directory: %s\n' "$work_dir"
     user=$(id -un); user_id=$(id -u); service_home=$HOME; service_path=$(linux_service_path)
     if $root_install; then
@@ -579,58 +495,45 @@ install_main() {
         printf 'Runner account: %s (UID %s); workflows do not run as root.\n' "$user" "$user_id"
     fi
     definition=$(mktemp)
-    if [ "$platform" = linux ]; then
-        [ -d /run/systemd/system ] || { echo 'Linux must be booted with systemd.' >&2; rm -f "$definition"; exit 1; }
-        service_name=local-github-runner-$user_id-$arch.service
-        docker_group=
-        if [ "$runtime" = docker ]; then
-            docker_group=$(stat -c %G /var/run/docker.sock)
-            [ -n "$docker_group" ] && [ "$docker_group" != root ] && [ "$docker_group" != UNKNOWN ] || { echo 'The Docker socket has no dedicated group; cannot grant the runner account access.' >&2; rm -f "$definition"; exit 1; }
-        fi
-        systemd_unit "$user" "$service_home" "$service_path" "$root" "$docker_group" "$docker_access_group" > "$definition"
-        privileged install -m 644 "$definition" "/etc/systemd/system/$service_name"
-        privileged systemctl daemon-reload
-        if [ -f "$root/conf/stopped" ]; then privileged systemctl disable "$service_name";
-        else
-            privileged systemctl enable "$service_name"
-            privileged systemctl restart "$service_name"
-            privileged systemctl is-active --quiet "$service_name"
-        fi
-        sudo_name=${service_name%.service}
-        if [ "$job_sudo" = true ]; then
-            sudo_principal=$user; [ "$runtime" != docker ] || sudo_principal="#$user_id"
-            install_job_sudo "$runtime" "$sudo_name" "$sudo_principal" "$user" || { echo 'Passwordless sudo was not granted; run the installer again after fixing the error above.' >&2; rm -f "$definition"; exit 1; }
-            if [ "$runtime" = docker ]; then printf 'Job sudo: on; jobs can use sudo without a password inside the container.\n'
-            else printf 'Job sudo: on; jobs can use sudo without a password, which is root on this host.\n'; fi
-        else remove_job_sudo "$sudo_name"; fi
-        # WSL is kept awake by its Windows host task instead (ghr wsl setup).
-        awake_name=${service_name%.service}-awake.service
-        inhibit_path=$(command -v systemd-inhibit || :); sleep_path=$(command -v sleep || :)
-        if [ "$prevent_sleep" = true ] && ! is_wsl && [ -n "$inhibit_path" ] && [ -n "$sleep_path" ] && [ -S /run/dbus/system_bus_socket ]; then
-            awake_unit "$service_name" "$inhibit_path" "$sleep_path" > "$definition"
-            privileged install -m 644 "$definition" "/etc/systemd/system/$awake_name"
-            privileged systemctl daemon-reload
-            privileged systemctl enable "$awake_name"
-            [ -f "$root/conf/stopped" ] || privileged systemctl restart "$awake_name"
-            printf 'Sleep prevention: on; this machine stays awake, also with the lid closed, while the runner service runs.\n'
-        elif [ -f "/etc/systemd/system/$awake_name" ]; then
-            privileged systemctl disable "$awake_name" || :; privileged systemctl stop "$awake_name" || :
-            privileged rm -f "/etc/systemd/system/$awake_name"
-            privileged systemctl daemon-reload
-        fi
-    else
-        service_name=com.suminwell.github-runner.$user_id.$arch
-        launchd_plist "$service_name" "$user" "$HOME" "$PATH" "$root" > "$definition"
-        privileged launchctl bootout "system/$service_name" 2>/dev/null || :
-        privileged install -o root -g wheel -m 644 "$definition" "/Library/LaunchDaemons/$service_name.plist"
-        if [ -f "$root/conf/stopped" ]; then privileged launchctl disable "system/$service_name";
-        else
-            privileged launchctl enable "system/$service_name"
-            privileged launchctl bootstrap system "/Library/LaunchDaemons/$service_name.plist"
-            privileged launchctl print "system/$service_name" >/dev/null
-        fi
+    [ -d /run/systemd/system ] || { echo 'Linux must be booted with systemd.' >&2; rm -f "$definition"; exit 1; }
+    service_name=local-github-runner-$user_id-$arch.service
+    docker_group=
+    if [ "$runtime" = docker ]; then
+        docker_group=$(stat -c %G /var/run/docker.sock)
+        [ -n "$docker_group" ] && [ "$docker_group" != root ] && [ "$docker_group" != UNKNOWN ] || { echo 'The Docker socket has no dedicated group; cannot grant the runner account access.' >&2; rm -f "$definition"; exit 1; }
     fi
-    rm -f "$definition" "$root/install.sh" "$root/service.sh" "$root/ghr.sh"
+    systemd_unit "$user" "$service_home" "$service_path" "$root" "$docker_group" "$docker_access_group" > "$definition"
+    privileged install -m 644 "$definition" "/etc/systemd/system/$service_name"
+    privileged systemctl daemon-reload
+    if [ -f "$root/conf/stopped" ]; then privileged systemctl disable "$service_name";
+    else
+        privileged systemctl enable "$service_name"
+        privileged systemctl restart "$service_name"
+        privileged systemctl is-active --quiet "$service_name"
+    fi
+    sudo_name=${service_name%.service}
+    if [ "$job_sudo" = true ]; then
+        sudo_principal=$user; [ "$runtime" != docker ] || sudo_principal="#$user_id"
+        install_job_sudo "$runtime" "$sudo_name" "$sudo_principal" "$user" || { echo 'Passwordless sudo was not granted; run the installer again after fixing the error above.' >&2; rm -f "$definition"; exit 1; }
+        if [ "$runtime" = docker ]; then printf 'Job sudo: on; jobs can use sudo without a password inside the container.\n'
+        else printf 'Job sudo: on; jobs can use sudo without a password, which is root on this host.\n'; fi
+    else remove_job_sudo "$sudo_name"; fi
+    # WSL is kept awake by its Windows host task instead (ghr wsl setup).
+    awake_name=${service_name%.service}-awake.service
+    inhibit_path=$(command -v systemd-inhibit || :); sleep_path=$(command -v sleep || :)
+    if [ "$prevent_sleep" = true ] && ! is_wsl && [ -n "$inhibit_path" ] && [ -n "$sleep_path" ] && [ -S /run/dbus/system_bus_socket ]; then
+        awake_unit "$service_name" "$inhibit_path" "$sleep_path" > "$definition"
+        privileged install -m 644 "$definition" "/etc/systemd/system/$awake_name"
+        privileged systemctl daemon-reload
+        privileged systemctl enable "$awake_name"
+        [ -f "$root/conf/stopped" ] || privileged systemctl restart "$awake_name"
+        printf 'Sleep prevention: on; this machine stays awake, also with the lid closed, while the runner service runs.\n'
+    elif [ -f "/etc/systemd/system/$awake_name" ]; then
+        privileged systemctl disable "$awake_name" || :; privileged systemctl stop "$awake_name" || :
+        privileged rm -f "/etc/systemd/system/$awake_name"
+        privileged systemctl daemon-reload
+    fi
+    rm -f "$definition"
     [ -z "${jq_bootstrap:-}" ] || rm -rf "$jq_bootstrap"
     printf '\nInstalled %s\n\n' "$service_name"
     /bin/bash "$root/bin/ghr.sh" help

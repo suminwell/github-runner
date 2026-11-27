@@ -8,11 +8,11 @@ try {
     . (Join-Path $repo 'windows/ghr.ps1') -Command library
     function New-Case([string]$Name) {
         $script:Root = Join-Path $fixture $Name
-        foreach ($directory in @('conf','runner/directory-is-not-identity/app')) { New-Item -ItemType Directory -Path (Join-Path $script:Root $directory) -Force | Out-Null }
+        foreach ($directory in @('conf','runner/directory-is-not-identity/runner/app')) { New-Item -ItemType Directory -Path (Join-Path $script:Root $directory) -Force | Out-Null }
         $script:Prefix = 'local-windows-x64'
         Save-State @{}
         Write-AtomicText (Join-Path $script:Root 'conf/github-token') 'fixture-credential'
-        $script:Metadata = Join-Path $script:Root 'runner/directory-is-not-identity/app/.runner'
+        $script:Metadata = Join-Path $script:Root 'runner/directory-is-not-identity/runner/app/.runner'
         Write-Json $script:Metadata @{agentId=42;agentName="$script:Prefix-1";gitHubUrl='https://github.com/alpha'}
         $script:Remote = @(@{id=42;name="$script:Prefix-1"},@{id=43;name='unrelated-runner'})
         $script:Deleted = @(); $script:FailDelete = $false
@@ -33,7 +33,7 @@ try {
         throw "Unexpected API endpoint: $Endpoint"
     }
     New-Case fresh
-    $duplicate = Join-Path $script:Root 'runner/duplicate-local-copy/app'
+    $duplicate = Join-Path $script:Root 'runner/duplicate-local-copy/runner/app'
     New-Item -ItemType Directory -Path $duplicate -Force | Out-Null
     Copy-Item -LiteralPath $script:Metadata -Destination (Join-Path $duplicate '.runner')
     Unregister-Runners

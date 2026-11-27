@@ -151,10 +151,10 @@ wait_file() {
 assert test "$(id -u ghrunner)" -gt 0
 assert test "$(cat /fixture/dependencies-uid)" = 0
 assert grep -Fxq User=ghrunner "/etc/systemd/system/local-github-runner-$(id -u ghrunner)-$arch.service"
-assert runuser -u ghrunner -- touch /root/builds/data/job /root/builds/logs/job
-assert wait_file /root/builds/data/fixture-org/demo/demo/job-uid
-assert test "$(cat /root/builds/data/fixture-org/demo/demo/job-uid)" = "$uid"
-assert test ! -d /root/retry/data
+assert runuser -u ghrunner -- touch /root/builds/jobs/job /root/builds/logs/job
+assert wait_file /root/builds/jobs/fixture-org/local-linux-$arch-1/demo/demo/job-uid
+assert test "$(cat /root/builds/jobs/fixture-org/local-linux-$arch-1/demo/demo/job-uid)" = "$uid"
+assert test ! -d /root/retry/jobs
 assert test "$(ps -p "$(head -n 1 "$root/conf/runtime/manager.pid")" -o uid= | tr -d ' ')" = "$uid"
 for protected in "$root/bin/ghr.sh" "$root/bin/account.sh" "$root/conf/settings.json" "$root/conf/github-token"; do
     if runuser -u ghrunner -- test -w "$protected"; then echo "Runner can modify $protected" >&2; exit 1; fi
@@ -174,8 +174,8 @@ assert test "$(cat "$root/conf/runtime/active-work-dir")" = /root/builds
 ghr start
 assert test "$(cat "$root/conf/runtime/active-work-dir")" = /root/builds
 ghr restart
-assert wait_file '/root/new work/data/fixture-org/demo/demo/job-uid'
-assert test "$(cat '/root/new work/data/fixture-org/demo/demo/job-uid')" = "$uid"
+assert wait_file "/root/new work/jobs/fixture-org/local-linux-$arch-1/demo/demo/job-uid"
+assert test "$(cat "/root/new work/jobs/fixture-org/local-linux-$arch-1/demo/demo/job-uid")" = "$uid"
 mkdir -p /fixture/untrusted/blocked
 chown ghrunner:ghrunner /fixture/untrusted
 chmod 700 /fixture/untrusted/blocked
@@ -185,7 +185,7 @@ if ghr config --data-dir /fixture/untrusted > /fixture/nonempty-error 2>&1; then
 assert grep -q 'not empty' /fixture/nonempty-error
 runuser -u ghrunner -- mkdir /fixture/untrusted/open
 ghr config --data-dir /fixture/untrusted/open
-assert runuser -u ghrunner -- touch /fixture/untrusted/open/data/job
+assert runuser -u ghrunner -- touch /fixture/untrusted/open/jobs/job
 mkdir '/root/final work'
 ghr config --data-dir '/root/final work'
 ghr logs > /fixture/logs
@@ -288,7 +288,7 @@ ghr uninstall
 assert test ! -e "$sudoers"
 assert test ! -d "$root/conf"
 assert test ! -e /usr/local/bin/ghr
-assert test -f '/root/new work/data/fixture-org/demo/demo/job-uid'
+assert test -f "/root/new work/jobs/fixture-org/local-linux-$arch-1/demo/demo/job-uid"
 assert jq -e 'length==0' /fixture/runners.json
 assert id ghrunner >/dev/null
 printf 'PASS root install/retry, non-root jobs, protected config, directories, lifecycle, WSL bridge and uninstall\n'

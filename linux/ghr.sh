@@ -9,8 +9,8 @@ ghr start: 启动runner
 ghr stop: 停止runner
 ghr restart: 重启runner
 ghr logs [-f]: 查询日志，-f是跟踪最新日志
-ghr config [--data-dir]: 显示data和logs的父目录
-ghr config --data-dir <PATH>: 设置data和logs的父目录，路径必须是已存在的空目录，重启后生效
+ghr config [--data-dir]: 显示jobs和logs的父目录
+ghr config --data-dir <PATH>: 设置jobs和logs的父目录，路径必须是已存在的空目录，重启后生效
 ghr runner: 显示每个组织的runner个数及本机上限（CPU核数的一半）
 ghr runner -a|--add: 每个组织增加一个runner，无需重启，超过上限时报错
 ghr runner -s|--sub: 每个组织减少一个runner，最少保留1个，多出的runner空闲后移除
@@ -44,8 +44,7 @@ install_cli() {
 service_identity() {
     OWNER_UID=$("$JQ" -er '.owner_uid' "$ROOT/conf/settings.json") || return 1
     safe_id "$OWNER_UID" || return 1
-    if [ "$OS" = linux ]; then SERVICE_NAME=local-github-runner-$OWNER_UID-$ARCH.service; DEFINITION=$SYSTEMD_UNITS/$SERVICE_NAME;
-    else SERVICE_NAME=com.suminwell.github-runner.$OWNER_UID.$ARCH; DEFINITION=/Library/LaunchDaemons/$SERVICE_NAME.plist; fi
+    SERVICE_NAME=local-github-runner-$OWNER_UID-$ARCH.service; DEFINITION=$SYSTEMD_UNITS/$SERVICE_NAME
 }
 systemd_property() (
     property_unit=$1; property_name=$2
@@ -67,49 +66,32 @@ remove_job_sudo() {
     done
 }
 native_service() {
-    local action=$1 installed_root command_path state
+    local action=$1 state awake
     service_identity || return 1
-    if [ "$OS" = linux ]; then
-        if [ -f "$DEFINITION" ]; then
-            installed_root=$(systemd_property "$SERVICE_NAME" WorkingDirectory) || return 1
-            [ "$installed_root" = "$ROOT" ] || { printf 'Another installation owns %s\n' "$SERVICE_NAME" >&2; return 1; }
-            if [ "$action" = start ]; then privileged systemctl enable "$SERVICE_NAME" && privileged systemctl start "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; return $?; fi
-            privileged systemctl disable "$SERVICE_NAME" && privileged systemctl stop "$SERVICE_NAME" || {
-                printf 'Failed to stop %s; operation incomplete.\n' "$SERVICE_NAME" >&2; return 1;
-            }
-            state=$(systemd_property "$SERVICE_NAME" ActiveState) || return 1
-            case "$state" in inactive|failed) ;; *) printf 'Service %s did not stop (state: %s).\n' "$SERVICE_NAME" "$state" >&2; return 1 ;; esac
-        elif [ "$action" = start ]; then printf 'Service definition missing; re-run the installer.\n' >&2; return 1
-        elif systemctl is-active --quiet "$SERVICE_NAME"; then printf 'Service ownership cannot be verified.\n' >&2; return 1
-        fi
-        if [ "$action" = remove ]; then
-            # The sleep inhibitor unit is bound to the supervisor and is removed with it.
-            if [ -f "${DEFINITION%.service}-awake.service" ]; then
-                privileged systemctl disable "${SERVICE_NAME%.service}-awake.service" || :; privileged systemctl stop "${SERVICE_NAME%.service}-awake.service" || :
-                privileged rm -f "${DEFINITION%.service}-awake.service" || return 1
-            fi
-            privileged rm -f "$DEFINITION" && privileged systemctl daemon-reload || return 1
-            remove_job_sudo || return 1
-        fi
-    else
-        if [ -f "$DEFINITION" ]; then
-            command_path=$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$DEFINITION") || return 1
-            [ "$command_path" = "$ROOT/bin/service.sh" ] || { printf 'Another installation owns %s\n' "$SERVICE_NAME" >&2; return 1; }
-            if [ "$action" = start ]; then
-                privileged launchctl enable "system/$SERVICE_NAME" || return 1
-                if ! privileged launchctl print "system/$SERVICE_NAME" >/dev/null 2>&1; then privileged launchctl bootstrap system "$DEFINITION" || return 1; fi
-                privileged launchctl kickstart "system/$SERVICE_NAME"; return $?
-            fi
-            privileged launchctl disable "system/$SERVICE_NAME" || return 1
-            if privileged launchctl print "system/$SERVICE_NAME" >/dev/null 2>&1; then privileged launchctl bootout "system/$SERVICE_NAME" || return 1; fi
-        elif [ "$action" = start ]; then printf 'Service definition missing; re-run the installer.\n' >&2; return 1; fi
-        if [ "$action" = remove ]; then privileged rm -f "$DEFINITION" || return 1; fi
+    if [ -f "$DEFINITION" ]; then
+        [ "$(systemd_property "$SERVICE_NAME" WorkingDirectory)" = "$ROOT" ] || { printf 'Another installation owns %s\n' "$SERVICE_NAME" >&2; return 1; }
+        if [ "$action" = start ]; then privileged systemctl enable "$SERVICE_NAME" && privileged systemctl start "$SERVICE_NAME" && systemctl is-active --quiet "$SERVICE_NAME"; return $?; fi
+        privileged systemctl disable "$SERVICE_NAME" && privileged systemctl stop "$SERVICE_NAME" || {
+            printf 'Failed to stop %s; operation incomplete.\n' "$SERVICE_NAME" >&2; return 1;
+        }
+        state=$(systemd_property "$SERVICE_NAME" ActiveState) || return 1
+        case "$state" in inactive|failed) ;; *) printf 'Service %s did not stop (state: %s).\n' "$SERVICE_NAME" "$state" >&2; return 1 ;; esac
+    elif [ "$action" = start ]; then printf 'Service definition missing; re-run the installer.\n' >&2; return 1
+    elif systemctl is-active --quiet "$SERVICE_NAME"; then printf 'Service ownership cannot be verified.\n' >&2; return 1
     fi
+    [ "$action" = remove ] || return 0
+    # The sleep inhibitor unit sits next to the supervisor unit and is removed with it.
+    awake=${SERVICE_NAME%.service}-awake.service
+    if [ -f "${DEFINITION%.service}-awake.service" ]; then
+        privileged systemctl disable "$awake" || :; privileged systemctl stop "$awake" || :
+        privileged rm -f "${DEFINITION%.service}-awake.service" || return 1
+    fi
+    privileged rm -f "$DEFINITION" && privileged systemctl daemon-reload || return 1
+    remove_job_sudo
 }
 stop_processes() {
     stop_record "$STATE/manager.pid"
     wait_for_lock || { printf 'Manager is still running.\n' >&2; return 1; }
-    trap 'if [ "$OS" = macos ]; then rm -f "$STATE/service.lock"; fi' EXIT
     stop_records "$STATE"/workers/*.pid "$STATE"/children/*.pid "$STATE"/timeouts/*.pid
 }
 stop_installation() {
@@ -119,10 +101,7 @@ stop_installation() {
     wsl_host stop || return 1
     printf 'Runner stopped; automatic startup disabled. Run ghr start to resume.\n'
 }
-release_control_lock() {
-    if [ "$OS" = macos ]; then rm -f "$STATE/service.lock"; else exec 9>&-; fi
-    trap - EXIT
-}
+release_control_lock() { exec 9>&-; }
 start_installation() {
     # A start on an already-running manager must not activate pending configuration.
     if record_alive "$STATE/manager.pid"; then wsl_host start || return 1; printf 'Runner already running. Use ghr restart to apply configuration.\n'; return 0; fi
@@ -161,7 +140,7 @@ configure() {
     config_directory "$CONFIG_VALUE" || return 1
     program_root=$(cd "$ROOT" && pwd -P) || return 1
     case "$CONFIG_DIRECTORY" in "$program_root/bin"|"$program_root/bin/"*|"$program_root/conf"|"$program_root/conf/"*|"$program_root/runner"|"$program_root/runner/"*) printf 'Data must be outside the program and state directories.\n' >&2; return 1 ;; esac
-    mkdir -p "$CONFIG_DIRECTORY/data" "$CONFIG_DIRECTORY/logs" || return 1
+    mkdir -p "$CONFIG_DIRECTORY/jobs" "$CONFIG_DIRECTORY/logs" || return 1
     jq_update "$ROOT/conf/settings.json" --arg directory "$CONFIG_DIRECTORY" '.work_dir=$directory' || return 1
     config_saved
 }
@@ -214,16 +193,14 @@ unregister_untracked_runners() {
     local config directory runner_id name login organization id remote targets failed=0
     "$JQ" -e 'type=="object" and all(to_entries[]; (.key|test("^[1-9][0-9]*([.]([2-9]|[1-9][0-9]+))?$")) and (.value|type=="object") and (.value.login|type=="string" and test("^[A-Za-z0-9][A-Za-z0-9-]{0,38}$")) and (.value.runner_id|type=="number" and .>0 and floor==.))' "$STATE/organizations.json" >/dev/null || { printf 'Invalid registration state; retained installation for repair.\n' >&2; return 1; }
     targets=$(mktemp "$STATE/unregister.XXXXXX") || return 1
-    for config in "$ROOT"/runner/*/app/.runner; do
+    for config in "$ROOT"/runner/*/*/app/.runner; do
         [ -e "$config" ] || [ -L "$config" ] || continue
         directory=${config%/app/.runner}
-        if [ -L "$ROOT/runner" ] || [ -L "$directory" ] || [ -L "$directory/app" ] || [ -L "$config" ]; then failed=1; break; fi
+        if [ -L "$ROOT/runner" ] || [ -L "${directory%/*}" ] || [ -L "$directory" ] || [ -L "$directory/app" ] || [ -L "$config" ]; then failed=1; break; fi
         runner_id=$("$JQ" -er '.agentId | select(type=="number" and .>0 and floor==.) | tostring' "$config") || { failed=1; break; }
-        # A runner ID is scoped to its organization. The existing directory/state
-        # pair supports older metadata; all other directories use the official URL.
-        if "$JQ" -e '.gitHubUrl==null' "$config" >/dev/null && "$JQ" -e --arg login "${directory##*/}" --argjson runner_id "$runner_id" 'any(to_entries[]; .value.login+(.key|ltrimstr(split(".")[0]))==$login and .value.runner_id==$runner_id)' "$STATE/organizations.json" >/dev/null; then continue; fi
+        # A runner ID is scoped to its organization, which the official URL identifies.
         name=$("$JQ" -er '.agentName | select(type=="string")' "$config") || { failed=1; break; }
-        if [ "$name" != "$PREFIX" ] && ! indexed_name "$name"; then failed=1; break; fi
+        indexed_name "$name" || { failed=1; break; }
         login=$("$JQ" -er '.gitHubUrl | capture("^https://github\\.com/(?<login>[A-Za-z0-9][A-Za-z0-9-]{0,38})/?$";"i") | .login' "$config") || { failed=1; break; }
         organization=$(api "orgs/$login") || { failed=1; break; }
         id=$(printf '%s' "$organization" | "$JQ" -er '.id | select(type=="number" and .>0 and floor==.) | tostring') || { failed=1; break; }
@@ -272,7 +249,7 @@ uninstall() {
         [ ! -L "$command_path" ] && grep -Fqx "# ghr: $ROOT" "$command_path" || { printf 'Command ownership changed; refusing removal.\n' >&2; return 1; }
         privileged rm -f "$command_path" || return 1
     fi
-    rm -rf "$ROOT/runner" "$ROOT/bin" "$ROOT/conf" || return 1
+    rm -rf "${ROOT:?}/runner" "${ROOT:?}/bin" "${ROOT:?}/conf" || return 1
     printf 'Runner uninstalled. Data and logs retained in their original directories. Configured directory: %s\n' "$WORK_DIR"
     [ -z "$hint" ] || printf '%s\n' "$hint"
 }
