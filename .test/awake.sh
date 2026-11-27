@@ -1,5 +1,5 @@
 #!/bin/bash
-# macOS sleep guard: holds SleepDisabled only while the manager lives, never takes over an
+# macOS awake guard: holds SleepDisabled only while the manager lives, never takes over an
 # owner's own setting, shares it between installations, and releases on any stop.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,8 +25,8 @@ esac
 PMSET
 chmod +x "$FIXTURE/pmset"
 export LOCAL_RUNNER_PMSET=$FIXTURE/pmset PMSET_STATE=$FIXTURE/sleep-disabled
-export LOCAL_RUNNER_SLEEP_OWNERS=$FIXTURE/owners LOCAL_RUNNER_SLEEP_INTERVAL=0.2
-GUARD=$REPO/macos/sleep.sh
+export LOCAL_RUNNER_AWAKE_OWNERS=$FIXTURE/owners LOCAL_RUNNER_AWAKE_INTERVAL=0.2
+GUARD=$REPO/macos/awake.sh
 state() { cat "$PMSET_STATE"; }
 state_is() { [ "$(state)" = "$1" ]; }
 calls() { cat "$PMSET_STATE.calls" 2>/dev/null || :; }
@@ -84,15 +84,15 @@ kill -TERM "$guard_a"; wait "$guard_a" 2>/dev/null || :
 assert test -z "$(calls)"
 if /bin/bash "$GUARD" release ../escape 2>/dev/null; then fail 'accepted a path as a service name'; fi
 # 4. ghr status reports the guard for this installation.
-export LOCAL_RUNNER_ROOT=$FIXTURE/root LOCAL_RUNNER_LAUNCH_DAEMONS=$FIXTURE/daemons LOCAL_RUNNER_SLEEP_HELPERS=$FIXTURE/helpers
-mkdir -p "$LOCAL_RUNNER_ROOT/conf" "$LOCAL_RUNNER_LAUNCH_DAEMONS" "$LOCAL_RUNNER_SLEEP_HELPERS"
+export LOCAL_RUNNER_ROOT=$FIXTURE/root LOCAL_RUNNER_LAUNCH_DAEMONS=$FIXTURE/daemons LOCAL_RUNNER_AWAKE_HELPERS=$FIXTURE/helpers
+mkdir -p "$LOCAL_RUNNER_ROOT/conf" "$LOCAL_RUNNER_LAUNCH_DAEMONS" "$LOCAL_RUNNER_AWAKE_HELPERS"
 command -v jq > "$LOCAL_RUNNER_ROOT/conf/jq-path"; printf '/usr/bin/false\n' > "$LOCAL_RUNNER_ROOT/conf/gh-path"
 printf '{"arch":"arm64","owner_uid":501}\n' > "$LOCAL_RUNNER_ROOT/conf/settings.json"
 . "$REPO/macos/service.sh"
 init control
 name=com.suminwell.github-runner.501.arm64
 assert test "$(sleep_prevention stopped)" = 'not set up; run the installer again'
-: > "$LOCAL_RUNNER_LAUNCH_DAEMONS/$name.sleep.plist"
+: > "$LOCAL_RUNNER_LAUNCH_DAEMONS/$name.awake.plist"
 assert test "$(sleep_prevention stopped)" = 'released while the manager is stopped'
 : > "$FIXTURE/owners/$name"
 assert test "$(sleep_prevention running)" = 'on; stays awake with the lid closed'
@@ -103,12 +103,19 @@ assert test "$(sleep_prevention running)" = 'off (LOCAL_RUNNER_PREVENT_SLEEP=no)
 privileged() { "$@"; }
 launchctl() { printf '%s\n' "$*" >> "$FIXTURE/launchctl"; }
 SERVICE_NAME=$name
-cp "$GUARD" "$LOCAL_RUNNER_SLEEP_HELPERS/$name.sleep.sh"
+cp "$GUARD" "$LOCAL_RUNNER_AWAKE_HELPERS/$name.awake.sh"
 printf '1\n' > "$PMSET_STATE"
-remove_sleep_guard
-assert grep -qx "bootout system/$name.sleep" "$FIXTURE/launchctl"
+remove_awake_guard
+assert grep -qx "bootout system/$name.awake" "$FIXTURE/launchctl"
 assert test "$(state)" = 0
-assert test ! -e "$FIXTURE/owners/$name" -a ! -e "$LOCAL_RUNNER_SLEEP_HELPERS/$name.sleep.sh" -a ! -e "$LOCAL_RUNNER_LAUNCH_DAEMONS/$name.sleep.plist"
-remove_sleep_guard
+assert test ! -e "$FIXTURE/owners/$name" -a ! -e "$LOCAL_RUNNER_AWAKE_HELPERS/$name.awake.sh" -a ! -e "$LOCAL_RUNNER_LAUNCH_DAEMONS/$name.awake.plist"
+remove_awake_guard
+# A guard installed by an earlier version under the .sleep name is released and removed too.
+cp "$GUARD" "$LOCAL_RUNNER_AWAKE_HELPERS/$name.sleep.sh"; : > "$LOCAL_RUNNER_LAUNCH_DAEMONS/$name.sleep.plist"
+: > "$FIXTURE/owners/$name"; printf '1\n' > "$PMSET_STATE"
+remove_awake_guard
+assert test "$(state)" = 0
+assert test ! -e "$LOCAL_RUNNER_AWAKE_HELPERS/$name.sleep.sh" -a ! -e "$LOCAL_RUNNER_LAUNCH_DAEMONS/$name.sleep.plist"
+remove_awake_guard
 success=true
-printf 'PASS macOS sleep guard: lifecycle-bound, owner setting kept, shared between installations, status\n'
+printf 'PASS macOS awake guard: lifecycle-bound, owner setting kept, shared between installations, status\n'

@@ -60,19 +60,21 @@ native_service() {
             privileged launchctl disable "system/$SERVICE_NAME" || return 1
             if privileged launchctl print "system/$SERVICE_NAME" >/dev/null 2>&1; then privileged launchctl bootout "system/$SERVICE_NAME" || return 1; fi
         elif [ "$action" = start ]; then printf 'Service definition missing; re-run the installer.\n' >&2; return 1; fi
-        if [ "$action" = remove ]; then privileged rm -f "$DEFINITION" && remove_sleep_guard || return 1; fi
+        if [ "$action" = remove ]; then privileged rm -f "$DEFINITION" && remove_awake_guard || return 1; fi
     fi
 }
-# Stop the sleep guard, give sleep back unless another installation still holds it, and
+# Stop the awake guard, give sleep back unless another installation still holds it, and
 # delete the guard. Its own TERM handler releases too; the explicit release covers a guard
-# that had already exited.
-remove_sleep_guard() {
-    local name=$SERVICE_NAME.sleep
-    local script=$SLEEP_HELPERS/$name.sh definition=$LAUNCH_DAEMONS/$name.plist
-    [ -f "$definition" ] || [ -f "$script" ] || return 0
-    if privileged launchctl print "system/$name" >/dev/null 2>&1; then privileged launchctl bootout "system/$name" || return 1; fi
-    if [ -f "$script" ]; then privileged /bin/bash "$script" release "$SERVICE_NAME" || return 1; fi
-    privileged rm -f "$script" "$definition"
+# that had already exited. Earlier versions named the guard <service>.sleep.
+remove_awake_guard() {
+    local name script definition
+    for name in "$SERVICE_NAME.sleep" "$SERVICE_NAME.awake"; do
+        script=$AWAKE_HELPERS/$name.sh definition=$LAUNCH_DAEMONS/$name.plist
+        [ -f "$definition" ] || [ -f "$script" ] || continue
+        if privileged launchctl print "system/$name" >/dev/null 2>&1; then privileged launchctl bootout "system/$name" || return 1; fi
+        if [ -f "$script" ]; then privileged /bin/bash "$script" release "$SERVICE_NAME" || return 1; fi
+        privileged rm -f "$script" "$definition" || return 1
+    done
 }
 stop_processes() {
     stop_record "$ROOT/conf/manager.pid"

@@ -81,7 +81,7 @@ Docker 需要 20.10.10 或更高版本。安装器在改动任何内容之前完
 
 | 平台 | 做法 |
 | --- | --- |
-| macOS | root 守护进程 `com.suminwell.github-runner.<UID>.<架构>.sleep`（脚本 `macos/sleep.sh`，复制到 `/Library/PrivilegedHelperTools/` 并归 root 所有），管理进程运行时执行 `pmset disablesleep 1`。只有这个系统设置能在合盖后保持运行，`caffeinate` 这类断言合盖即失效 |
+| macOS | root 守护进程 `com.suminwell.github-runner.<UID>.<架构>.awake`（脚本 `macos/awake.sh`，复制到 `/Library/PrivilegedHelperTools/` 并归 root 所有），管理进程运行时执行 `pmset disablesleep 1`。只有这个系统设置能在合盖后保持运行，`caffeinate` 这类断言合盖即失效 |
 | Linux | 与主服务绑定的 `<服务名>-awake.service`，以 root 持有 logind 的 `sleep:idle:handle-lid-switch` 阻止锁，随主服务启停；没有 systemd-logind 的系统（多数容器）不需要也不安装 |
 | Windows | SYSTEM 计划任务 `LocalGitHubRunner-<架构>-Awake`（脚本 `windows/awake.ps1`，复制到仅管理员可写的 `%ProgramData%\github-runner\awake\`），阻止空闲休眠，并把当前电源计划的合盖动作设为“不采取任何操作” |
 | WSL | `ghr wsl setup` 在 Windows 上安装同样的 SYSTEM 任务，跟随 WSL 宿主任务；宿主任务被移除后，它会自行恢复设置并删除自己 |
@@ -231,7 +231,7 @@ linux/                          # macos 同结构；windows 对应 .ps1
 ├── service.sh                  # 发现组织、注册、管理各组织进程
 ├── runner.sh                   # 单个组织的监听与退出重试
 ├── ghr.sh                      # 用户管理命令
-└── sleep.sh                    # 仅 macOS：服务运行期间阻止休眠（root 守护进程）
+└── awake.sh                    # 仅 macOS：服务运行期间阻止休眠（root 守护进程）
 windows/awake.ps1               # Windows 和 WSL 宿主：服务运行期间阻止休眠（SYSTEM 任务）
 .test/                          # Shell / PowerShell 测试
 ```
@@ -313,7 +313,7 @@ bash .test/linux-compatibility.sh
 bash .test/systemd-control.sh
 bash .test/uninstall-recovery.sh
 bash .test/status.sh
-bash .test/sleep.sh
+bash .test/awake.sh
 # 需要 Docker；只在一次性 Linux 容器内创建账户并验证 root 安装
 bash .test/root-install.sh
 ```

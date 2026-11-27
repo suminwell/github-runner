@@ -3,13 +3,13 @@
 # Idle-sleep assertions (caffeinate) do not survive closing the lid; only the system-wide
 # SleepDisabled setting does, and it needs root, so launchd runs this file as root from a
 # root-owned copy. It reads nothing from the installation but the manager's PID record.
-#   sleep.sh run <manager.pid> <service name>   hold while the manager lives, release otherwise
-#   sleep.sh release <service name>             release now (uninstall, prevent_sleep off)
+#   awake.sh run <manager.pid> <service name>   hold while the manager lives, release otherwise
+#   awake.sh release <service name>             release now (uninstall, prevent_sleep off)
 set -u
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
 PMSET=${LOCAL_RUNNER_PMSET:-pmset}
-OWNERS=${LOCAL_RUNNER_SLEEP_OWNERS:-/Library/Application Support/com.suminwell.github-runner/sleep}
-INTERVAL=${LOCAL_RUNNER_SLEEP_INTERVAL:-5}
+OWNERS=${LOCAL_RUNNER_AWAKE_OWNERS:-/Library/Application Support/com.suminwell.github-runner/awake}
+INTERVAL=${LOCAL_RUNNER_AWAKE_INTERVAL:-5}
 safe_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
 disabled() { [ "$("$PMSET" -g 2>/dev/null | awk '$1=="SleepDisabled" {print $2}')" = 1 ]; }
 owned() { [ -n "$(ls -A "$OWNERS" 2>/dev/null)" ]; }
@@ -36,14 +36,16 @@ release() {
 }
 case "${1:-}" in
     run)
-        [ "$#" -eq 3 ] && safe_name "$3" || { echo 'Usage: sleep.sh run <manager.pid> <service name>' >&2; exit 2; }
-        trap 'release "$3"; exit 0' TERM INT HUP
+        [ "$#" -eq 3 ] && safe_name "$3" || { echo 'Usage: awake.sh run <manager.pid> <service name>' >&2; exit 2; }
+        # Inside a function $3 is that function's argument, so the trap uses saved names.
+        record=$2 service=$3
+        trap 'release "$service"; exit 0' TERM INT HUP
         while :; do
-            if alive "$2"; then hold "$3"; else release "$3"; fi
+            if alive "$record"; then hold "$service"; else release "$service"; fi
             sleep "$INTERVAL" & wait $!
         done ;;
     release)
-        [ "$#" -eq 2 ] && safe_name "$2" || { echo 'Usage: sleep.sh release <service name>' >&2; exit 2; }
+        [ "$#" -eq 2 ] && safe_name "$2" || { echo 'Usage: awake.sh release <service name>' >&2; exit 2; }
         release "$2" ;;
-    *) echo 'Usage: sleep.sh run <manager.pid> <service name> | release <service name>' >&2; exit 2 ;;
+    *) echo 'Usage: awake.sh run <manager.pid> <service name> | release <service name>' >&2; exit 2 ;;
 esac

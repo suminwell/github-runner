@@ -83,7 +83,7 @@ for target in linux macos; do
         : > "$home/host-calls"
         run_install "$target" none "$home" "$second" 0
         assert test -f "$home/$target/conf/stopped"
-        if grep -v '\.sleep' "$home/host-calls" | grep -Eq 'systemctl (enable|restart)|launchctl (enable|bootstrap|print)'; then echo 'Stopped installation resumed during upgrade' >&2; exit 1; fi
+        if grep -v '\.awake' "$home/host-calls" | grep -Eq 'systemctl (enable|restart)|launchctl (enable|bootstrap|print)'; then echo 'Stopped installation resumed during upgrade' >&2; exit 1; fi
     done
     for legacy_state in .state conf; do
         home=$FIXTURE/$target-legacy-$legacy_state
@@ -93,7 +93,7 @@ for target in linux macos; do
         run_install "$target" none "$home" "$FIXTURE" 0
         assert test -f "$home/$target/conf/stopped"
         assert jq -e --arg work "$home/work" '.work_dir==$work' "$home/$target/conf/settings.json"
-        if grep -v '\.sleep' "$home/host-calls" | grep -Eq 'systemctl (enable|restart)|launchctl (enable|bootstrap|print)'; then echo 'Stopped legacy installation resumed during upgrade' >&2; exit 1; fi
+        if grep -v '\.awake' "$home/host-calls" | grep -Eq 'systemctl (enable|restart)|launchctl (enable|bootstrap|print)'; then echo 'Stopped legacy installation resumed during upgrade' >&2; exit 1; fi
     done
     home=$FIXTURE/$target-unrelated
     mkdir -p "$home/$target/bin"
@@ -138,8 +138,8 @@ for target in linux macos; do
 done
 # macOS installs the root sleep guard from a root-owned copy by default, keeps the choice
 # on re-runs, and removes it (releasing sleep) when LOCAL_RUNNER_PREVENT_SLEEP=no.
-home=$FIXTURE/macos-scope-ok; guard=com.suminwell.github-runner.1001.x64.sleep
-assert grep -q "^install -o root -g wheel -m 755 $home/macos/bin/sleep.sh /Library/PrivilegedHelperTools/$guard.sh$" "$home/host-calls"
+home=$FIXTURE/macos-scope-ok; guard=com.suminwell.github-runner.1001.x64.awake
+assert grep -q "^install -o root -g wheel -m 755 $home/macos/bin/awake.sh /Library/PrivilegedHelperTools/$guard.sh$" "$home/host-calls"
 assert grep -q "^launchctl bootstrap system /Library/LaunchDaemons/$guard.plist$" "$home/host-calls"
 assert jq -e '.prevent_sleep == true' "$home/macos/conf/settings.json"
 : > "$home/host-calls"

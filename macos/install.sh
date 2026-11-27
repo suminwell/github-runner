@@ -55,8 +55,8 @@ launchd_plist() {
 </dict></plist>
 PLIST
 }
-# The root daemon that keeps the Mac awake while the manager runs (macos/sleep.sh).
-sleep_plist() {
+# The root daemon that keeps the Mac awake while the manager runs (macos/awake.sh).
+awake_plist() {
     cat <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -69,23 +69,24 @@ sleep_plist() {
 PLIST
 }
 # install: (re)start the guard from a root-owned copy; remove: let go of sleep and delete it.
-sleep_guard() {
-    guard_name=$service_name.sleep
-    guard_script=/Library/PrivilegedHelperTools/$guard_name.sh
-    guard_definition=/Library/LaunchDaemons/$guard_name.plist
-    # Booting the guard out releases sleep; its replacement takes it again within seconds.
-    sudo launchctl bootout "system/$guard_name" 2>/dev/null || :
-    if [ "$1" = install ]; then
-        sleep_plist "$guard_name" "$guard_script" "$root/conf/manager.pid" "$service_name" > "$definition"
-        sudo mkdir -p /Library/PrivilegedHelperTools
-        sudo install -o root -g wheel -m 755 "$root/bin/sleep.sh" "$guard_script"
-        sudo install -o root -g wheel -m 644 "$definition" "$guard_definition"
-        sudo launchctl enable "system/$guard_name"
-        sudo launchctl bootstrap system "$guard_definition"
-    else
-        if [ -f "$guard_script" ]; then sudo /bin/bash "$guard_script" release "$service_name"; fi
-        sudo rm -f "$guard_script" "$guard_definition"
-    fi
+# Earlier versions named the guard <service>.sleep; it is released and removed either way.
+awake_guard() {
+    local name script
+    for name in "$service_name.sleep" "$service_name.awake"; do
+        script=/Library/PrivilegedHelperTools/$name.sh
+        # Booting the guard out releases sleep; its replacement takes it again within seconds.
+        sudo launchctl bootout "system/$name" 2>/dev/null || :
+        if [ -f "$script" ]; then sudo /bin/bash "$script" release "$service_name"; fi
+        sudo rm -f "$script" "/Library/LaunchDaemons/$name.plist"
+    done
+    [ "$1" = install ] || return 0
+    name=$service_name.awake; script=/Library/PrivilegedHelperTools/$name.sh
+    awake_plist "$name" "$script" "$root/conf/manager.pid" "$service_name" > "$definition"
+    sudo mkdir -p /Library/PrivilegedHelperTools
+    sudo install -o root -g wheel -m 755 "$root/bin/awake.sh" "$script"
+    sudo install -o root -g wheel -m 644 "$definition" "/Library/LaunchDaemons/$name.plist"
+    sudo launchctl enable "system/$name"
+    sudo launchctl bootstrap system "/Library/LaunchDaemons/$name.plist"
 }
 fetch() {
     if [ -n "${LOCAL_RUNNER_SOURCE_DIR:-}" ]; then cp "$LOCAL_RUNNER_SOURCE_DIR/$1" "$2.new";
@@ -282,8 +283,9 @@ install_main() {
     fetch "$platform/service.sh" "$root/bin/service.sh"
     fetch "$platform/ghr.sh" "$root/bin/ghr.sh"
     fetch "$platform/runner.sh" "$root/bin/runner.sh"
-    fetch "$platform/sleep.sh" "$root/bin/sleep.sh"
-    chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh" "$root/bin/sleep.sh"
+    fetch "$platform/awake.sh" "$root/bin/awake.sh"
+    rm -f "$root/bin/sleep.sh"
+    chmod 700 "$root/bin/install.sh" "$root/bin/service.sh" "$root/bin/ghr.sh" "$root/bin/runner.sh" "$root/bin/awake.sh"
     /bin/bash "$root/bin/service.sh" prepare
     if [ "$platform" = linux ]; then sudo /bin/bash "$root/bin/.cache/package/bin/installdependencies.sh"; fi
     /bin/bash "$root/bin/ghr.sh" --install-command
@@ -317,9 +319,9 @@ install_main() {
         fi
         # The guard runs even while the service is stopped, so ghr start needs no sudo for it.
         if [ "$prevent_sleep" = true ]; then
-            sleep_guard install
+            awake_guard install
             printf 'Sleep prevention: on; this Mac stays awake, also with the lid closed, while the runner service runs.\n'
-        else sleep_guard remove; fi
+        else awake_guard remove; fi
     fi
     rm -f "$definition" "$root/install.sh" "$root/service.sh" "$root/ghr.sh"
     printf '\nInstalled %s\n\n' "$service_name"

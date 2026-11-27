@@ -5,10 +5,10 @@ set -o pipefail
 OS=macos
 SERVICE_FILE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
 ROOT=${LOCAL_RUNNER_ROOT:-$(cd "$(dirname "$SERVICE_FILE")/.." && pwd)}
-# Where the installer puts launchd definitions and the root sleep guard (see sleep.sh).
+# Where the installer puts launchd definitions and the root awake guard (see awake.sh).
 LAUNCH_DAEMONS=${LOCAL_RUNNER_LAUNCH_DAEMONS:-/Library/LaunchDaemons}
-SLEEP_HELPERS=${LOCAL_RUNNER_SLEEP_HELPERS:-/Library/PrivilegedHelperTools}
-SLEEP_OWNERS=${LOCAL_RUNNER_SLEEP_OWNERS:-/Library/Application Support/com.suminwell.github-runner/sleep}
+AWAKE_HELPERS=${LOCAL_RUNNER_AWAKE_HELPERS:-/Library/PrivilegedHelperTools}
+AWAKE_OWNERS=${LOCAL_RUNNER_AWAKE_OWNERS:-/Library/Application Support/com.suminwell.github-runner/awake}
 PMSET=${LOCAL_RUNNER_PMSET:-pmset}
 atomic() { local target=$1; cat > "$target.tmp.$$" && chmod 600 "$target.tmp.$$" && mv -f "$target.tmp.$$" "$target"; }
 # Rewrite JSON in place only when jq succeeds; a failed or truncated run keeps the original.
@@ -432,8 +432,8 @@ sleep_prevention() {
     fi
     owner=$("$JQ" -r '.owner_uid // empty' "$ROOT/conf/settings.json")
     name=com.suminwell.github-runner.$owner.$ARCH
-    if [ ! -f "$LAUNCH_DAEMONS/$name.sleep.plist" ]; then printf 'not set up; run the installer again'
-    elif [ -f "$SLEEP_OWNERS/$name" ]; then printf 'on; stays awake with the lid closed'
+    if [ ! -f "$LAUNCH_DAEMONS/$name.awake.plist" ]; then printf 'not set up; run the installer again'
+    elif [ -f "$AWAKE_OWNERS/$name" ]; then printf 'on; stays awake with the lid closed'
     elif [ "$( ("$PMSET" -g 2>/dev/null || :) | awk '$1=="SleepDisabled" {print $2}')" = 1 ]; then printf 'on; sleep is already disabled on this Mac'
     elif [ "$1" = running ]; then printf 'starting'
     else printf 'released while the manager is stopped'; fi
