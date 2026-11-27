@@ -170,7 +170,8 @@ function Install-WslHost {
         try {
             try { $process = Start-Process -FilePath $script:HostPowerShell -Verb RunAs -ArgumentList (($arguments | ForEach-Object { Quote-WslArgument $_ }) -join ' ') -Wait -PassThru }
             catch { throw "Windows elevation was declined or failed: $($_.Exception.Message) Run ghr wsl setup to retry." }
-            $detail = if (Test-Path -LiteralPath $result) { (Get-Content -Raw -Encoding UTF8 -LiteralPath $result).Trim() } else { '' }
+            # Success leaves the file empty, which Get-Content -Raw reads as $null.
+            $detail = if (Test-Path -LiteralPath $result) { "$(Get-Content -Raw -Encoding UTF8 -LiteralPath $result)".Trim() } else { '' }
             if ($process.ExitCode -ne 0) {
                 if (-not $detail) { $detail = 'the elevated window closed before reporting a result' }
                 throw "Windows host setup failed: $detail Run ghr wsl setup to retry."

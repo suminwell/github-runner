@@ -115,6 +115,16 @@ function Start-Process {
 }
 $message = ''; try { Install-WslHost } catch { $message = $_.Exception.Message }
 Assert ($message -match 'The user name or password is incorrect\.' -and $message -match 'ghr wsl setup') "elevated error reported: $message"
+# A successful elevated window leaves the result file empty.
+function Start-Process {
+    param($FilePath,$Verb,$ArgumentList,[switch]$Wait,[switch]$PassThru)
+    $match = [regex]::Match($ArgumentList, '(?:^| )-ResultFile (?:"([^"]+)"|(\S+))')
+    $file = if ($match.Groups[1].Success) { $match.Groups[1].Value } else { $match.Groups[2].Value }
+    [IO.File]::WriteAllText($file, '')
+    return [pscustomobject]@{ExitCode=0}
+}
+$message = ''; try { Install-WslHost } catch { $message = $_.Exception.Message }
+Assert (-not $message) "successful elevated setup reported as finished: $message"
 function Start-Process { param($FilePath,$Verb,$ArgumentList,[switch]$Wait,[switch]$PassThru); throw 'The operation was canceled by the user.' }
 $message = ''; try { Install-WslHost } catch { $message = $_.Exception.Message }
 Assert ($message -match 'declined' -and $message -match 'canceled by the user') "declined elevation reported: $message"
