@@ -483,6 +483,20 @@ install_main() {
     fi
     "$jq_path" --arg group "$docker_access_group" 'if $group == "" then del(.docker_group) else .docker_group=$group end' "$root/conf/settings.json" > "$root/conf/settings.new"
     mv "$root/conf/settings.new" "$root/conf/settings.json"
+    # The sudo rule exists before the runtime check and the service start: Docker mode mounts it.
+    if $root_install; then sudo_user=$account_user; sudo_uid=$account_uid; else sudo_user=$(id -un); sudo_uid=$(id -u); fi
+    sudo_name=local-github-runner-$sudo_uid-$arch
+    definition=$(mktemp)
+    if [ "$job_sudo" = true ]; then
+        sudo_principal=$sudo_user; [ "$runtime" != docker ] || sudo_principal="#$sudo_uid"
+        install_job_sudo "$runtime" "$sudo_name" "$sudo_principal" "$sudo_user" || { echo 'Passwordless sudo was not granted; run the installer again after fixing the error above.' >&2; rm -f "$definition"; exit 1; }
+        if [ "$runtime" = docker ]; then printf 'Job sudo: on; jobs can use sudo without a password inside the container.\n'
+        else printf 'Job sudo: on; jobs can use sudo without a password, which is root on this host.\n'; fi
+    else
+        remove_job_sudo "$sudo_name"
+        [ "$runtime" = docker ] || $root_install || printf 'Job sudo: off; jobs run as your own login account here. Install as root for passwordless sudo.\n'
+    fi
+    rm -f "$definition"
     if $root_install; then
         chgrp "$account_gid" "$root/bin/"*.sh "$root/bin/"*.ps1 "$root/bin/tools" "$root/bin/tools/"*
         chmod 755 "$root/bin/"*.sh "$root/bin/tools" "$root/bin/tools/"*
@@ -529,16 +543,6 @@ install_main() {
         privileged systemctl enable "$service_name"
         privileged systemctl restart "$service_name"
         privileged systemctl is-active --quiet "$service_name"
-    fi
-    sudo_name=${service_name%.service}
-    if [ "$job_sudo" = true ]; then
-        sudo_principal=$user; [ "$runtime" != docker ] || sudo_principal="#$user_id"
-        install_job_sudo "$runtime" "$sudo_name" "$sudo_principal" "$user" || { echo 'Passwordless sudo was not granted; run the installer again after fixing the error above.' >&2; rm -f "$definition"; exit 1; }
-        if [ "$runtime" = docker ]; then printf 'Job sudo: on; jobs can use sudo without a password inside the container.\n'
-        else printf 'Job sudo: on; jobs can use sudo without a password, which is root on this host.\n'; fi
-    else
-        remove_job_sudo "$sudo_name"
-        [ "$runtime" = docker ] || $root_install || printf 'Job sudo: off; jobs run as your own login account here. Install as root for passwordless sudo.\n'
     fi
     # WSL is kept awake by its Windows host task instead (ghr wsl setup).
     awake_name=${service_name%.service}-awake.service
