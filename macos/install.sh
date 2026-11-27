@@ -180,6 +180,9 @@ install_main() {
     stop_installed_service
     migrate_layout
     initialize_install_settings
+    # Re-running the installer usually repairs credentials or configuration, so every
+    # organization is retried at once instead of after its backoff (up to an hour).
+    if [ -d "$root/conf/backoff" ] && [ ! -L "$root/conf/backoff" ]; then rm -f "$root/conf/backoff"/*; fi
     mkdir -p "$root/bin/.cache" "$root/bin/tools" "$root/conf"
     jq_path=$(command -v jq)
     gh_path=$(command -v gh || :)

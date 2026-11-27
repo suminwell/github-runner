@@ -168,6 +168,13 @@ assert grep -q 'CentOS Linux 7' "$FIXTURE/install-output"
 assert grep -q 'Docker mode' "$FIXTURE/install-output"
 assert grep -q 'Docker upgrade declined' "$FIXTURE/install-output"
 assert test ! -e "$FIXTURE/home/.local/share/github-runner"
+# Native mode cannot be forced on a host that cannot run the Runner.
+result=0
+FIXTURE=$FIXTURE PATH="$FIXTURE/bin:$PATH" LOCAL_RUNNER_SOURCE_DIR=$REPO LOCAL_RUNNER_RUNTIME=native HOME=$FIXTURE/home \
+    /bin/bash "$FIXTURE/run-install.sh" > "$FIXTURE/install-output" 2>&1 < /dev/null || result=$?
+assert test "$result" = 1
+assert grep -q 'LOCAL_RUNNER_RUNTIME=native is not possible here' "$FIXTURE/install-output"
+assert test ! -s "$FIXTURE/mutated"
 
 # The container launcher: identical host paths, host PID namespace, the Docker socket
 # and the account's identity; stop only stops this installation's container.

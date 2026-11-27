@@ -23,7 +23,7 @@ account_run() {
     # No sudo rights are granted to the service account. Preserve proxy and WSL
     # interoperability variables, but never root's HOME or GitHub environment token.
     runuser -u "$account_user" -- env -u GH_TOKEN -u GITHUB_TOKEN -u GH_CONFIG_DIR \
-        HOME="$account_home" USER="$account_user" LOGNAME="$account_user" \
+        HOME="$account_home" USER="$account_user" LOGNAME="$account_user" GHR_NESTED=1 \
         PATH=/usr/local/bin:/usr/bin:/bin /bin/sh -c 'cd / && exec "$@"' sh "$@"
 }
 account_setup() {

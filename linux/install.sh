@@ -252,7 +252,12 @@ install_main() {
     runtime=native; compatibility=0
     check_linux_compatibility || compatibility=$?
     case "$compatibility" in 0) ;; 3) runtime=docker ;; *) exit 1 ;; esac
-    [ "${LOCAL_RUNNER_RUNTIME:-}" != docker ] || runtime=docker
+    case "${LOCAL_RUNNER_RUNTIME:-}" in
+        docker) runtime=docker ;;
+        native) [ "$runtime" = native ] || { echo 'This Linux cannot run the official Runner natively; LOCAL_RUNNER_RUNTIME=native is not possible here.' >&2; exit 1; } ;;
+        '') ;;
+        *) echo 'LOCAL_RUNNER_RUNTIME must be docker or native.' >&2; exit 1 ;;
+    esac
     root_install=false
     if [ "$(id -u)" = 0 ]; then root_install=true; else sudo -v; fi
     base=${LOCAL_RUNNER_BASE_URL:-https://raw.githubusercontent.com/suminwell/github-runner/main}
@@ -321,7 +326,8 @@ install_main() {
             known_installation=true
         fi
     done
-    if [ -f "$root/conf/settings.json" ] && jq -e '.runtime=="docker"' "$root/conf/settings.json" >/dev/null 2>&1; then
+    # A reinstall keeps Docker mode unless LOCAL_RUNNER_RUNTIME=native switches back.
+    if [ "${LOCAL_RUNNER_RUNTIME:-}" != native ] && [ -f "$root/conf/settings.json" ] && jq -e '.runtime=="docker"' "$root/conf/settings.json" >/dev/null 2>&1; then
         runtime=docker
         if is_wsl; then echo 'Docker mode is not supported in WSL.' >&2; exit 1; fi
         prepare_docker_engine
@@ -344,6 +350,12 @@ install_main() {
     stop_installed_service
     migrate_layout
     initialize_install_settings
+    # Re-running the installer usually repairs credentials or configuration, so every
+    # organization is retried at once instead of after its backoff (up to an hour).
+    for backoff_directory in "$root/conf/backoff" "$root/conf/runtime/backoff"; do
+        [ -d "$backoff_directory" ] && [ ! -L "$backoff_directory" ] || continue
+        rm -f "$backoff_directory"/*
+    done
     if $root_install; then account_protect_config; fi
     mkdir -p "$root/bin/.cache" "$root/bin/tools" "$root/conf"
     jq_path=$(command -v jq)

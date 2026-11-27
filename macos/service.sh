@@ -363,6 +363,9 @@ reconcile() {
         backoff_due "$id" || continue
         if reconcile_one "$id" "$login"; then
             if [ -f "$ROOT/conf/backoff/$id" ]; then rm -f "$ROOT/conf/backoff/$id"; log "Organization $login: reconciliation recovered"; fi
+            # Start this organization now; with many organizations and a slow network, waiting
+            # for the whole pass would leave registered runners offline for minutes.
+            [ -z "${SUPERVISING:-}" ] || ensure_worker "$id" "$login" || :
         else backoff_failure "$id" "$login"; fi
     done < <(printf '%s' "$desired" | "$JQ" -r '.[] | [.id,.login] | @tsv')
     while IFS=$'\t' read -r id login; do
@@ -405,6 +408,7 @@ serve() {
     printf '%s\n' "$WORK_DIR" | atomic "$ROOT/conf/active-work-dir" || return 1
     stop_records "$ROOT"/conf/workers/*.pid "$ROOT"/conf/children/*.pid "$ROOT"/conf/timeouts/*.pid
     log "Started Shell supervisor $PREFIX"
+    SUPERVISING=1
     while [ ! -f "$ROOT/conf/stopped" ]; do
         # Reopen after log rotation so diagnostics land in the current file.
         exec 2>> "$LOG_DIR/service.log"

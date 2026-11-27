@@ -59,7 +59,7 @@ Docker 需要 20.10.10 或更高版本。安装器在改动任何内容之前完
 
 软件源按机器公网 IP 所在地区自动选择：中国大陆使用阿里云的 docker-ce、CentOS vault 和 Ubuntu 镜像源，其他地区使用官方源。也可用 `LOCAL_RUNNER_REGION=cn` 或 `global` 指定。基础镜像先尝试 `ubuntu:22.04`（会使用 Docker 守护进程已配置的 registry-mirrors），在中国大陆还会依次尝试 `docker.m.daocloud.io` 和 `docker.1ms.run` 的镜像；都不可用时，用 `LOCAL_RUNNER_DOCKER_BASE=<可访问的 ubuntu:22.04 镜像>` 指定。job 自己拉取的镜像不受这些设置影响，大陆主机需要自行给 Docker 配置镜像加速。
 
-无交互输入时不会自动同意升级或修改软件源；无人值守安装可设置 `LOCAL_RUNNER_ASSUME_YES=yes`，表示同意上述全部询问。也可以在受支持的系统上设置 `LOCAL_RUNNER_RUNTIME=docker` 主动使用 Docker 模式；之后重复安装会沿用已记录的模式。WSL 内不支持 Docker 模式。
+无交互输入时不会自动同意升级或修改软件源；无人值守安装可设置 `LOCAL_RUNNER_ASSUME_YES=yes`，表示同意上述全部询问。也可以在受支持的系统上设置 `LOCAL_RUNNER_RUNTIME=docker` 主动使用 Docker 模式；之后重复安装会沿用已记录的模式，设置 `LOCAL_RUNNER_RUNTIME=native` 重新安装可切回原生运行（仅限受支持的系统）。WSL 内不支持 Docker 模式。
 
 `ghr status` 会显示 `Runtime: Docker (...)`。`ghr uninstall` 保留 Docker 和镜像，因为同一主机上的其他安装可能还在使用；确认不再需要后自行执行 `docker rmi local-github-runner:<架构>`。
 

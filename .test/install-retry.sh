@@ -118,6 +118,13 @@ for target in linux macos; do
     assert grep -q 'Use a token with admin:org and run the installer again' "$home/output"
     if grep -q '^refresh' "$home/host-calls" 2>/dev/null; then echo 'Refreshed despite a supplied token' >&2; exit 1; fi
 done
+# Re-running the installer retries every organization at once instead of after backoff.
+for target in linux macos; do
+    home=$FIXTURE/$target-scope-ok
+    mkdir -p "$home/$target/conf/backoff"; printf '9999999999\n5\n' > "$home/$target/conf/backoff/42"
+    run_install "$target" none "$home" "$FIXTURE/scope-$target" 0
+    assert test ! -e "$home/$target/conf/backoff/42"
+done
 # A dropped GitHub connection is retried; a persistent failure explains how to resume.
 (
     sed '/^if \[ -t 0 \]/,$d' "$REPO/linux/install.sh" > "$FIXTURE/helpers.sh"

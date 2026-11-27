@@ -226,6 +226,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         if init control; then command_main "$@" || command_result=$?;
         else printf 'Cannot load runner configuration: %s/conf\n' "$ROOT" >&2; command_result=1; fi
     fi
-    [ "$command_result" = 0 ] || printf 'ghr %s failed (exit %s); operation incomplete.\n' "${1:-help}" "$command_result" >&2
+    # A root-mode command runs parts of itself as ghrunner; only the outer one reports.
+    [ "$command_result" = 0 ] || [ -n "${GHR_NESTED:-}" ] || printf 'ghr %s failed (exit %s); operation incomplete.\n' "${1:-help}" "$command_result" >&2
     exit "$command_result"
 fi

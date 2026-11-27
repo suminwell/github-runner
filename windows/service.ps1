@@ -332,6 +332,11 @@ function Invoke-Reconcile {
         try {
             Reconcile-Organization $id $desired[$id]
             if ($null -ne $previous) { Remove-Item -LiteralPath $backoff -Force; Write-Log "Organization $($desired[$id]): reconciliation recovered" }
+            # Start this organization now; with many organizations and a slow network, waiting
+            # for the whole pass would leave registered runners offline for minutes.
+            if ($script:Supervising) {
+                try { Start-Worker $id $desired[$id] } catch { Write-Log "Organization $($desired[$id]): runner start failed: $($_.Exception.Message)" }
+            }
         } catch {
             # Organizations without runner permission (or with persistent errors) back off
             # exponentially from poll_seconds to one hour instead of failing every poll.
@@ -362,6 +367,7 @@ function Invoke-Supervisor {
         Write-AtomicText (Join-Path $script:Root 'conf\active-work-dir') $script:WorkDir
         foreach ($folder in @('workers','children')) { Get-ChildItem (Join-Path $script:Root "conf\$folder") -Filter *.json | ForEach-Object { Stop-Record $_.FullName } }
         Write-Log "Started PowerShell supervisor $script:Prefix"
+        $script:Supervising = $true
         $next = [DateTime]::MinValue
         while (-not (Test-Path (Join-Path $script:Root 'conf\stopped'))) {
             Ensure-Workers

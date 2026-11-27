@@ -166,6 +166,9 @@ if (@($stateDirectories).Count) {
 }
 Move-PreviousLayout $installRoot $arch
 Initialize-InstallSettings $installRoot $arch
+# Re-running the installer usually repairs credentials or configuration, so every
+# organization is retried at once instead of after its backoff (up to an hour).
+Remove-Item -Path (Join-Path $installRoot 'conf\backoff\*') -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $bin, $state, (Join-Path $bin 'tools'), (Join-Path $bin '.cache'), (Join-Path $installRoot 'runner') | Out-Null
 Protect-AdminFile (Join-Path $state 'settings.json')
 foreach ($writable in @($state, (Join-Path $bin '.cache'), (Join-Path $installRoot 'runner'))) { Grant-ServiceWrite $writable }
